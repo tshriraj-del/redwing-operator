@@ -307,6 +307,15 @@ def load_generated_rules() -> list:
         return []
 
 
+# Module-level dict of deployed rules — populated on import, kept in sync by
+# deploy_rule() and retire_rule(). Imported by main.py /patterns endpoint.
+_deployed_rules: dict = {
+    r["id"]: r
+    for r in load_generated_rules()
+    if r.get("status") == "deployed"
+}
+
+
 def deploy_rule(rule_id: str):
     """Promote a shadow rule to deployed status."""
     rules = load_generated_rules()

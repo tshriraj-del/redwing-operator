@@ -34,6 +34,11 @@ from rule_factory import (
     deploy_rule, retire_rule, backtest_rule, _safe_lambda,
     load_transactions,
 )
+from agent import (
+    agent_state, agent_config, run_agent,
+    novel_attack_buffer, _event_subscribers,
+    load_config, save_config, validate_config, THREAT_META,
+)
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +108,15 @@ def build_event(row) -> dict:
         "matched_signals": top["matched_signals"] if top else [],
         "timestamp":      datetime.utcnow().isoformat() + "Z",
     }
+
+
+# ── Autonomous Agent Startup ──────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def start_autonomous_agent():
+    """Start the SyntheticID autonomous agent as a background task."""
+    if MODEL_OK and not agent_state.running:
+        asyncio.create_task(run_agent(build_event, df_all, FEATURES))
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -742,6 +756,179 @@ async def llm_proxy(body: dict):
         data    = resp.json()
         content = data["choices"][0]["message"]["content"]
         return {"content": content}
+
+
+# ── Autonomous Agent Endpoints ────────────────────────────────────────────────
+
+@app.get("/agent/status")
+def get_agent_status():
+    """Return current state of the autonomous fraud detection agent."""
+    uptime_seconds = None
+    if agent_state.start_time:
+        uptime_seconds = int((datetime.utcnow() - agent_state.start_time).total_seconds())
+    return {
+        "running":           agent_state.running,
+        "uptime_seconds":    uptime_seconds,
+        "blocked_count":     agent_state.blocked_count,
+        "flagged_count":     agent_state.flagged_count,
+        "allowed_count":     agent_state.allowed_count,
+        "patterns_learned":  agent_state.patterns_learned,
+        "event_buffer_size": len(agent_state.recent_events),
+        "case_queue_size":   len(agent_state.case_queue),
+        "novel_buffer_size": len(novel_attack_buffer),
+    }
+
+
+@app.get("/agent/events")
+async def agent_events_stream():
+    """
+    SSE fan-out stream of autonomous agent decisions.
+    Each connected browser tab gets its own queue (fan-out pattern).
+    Backfills the last 20 events immediately on connect.
+    """
+    my_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _event_subscribers.add(my_queue)
+
+    async def generate():
+        try:
+            # Backfill
+            for event in list(agent_state.recent_events)[:20]:
+                yield f"data: {json.dumps(event)}\n\n"
+            # Stream live events
+            while True:
+                try:
+                    event = await asyncio.wait_for(my_queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+        finally:
+            _event_subscribers.discard(my_queue)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/agent/start")
+async def start_agent():
+    """Start the autonomous agent if not already running. Idempotent."""
+    if agent_state.running:
+        return {"status": "already_running"}
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded — run the ML notebook first")
+    asyncio.create_task(run_agent(build_event, df_all, FEATURES))
+    return {"status": "started"}
+
+
+@app.post("/agent/stop")
+def stop_agent():
+    """Gracefully stop the agent. It will finish its current tick then exit."""
+    agent_state.running = False
+    return {"status": "stopping"}
+
+
+@app.get("/agent/config")
+def get_agent_config():
+    """Return the current agent configuration."""
+    return agent_config
+
+
+@app.put("/agent/config")
+def update_agent_config(body: dict):
+    """
+    Update agent config. Changes apply immediately on the next tick — no restart.
+    Accepts partial updates; merges deeply with current config.
+    """
+    try:
+        validated = validate_config(body)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid config: {e}")
+
+    # Mutate the module-level dict in place so run_agent sees the changes
+    agent_config.clear()
+    agent_config.update(validated)
+    save_config(validated)
+    return agent_config
+
+
+@app.get("/agent/cases")
+def get_agent_cases(status: str = None):
+    """
+    Return the case review queue.
+    Optional ?status=pending|approved|declined filter.
+    """
+    cases = list(agent_state.case_queue)
+    if status:
+        cases = [c for c in cases if c.get("status") == status]
+    return cases
+
+
+@app.post("/agent/cases/{case_id}/resolve")
+async def resolve_agent_case(case_id: str, body: dict):
+    """
+    Analyst resolves a case: approve (confirm agent action) or decline (override).
+    body: { action: "approve"|"decline", analyst_id: str, note: str }
+    """
+    action = body.get("action", "")
+    if action not in ("approve", "decline"):
+        raise HTTPException(400, "action must be 'approve' or 'decline'")
+
+    # Find case in deque
+    found = None
+    for case in agent_state.case_queue:
+        if case.get("case_id") == case_id:
+            found = case
+            break
+    if not found:
+        raise HTTPException(404, f"Case '{case_id}' not found")
+
+    found["status"]         = "approved" if action == "approve" else "declined"
+    found["analyst_action"] = action
+    found["analyst_id"]     = body.get("analyst_id", "analyst_1")
+    found["analyst_note"]   = body.get("note", "")
+    found["resolved_at"]    = datetime.utcnow().isoformat() + "Z"
+
+    # Broadcast resolution to SSE clients so Live Feed updates
+    resolution_event = {
+        "type":          "case_resolved",
+        "case_id":       case_id,
+        "analyst_action":action,
+        "timestamp":     found["resolved_at"],
+    }
+    from agent import _broadcast
+    _broadcast(resolution_event)
+
+    return found
+
+
+@app.post("/agent/override/{tx_id}")
+async def override_agent_decision(tx_id: str, body: dict = {}):
+    """
+    Human analyst directly overrides a live feed decision by transaction ID.
+    body: { action: "allow"|"escalate", analyst_id: str, reason: str }
+    """
+    override_action = body.get("action", "allow")
+    if override_action not in ("allow", "escalate"):
+        raise HTTPException(400, "action must be 'allow' or 'escalate'")
+
+    matching = [e for e in agent_state.recent_events if e.get("transaction_id") == tx_id]
+    if not matching:
+        raise HTTPException(404, f"No recent event for transaction '{tx_id}'")
+
+    override_record = {
+        "type":            "human_override",
+        "transaction_id":  tx_id,
+        "original_action": matching[0].get("action"),
+        "override_action": override_action,
+        "analyst_id":      body.get("analyst_id", "analyst_1"),
+        "reason":          body.get("reason", ""),
+        "timestamp":       datetime.utcnow().isoformat() + "Z",
+    }
+    from agent import _broadcast
+    _broadcast(override_record)
+    return {"status": "override_recorded", **override_record}
 
 
 # ── Integration Hub ───────────────────────────────────────────────────────────
