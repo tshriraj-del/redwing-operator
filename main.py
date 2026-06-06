@@ -121,8 +121,13 @@ def health():
 
 @app.get("/patterns")
 def get_patterns():
-    """Return the full pattern library."""
-    return PATTERNS
+    """Return merged static + deployed generated rules."""
+    from rule_factory import _deployed_rules  # noqa: PLC0415
+    merged = list(PATTERNS)
+    for rule in _deployed_rules.values():
+        if rule not in merged:
+            merged.append(rule)
+    return merged
 
 
 @app.post("/score")
@@ -644,68 +649,97 @@ def ingest_syntheticid(body: dict):
 
 
 # ── LLM Proxy ─────────────────────────────────────────────────────────────────
-# Provider-agnostic proxy for non-Anthropic LLM providers.
+# Provider-agnostic proxy: anthropic | openai | groq | mistral
 # API key never touches the browser — stored in operator/.env only.
 #
 # operator/.env:
-#   LLM_PROVIDER=openai        # openai | groq | mistral
-#   LLM_API_KEY=sk-...
-#   LLM_MODEL=gpt-4o           # optional override
+#   LLM_PROVIDER=anthropic     # anthropic | openai | groq | mistral
+#   LLM_API_KEY=sk-ant-...
+#   LLM_MODEL=claude-sonnet-4-6   # optional override
 
-_LLM_ENDPOINTS = {
+_LLM_OAI_ENDPOINTS = {
     "openai":  "https://api.openai.com/v1/chat/completions",
     "groq":    "https://api.groq.com/openai/v1/chat/completions",
     "mistral": "https://api.mistral.ai/v1/chat/completions",
 }
 
 _DEFAULT_MODELS = {
-    "openai":  "gpt-4o",
-    "groq":    "llama-3.1-70b-versatile",
-    "mistral": "mistral-large-latest",
+    "anthropic": "claude-sonnet-4-6",
+    "openai":    "gpt-4o",
+    "groq":      "llama-3.1-70b-versatile",
+    "mistral":   "mistral-large-latest",
 }
 
 @app.post("/llm/proxy")
 async def llm_proxy(body: dict):
     """
-    Route LLM requests to openai / groq / mistral.
+    Route LLM requests to anthropic / openai / groq / mistral.
     Reads LLM_PROVIDER, LLM_API_KEY, LLM_MODEL from environment.
     Streams back SSE for stream=true, returns JSON for stream=false.
     """
     import httpx
 
-    provider = os.environ.get("LLM_PROVIDER", "openai").lower()
-    api_key  = os.environ.get("LLM_API_KEY", "")
-    model    = body.get("model") or os.environ.get("LLM_MODEL") or _DEFAULT_MODELS.get(provider, "gpt-4o")
-    system   = body.get("system", "")
-    messages = body.get("messages", [])
+    provider   = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+    api_key    = os.environ.get("LLM_API_KEY", "")
+    model      = body.get("model") or os.environ.get("LLM_MODEL") or _DEFAULT_MODELS.get(provider, "claude-sonnet-4-6")
+    system     = body.get("system", "")
+    messages   = body.get("messages", [])
     max_tokens = int(body.get("max_tokens", 2000))
-    stream   = bool(body.get("stream", False))
+    stream     = bool(body.get("stream", False))
 
     if not api_key:
         raise HTTPException(400, "LLM_API_KEY not set in operator/.env")
 
-    endpoint = _LLM_ENDPOINTS.get(provider)
+    # ── Anthropic path ────────────────────────────────────────────────────────
+    if provider == "anthropic":
+        endpoint = "https://api.anthropic.com/v1/messages"
+        payload  = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": stream}
+        if system:
+            payload["system"] = system
+        headers  = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        if stream:
+            async def generate_anthropic():
+                async with httpx.AsyncClient(timeout=60) as client:
+                    async with client.stream("POST", endpoint, json=payload, headers=headers) as resp:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            return StreamingResponse(generate_anthropic(), media_type="text/event-stream")
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            if resp.status_code != 200:
+                raise HTTPException(resp.status_code, resp.text)
+            data    = resp.json()
+            content = data["content"][0]["text"] if data.get("content") else ""
+            return {"content": content}
+
+    # ── OpenAI-compatible path (openai / groq / mistral) ─────────────────────
+    endpoint = _LLM_OAI_ENDPOINTS.get(provider)
     if not endpoint:
-        raise HTTPException(400, f"Unsupported provider '{provider}'. Supported: openai, groq, mistral")
+        raise HTTPException(400, f"Unsupported provider '{provider}'. Supported: anthropic, openai, groq, mistral")
 
     oai_messages = [{"role": "system", "content": system}] + messages
-    payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens, "stream": stream}
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    payload      = {"model": model, "messages": oai_messages, "max_tokens": max_tokens, "stream": stream}
+    headers      = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     if stream:
-        async def generate():
+        async def generate_oai():
             async with httpx.AsyncClient(timeout=60) as client:
                 async with client.stream("POST", endpoint, json=payload, headers=headers) as resp:
                     async for chunk in resp.aiter_bytes():
                         yield chunk
-
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        return StreamingResponse(generate_oai(), media_type="text/event-stream")
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(endpoint, json=payload, headers=headers)
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
-        data = resp.json()
+        data    = resp.json()
         content = data["choices"][0]["message"]["content"]
         return {"content": content}
 
