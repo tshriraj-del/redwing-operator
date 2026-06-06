@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 
 from match_engine import combined_score, is_alert, score_transaction
 from patterns import PATTERNS
+from xai import explain_score as _xai_explain, get_model_card as _xai_model_card, list_explanations as _xai_list, get_governance_metrics as _xai_governance
 from rule_factory import (
     extract_rule_gaps, run_pipeline, load_generated_rules,
     deploy_rule, retire_rule, backtest_rule, _safe_lambda,
@@ -127,27 +128,100 @@ def get_patterns():
 @app.post("/score")
 def score(body: dict):
     """
-    Score a single transaction.
+    Score a single transaction with full XAI explanation.
 
     Body: any subset of the 10 ML features, or a free-form transaction dict.
-    Returns: ml_score, pattern matches, combined score.
+    Returns: ml_score, pattern matches, combined score, XAI explanation record.
     """
     if not MODEL_OK:
         raise HTTPException(503, "ML models not loaded. Run the ML Fraud Engine notebook first.")
 
     features = {f: float(body.get(f, 0.0)) for f in FEATURES}
-    ml  = ml_score_row(features)
-    matches = score_transaction(features)
-    top = matches[0] if matches else None
-    c_score = combined_score(ml, top["confidence"]) if top else ml
+    ml       = ml_score_row(features)
+    matches  = score_transaction(features)
+    top      = matches[0] if matches else None
+    c_score  = combined_score(ml, top["confidence"]) if top else ml
+
+    transaction_id = str(body.get("transaction_id", f"txn_{uuid.uuid4().hex[:8]}"))
+    explanation = _xai_explain(
+        features       = features,
+        ml_score       = ml,
+        pattern_match  = top,
+        combined_score = c_score,
+        model          = xgb,
+        scaler         = scaler,
+        feature_names  = FEATURES,
+        model_version  = config.get("version", "1.0.0"),
+        transaction_id = transaction_id,
+    )
 
     return {
+        "transaction_id": transaction_id,
         "ml_score":       round(ml, 4),
         "combined_score": round(c_score, 4),
         "is_alert":       is_alert(c_score),
         "top_pattern":    top,
         "all_patterns":   matches,
+        "explanation":    explanation,
     }
+
+
+# ── XAI / Explainability Endpoints ───────────────────────────────────────────
+
+@app.get("/xai/explanations")
+def xai_list_explanations(
+    limit: int = 100,
+    verdict: str = "",
+    min_score: float = 0.0,
+    transaction_id: str = "",
+):
+    """
+    Return recent XAI explanation records from the audit log.
+
+    Query params:
+      limit          max records to return (default 100)
+      verdict        filter by verdict: LOW | MEDIUM | HIGH | CRITICAL
+      min_score      filter by minimum combined score (0.0–1.0)
+      transaction_id filter by transaction ID substring
+    """
+    return _xai_list(
+        limit          = limit,
+        verdict        = verdict or None,
+        min_score      = min_score or None,
+        transaction_id = transaction_id or None,
+    )
+
+
+@app.get("/xai/model-card")
+def xai_model_card():
+    """
+    Return the model card for the active fraud detection model.
+    Structured per EU AI Act Article 11/13 and Fed SR 26-02 requirements.
+    """
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded.")
+    return _xai_model_card(config, FEATURES)
+
+
+@app.get("/xai/governance")
+def xai_governance():
+    """
+    Return live model governance metrics computed from the explanation audit log.
+    Includes verdict distribution, score histogram, and top risk drivers.
+    """
+    return _xai_governance()
+
+
+@app.get("/xai/explain/{transaction_id}")
+def xai_explain_transaction(transaction_id: str):
+    """
+    Retrieve the stored XAI explanation for a specific transaction.
+    Returns the most recent record matching the transaction_id.
+    """
+    records = _xai_list(limit=1000, transaction_id=transaction_id)
+    if not records:
+        raise HTTPException(404, f"No explanation found for transaction_id '{transaction_id}'")
+    return records[0]
 
 
 @app.get("/monitor/stream")
