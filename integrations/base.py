@@ -1,5 +1,5 @@
 """
-Base connector interface for all RedWing external integrations.
+Base connector interface for all Riposte external integrations.
 
 Every agency/bureau connector inherits from BaseConnector and implements:
   - enrich(payload)  → pull signals about a transaction/user

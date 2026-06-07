@@ -1,6 +1,6 @@
-# RedWing Operator
+# Riposte Operator
 
-FastAPI backend for the RedWing fraud prevention platform. Runs on port 8000 and serves the ML scoring engine, autonomous AI fraud agent, rule factory pipeline, LLM proxy, network graph API, and XAI engine.
+FastAPI backend for the Riposte fraud prevention platform. Runs on port 8000 and serves the ML scoring engine, autonomous AI fraud agent, rule factory pipeline, LLM proxy, network graph API, and XAI engine.
 
 ---
 
@@ -161,7 +161,7 @@ The hub connects to external agencies and bureaus for transaction enrichment and
 
 ---
 
-## Part of the RedWing Platform
+## Part of the Riposte Platform
 
 | Repo | Role |
 |------|------|
