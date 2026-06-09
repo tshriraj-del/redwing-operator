@@ -1,5 +1,5 @@
 """
-XAI Engine — Explainable AI layer for the Riposte Operator.
+XAI Engine — Explainable AI layer for the RedWing Operator.
 
 Attaches to every ML score output:
   - SHAP tree values (XGBoost built-in, no extra library needed)
@@ -152,7 +152,7 @@ def get_model_card(config: dict, feature_names: list) -> dict:
     Required by EU AI Act (Art. 11/13) and Fed SR 26-02 model governance.
     """
     return {
-        "model_id":     "riposte-fraud-xgb-v1",
+        "model_id":     "redwing-fraud-xgb-v1",
         "model_type":   "XGBClassifier — gradient boosted decision trees",
         "version":      config.get("version", "1.0.0"),
         "training_date": config.get("training_date", None),

@@ -1,5 +1,5 @@
 """
-Riposte Rule Factory — Self-improving rule engine.
+RedWing Rule Factory — Self-improving rule engine.
 
 Identifies fraud vectors that ML caught but rules missed (rule gaps),
 sends them to Claude for pattern analysis, generates candidate rules,
@@ -43,7 +43,7 @@ ALL_FEATURES = [
     'recipient_global_fraud_rate', 'inter_tx_time_short',
 ]
 
-RULE_GENERATION_SYSTEM = """You are Riposte's rule engine architect. Your job is to analyze confirmed fraud transactions that slipped past the existing rule engine and generate new detection rules.
+RULE_GENERATION_SYSTEM = """You are RedWing's rule engine architect. Your job is to analyze confirmed fraud transactions that slipped past the existing rule engine and generate new detection rules.
 
 You will receive:
 1. Feature statistics for transactions that were confirmed fraud but had rule_score = 0
