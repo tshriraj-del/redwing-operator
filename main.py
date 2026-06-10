@@ -4,9 +4,12 @@ SyntheticID Operator — Real-time fraud pattern detection service.
 Loads the trained ML models from ~/pulseml_models and exposes:
   GET  /health            → system health + model info
   GET  /patterns          → full pattern library
-  POST /score             → score a single transaction
-  GET  /monitor/stream    → SSE stream of live transaction scoring
+  POST /score             → score a single transaction (one-shot, no pipeline routing)
+  GET  /monitor/stream    → SSE stream — drains injection buffer, falls back to historical
   GET  /alerts            → recent high-confidence alerts
+  POST /ingest            → inject a live transaction into the full scoring pipeline
+  POST /ingest/batch      → inject up to 1 000 transactions in one call
+  GET  /ingest/stats      → injection buffer + log stats
 """
 
 import asyncio
@@ -16,6 +19,7 @@ import pickle
 import random
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -74,6 +78,11 @@ except Exception as e:
     FEATURES = []
     df_all   = pd.DataFrame()
     print(f"⚠ Model load failed: {e}")
+
+# ── Injection pipeline state ───────────────────────────────────────────────────
+
+_ingest_buffer:   deque = deque(maxlen=500)   # ring buffer — latest injected events
+_ingest_log_path: Path  = MODELS_DIR / "ingest_log.jsonl"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -291,6 +300,9 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
     """
     SSE stream of transactions being scored in real-time.
 
+    Drains the injection buffer first (real injected transactions), then falls
+    back to historical dataset replay so the stream never goes silent.
+
     Query params:
       speed  — seconds between events (default 0.25 = 4 tx/sec)
       limit  — max transactions to stream (default 300)
@@ -300,23 +312,42 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
             yield f"data: {json.dumps({'error': 'Models not loaded'})}\n\n"
         return StreamingResponse(error_stream(), media_type="text/event-stream")
 
-    # Mix fraud + legit for a realistic stream
-    fraud_rows  = df_all[df_all["is_fraud"] == True].head(60)  if "is_fraud" in df_all.columns else pd.DataFrame()
-    legit_rows  = df_all[df_all["is_fraud"] == False].head(240) if "is_fraud" in df_all.columns else df_all.head(300)
-    sample      = pd.concat([fraud_rows, legit_rows]).sample(frac=1, random_state=42).head(limit).reset_index(drop=True)
+    # Snapshot the injection buffer before building the historical fallback
+    injected = list(_ingest_buffer)
+
+    # Historical fallback: mix fraud + legit
+    fraud_rows = df_all[df_all["is_fraud"] == True].head(60)  if "is_fraud" in df_all.columns else pd.DataFrame()
+    legit_rows = df_all[df_all["is_fraud"] == False].head(240) if "is_fraud" in df_all.columns else df_all.head(300)
+    historical = pd.concat([fraud_rows, legit_rows]).sample(frac=1, random_state=42).reset_index(drop=True)
 
     async def event_stream():
-        stats = {"processed": 0, "alerts": 0}
+        stats = {"processed": 0, "alerts": 0, "injected": 0, "historical": 0}
+        emitted = 0
 
-        for _, row in sample.iterrows():
-            event = build_event(row)
+        # 1. Drain injection buffer (already scored — emit directly)
+        for event in injected:
+            if emitted >= limit:
+                break
             stats["processed"] += 1
+            stats["injected"]   += 1
+            if event.get("is_alert"):
+                stats["alerts"] += 1
+            yield f"data: {json.dumps({**event, 'source': 'injected', 'stats': stats.copy()})}\n\n"
+            await asyncio.sleep(speed)
+            emitted += 1
+
+        # 2. Historical replay to fill remaining quota
+        for _, row in historical.iterrows():
+            if emitted >= limit:
+                break
+            event = build_event(row)
+            stats["processed"]  += 1
+            stats["historical"] += 1
             if event["is_alert"]:
                 stats["alerts"] += 1
-
-            payload = {**event, "stats": stats.copy()}
-            yield f"data: {json.dumps(payload)}\n\n"
+            yield f"data: {json.dumps({**event, 'source': 'historical', 'stats': stats.copy()})}\n\n"
             await asyncio.sleep(speed)
+            emitted += 1
 
         yield f"data: {json.dumps({'done': True, 'stats': stats})}\n\n"
 
@@ -347,6 +378,120 @@ def get_alerts(limit: int = 30):
     # Sort by combined score desc
     alerts.sort(key=lambda x: x["combined_score"], reverse=True)
     return alerts[:limit]
+
+
+# ── Injection Pipeline ────────────────────────────────────────────────────────
+
+def _write_ingest_log(events: list[dict]) -> None:
+    """Append scored events to the JSONL ingest log (blocking — run in executor)."""
+    try:
+        with open(_ingest_log_path, "a") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+    except Exception:
+        pass
+
+
+def _fan_out(event: dict) -> None:
+    """Push a scored event to all active SSE subscribers."""
+    for q in list(_event_subscribers):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
+@app.post("/ingest")
+async def ingest_transaction(body: dict):
+    """
+    Inject a live transaction into the full RedWing scoring pipeline.
+
+    Runs the complete 4-tier cascade (XGBoost → GNN → graph features → drift)
+    then routes the scored event to every live output channel:
+      • Drift monitor rolling buffer         (concept drift tracking)
+      • Autonomous agent SSE fan-out         (all connected analyst clients)
+      • In-memory ingest ring buffer         (feeds /monitor/stream)
+      • Append-only JSONL log                (~/pulseml_models/ingest_log.jsonl)
+
+    Accepts raw transaction fields (amount, user_id, device_id, recipient_id,
+    payment_rail, …) or pre-computed ML features — or a mix of both.
+    Any missing features default to 0.0.
+    """
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded — run the ML Fraud Engine notebook first.")
+
+    event = build_event(body)   # drift_monitor.record() already called inside build_event
+    event["source"] = "injected"
+
+    _ingest_buffer.appendleft(event)
+    _fan_out(event)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _write_ingest_log, [event])
+
+    return event
+
+
+@app.post("/ingest/batch")
+async def ingest_batch(body: dict):
+    """
+    Inject multiple transactions in a single call.
+
+    Body: {"transactions": [{...}, {...}, ...]}  (max 1 000 per call)
+    Returns: list of scored events + summary stats.
+    """
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded — run the ML Fraud Engine notebook first.")
+
+    transactions = body.get("transactions", [])
+    if not transactions:
+        raise HTTPException(400, "Body must contain a 'transactions' list.")
+    if len(transactions) > 1000:
+        raise HTTPException(400, "Batch limit is 1 000 transactions per call.")
+
+    results, alerts = [], 0
+    for tx in transactions:
+        event = build_event(tx)
+        event["source"] = "injected"
+        _ingest_buffer.appendleft(event)
+        _fan_out(event)
+        if event["is_alert"]:
+            alerts += 1
+        results.append(event)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _write_ingest_log, results)
+
+    return {
+        "processed":   len(results),
+        "alerts":      alerts,
+        "alert_rate":  round(alerts / len(results), 4),
+        "results":     results,
+    }
+
+
+@app.get("/ingest/stats")
+def ingest_stats():
+    """
+    Injection pipeline health: buffer occupancy and persistent log size.
+    """
+    log_lines = 0
+    log_bytes = 0
+    if _ingest_log_path.exists():
+        log_bytes = _ingest_log_path.stat().st_size
+        try:
+            with open(_ingest_log_path) as f:
+                log_lines = sum(1 for _ in f)
+        except Exception:
+            pass
+
+    return {
+        "buffer_used":      len(_ingest_buffer),
+        "buffer_capacity":  _ingest_buffer.maxlen,
+        "log_transactions": log_lines,
+        "log_size_bytes":   log_bytes,
+        "log_path":         str(_ingest_log_path),
+    }
 
 
 # ── Rule Factory Endpoints ────────────────────────────────────────────────────
