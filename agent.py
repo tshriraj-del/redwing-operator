@@ -236,10 +236,16 @@ def autonomous_decision(
     combined_score: float,
     ai_sig: dict,
     config: dict,
+    graph_risk: float = 0.0,
 ) -> dict:
     """
     Make a block/flag/allow decision using per-threat thresholds from config.
     Config changes (via PUT /agent/config) apply immediately on next tick.
+
+    Effective score blends three signals (4-tier cascade, Tier 1+3):
+      60% XGBoost combined score — primary ML signal
+      25% AI behavioral confidence — bot/synthetic ID patterns
+      15% graph risk score — ring membership, shared device, recipient fraud rate
     """
     per_threat = config["per_threat"].get(threat_type, {"block": 0.65, "flag": 0.45, "enabled": True})
     toggles    = config["toggles"]
@@ -258,9 +264,9 @@ def autonomous_decision(
     if toggles.get("zero_tolerance_bot") and threat_type == "card_testing_bot":
         block_thr = 0.30
 
-    # Blend ML combined score (70%) with AI behavioral confidence (30%)
-    ai_conf        = ai_sig.get("confidence", 0.0)
-    effective_score = round(combined_score * 0.70 + ai_conf * 0.30, 4)
+    # Blend: XGBoost (60%) + AI behavioral (25%) + graph context (15%)
+    ai_conf         = ai_sig.get("confidence", 0.0)
+    effective_score = round(combined_score * 0.60 + ai_conf * 0.25 + graph_risk * 0.15, 4)
 
     if effective_score >= block_thr:
         action    = "block"
@@ -431,8 +437,9 @@ async def run_agent(build_event_fn, df_all, features) -> None:
             threat_type = classify_threat(tx, ml_score, ai_sig)
             ai_sig["threat_type"] = threat_type
 
-            # ── Autonomous decision ───────────────────────────────────────
-            decision    = autonomous_decision(threat_type, c_score, ai_sig, agent_config)
+            # ── Autonomous decision (graph risk feeds the 60/25/15 blend) ─
+            graph_risk = tx.get("graph_risk_score", 0.0)
+            decision   = autonomous_decision(threat_type, c_score, ai_sig, agent_config, graph_risk)
 
             # ── Update counters ───────────────────────────────────────────
             action = decision["action"]
@@ -462,6 +469,8 @@ async def run_agent(build_event_fn, df_all, features) -> None:
                 "escalate_human":   decision.get("escalate_human", False),
                 "ai_signals":       ai_sig.get("signals", []),
                 "ai_confidence":    ai_sig.get("confidence", 0.0),
+                "graph_risk_score": graph_risk,
+                "graph_context":    tx.get("graph_context", {}),
                 "timestamp":        datetime.utcnow().isoformat() + "Z",
             }
 

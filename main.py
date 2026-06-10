@@ -39,6 +39,8 @@ from agent import (
     novel_attack_buffer, _event_subscribers,
     load_config, save_config, validate_config, THREAT_META,
 )
+import drift_monitor
+import graph_features
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -62,6 +64,8 @@ try:
     FEATURES = config["features"]
     MODEL_OK = True
     print(f"✓ Models loaded — {len(df_all):,} transactions available")
+    graph_features.precompute(df_all)
+    print(f"✓ Graph features precomputed — {graph_features.get_stats()['entities']:,} entities indexed")
 except Exception as e:
     MODEL_OK = False
     FEATURES = []
@@ -93,20 +97,32 @@ def build_event(row) -> dict:
     c_score = combined_score(ml, top["confidence"]) if top else ml
     alert   = is_alert(c_score) or bool(row.get("is_fraud", False))
 
+    # ── Tier 3: offline graph context (O(1) lookup) ───────────────────────────
+    graph_ctx = graph_features.get_features(
+        user_id      = row.get("user_id"),
+        device_id    = row.get("device_id"),
+        recipient_id = row.get("recipient_id"),
+    )
+
+    # ── Drift monitoring — non-blocking, appends to rolling buffer ────────────
+    drift_monitor.record(ml, features)
+
     return {
-        "transaction_id": str(row.get("transaction_id", f"txn_{random.randint(10000,99999)}")),
-        "amount":         round(float(row.get("amount", 0.0)), 2),
-        "user_id":        str(row.get("user_id", "unknown")),
-        "rail":           str(row.get("payment_rail", "card")),
-        "ml_score":       round(ml, 4),
-        "top_pattern":    top["pattern_name"] if top and top["confidence"] > 0.35 else None,
-        "top_pattern_id": top["pattern_id"]   if top and top["confidence"] > 0.35 else None,
-        "pattern_color":  top["color"]         if top and top["confidence"] > 0.35 else "#64748b",
-        "confidence":     round(top["confidence"], 4) if top else 0.0,
-        "combined_score": round(c_score, 4),
-        "is_alert":       alert,
+        "transaction_id":  str(row.get("transaction_id", f"txn_{random.randint(10000,99999)}")),
+        "amount":          round(float(row.get("amount", 0.0)), 2),
+        "user_id":         str(row.get("user_id", "unknown")),
+        "rail":            str(row.get("payment_rail", "card")),
+        "ml_score":        round(ml, 4),
+        "top_pattern":     top["pattern_name"] if top and top["confidence"] > 0.35 else None,
+        "top_pattern_id":  top["pattern_id"]   if top and top["confidence"] > 0.35 else None,
+        "pattern_color":   top["color"]         if top and top["confidence"] > 0.35 else "#64748b",
+        "confidence":      round(top["confidence"], 4) if top else 0.0,
+        "combined_score":  round(c_score, 4),
+        "is_alert":        alert,
         "matched_signals": top["matched_signals"] if top else [],
-        "timestamp":      datetime.utcnow().isoformat() + "Z",
+        "graph_context":   graph_ctx,
+        "graph_risk_score":graph_ctx["graph_risk_score"],
+        "timestamp":       datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -114,9 +130,18 @@ def build_event(row) -> dict:
 
 @app.on_event("startup")
 async def start_autonomous_agent():
-    """Start the SyntheticID autonomous agent as a background task."""
+    """Start the SyntheticID agent and schedule hourly graph feature refresh."""
     if MODEL_OK and not agent_state.running:
         asyncio.create_task(run_agent(build_event, df_all, FEATURES))
+    asyncio.create_task(_graph_refresh_loop())
+
+
+async def _graph_refresh_loop() -> None:
+    """Refresh graph features every hour so the ring-detection context stays current."""
+    while True:
+        await asyncio.sleep(3600)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, graph_features.refresh_from_disk, MODELS_DIR)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -560,6 +585,40 @@ def get_typologies():
     fraud = df[df["is_fraud"] == True] if "is_fraud" in df.columns else df
     typos = [t for t in fraud["fraud_typology"].dropna().unique().tolist() if t and t != "none"]
     return sorted(typos)
+
+
+# ── Drift Monitor ────────────────────────────────────────────────────────────
+
+@app.get("/drift/status")
+def get_drift_status():
+    """
+    ADWIN-style concept drift report.
+    Returns PSI on model scores and 5 key features:
+      state: warming_up | stable | warning | drift
+      score_psi / feature_psi — Population Stability Index values
+      drift_events — history of state transitions into warning/drift
+    PSI < 0.10: stable · 0.10–0.20: warning · > 0.20: retrain recommended
+    """
+    return drift_monitor.get_status()
+
+
+@app.post("/drift/reset")
+def reset_drift_monitor():
+    """
+    Reset the drift monitor after a model retrain.
+    Clears all rolling buffers and returns to warming_up state.
+    """
+    drift_monitor.reset()
+    return {"status": "reset", "message": "Drift monitor cleared — warming up again"}
+
+
+@app.get("/graph/stats")
+def get_graph_stats():
+    """
+    Return graph feature store metadata: entity counts, last refresh time.
+    The feature store is the offline precomputed embeddings layer (BRIGHT Tier 3).
+    """
+    return graph_features.get_stats()
 
 
 # ── SyntheticID Ingest ────────────────────────────────────────────────────────
