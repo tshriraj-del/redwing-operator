@@ -41,6 +41,7 @@ from agent import (
 )
 import drift_monitor
 import graph_features
+import gnn_lite
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -66,6 +67,8 @@ try:
     print(f"✓ Models loaded — {len(df_all):,} transactions available")
     graph_features.precompute(df_all)
     print(f"✓ Graph features precomputed — {graph_features.get_stats()['entities']:,} entities indexed")
+    gnn_lite.init(df_all)
+    print(f"✓ GNN Tier 2 initialised — {gnn_lite.get_stats()['users']:,} user embeddings")
 except Exception as e:
     MODEL_OK = False
     FEATURES = []
@@ -95,7 +98,18 @@ def build_event(row) -> dict:
     top = matches[0] if matches else None
 
     c_score = combined_score(ml, top["confidence"]) if top else ml
-    alert   = is_alert(c_score) or bool(row.get("is_fraud", False))
+
+    # ── Tier 2: GNN cascade (borderline transactions only) ────────────────────
+    gnn_result = None
+    if gnn_lite.should_invoke(c_score):
+        gnn_result = gnn_lite.score(
+            row.get("user_id"), row.get("device_id"), row.get("recipient_id")
+        )
+        cascade_score = gnn_lite.cascade_blend(c_score, gnn_result)
+    else:
+        cascade_score = c_score
+
+    alert = is_alert(cascade_score) or bool(row.get("is_fraud", False))
 
     # ── Tier 3: offline graph context (O(1) lookup) ───────────────────────────
     graph_ctx = graph_features.get_features(
@@ -108,21 +122,24 @@ def build_event(row) -> dict:
     drift_monitor.record(ml, features)
 
     return {
-        "transaction_id":  str(row.get("transaction_id", f"txn_{random.randint(10000,99999)}")),
-        "amount":          round(float(row.get("amount", 0.0)), 2),
-        "user_id":         str(row.get("user_id", "unknown")),
-        "rail":            str(row.get("payment_rail", "card")),
-        "ml_score":        round(ml, 4),
-        "top_pattern":     top["pattern_name"] if top and top["confidence"] > 0.35 else None,
-        "top_pattern_id":  top["pattern_id"]   if top and top["confidence"] > 0.35 else None,
-        "pattern_color":   top["color"]         if top and top["confidence"] > 0.35 else "#64748b",
-        "confidence":      round(top["confidence"], 4) if top else 0.0,
-        "combined_score":  round(c_score, 4),
-        "is_alert":        alert,
-        "matched_signals": top["matched_signals"] if top else [],
-        "graph_context":   graph_ctx,
-        "graph_risk_score":graph_ctx["graph_risk_score"],
-        "timestamp":       datetime.utcnow().isoformat() + "Z",
+        "transaction_id":    str(row.get("transaction_id", f"txn_{random.randint(10000,99999)}")),
+        "amount":            round(float(row.get("amount", 0.0)), 2),
+        "user_id":           str(row.get("user_id", "unknown")),
+        "rail":              str(row.get("payment_rail", "card")),
+        "ml_score":          round(ml, 4),
+        "top_pattern":       top["pattern_name"] if top and top["confidence"] > 0.35 else None,
+        "top_pattern_id":    top["pattern_id"]   if top and top["confidence"] > 0.35 else None,
+        "pattern_color":     top["color"]         if top and top["confidence"] > 0.35 else "#64748b",
+        "confidence":        round(top["confidence"], 4) if top else 0.0,
+        "tier1_score":       round(c_score, 4),
+        "tier2_gnn_score":   round(gnn_result.score, 4) if gnn_result else None,
+        "tier2_invoked":     gnn_result is not None,
+        "combined_score":    round(cascade_score, 4),
+        "is_alert":          alert,
+        "matched_signals":   top["matched_signals"] if top else [],
+        "graph_context":     graph_ctx,
+        "graph_risk_score":  graph_ctx["graph_risk_score"],
+        "timestamp":         datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -142,6 +159,7 @@ async def _graph_refresh_loop() -> None:
         await asyncio.sleep(3600)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, graph_features.refresh_from_disk, MODELS_DIR)
+        await loop.run_in_executor(None, gnn_lite.refresh_from_disk, MODELS_DIR)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -619,6 +637,15 @@ def get_graph_stats():
     The feature store is the offline precomputed embeddings layer (BRIGHT Tier 3).
     """
     return graph_features.get_stats()
+
+
+@app.get("/gnn/stats")
+def get_gnn_stats():
+    """
+    Return GNN Tier 2 table coverage: user/device/recipient counts and
+    precomputed 1-hop neighbourhood aggregate counts.
+    """
+    return gnn_lite.get_stats()
 
 
 # ── SyntheticID Ingest ────────────────────────────────────────────────────────
