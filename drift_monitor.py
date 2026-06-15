@@ -13,6 +13,7 @@ PSI interpretation (industry standard):
 
 Reference: ADWIN (Bifet & Gavalda, 2007); PSI as used in SR 11-7 / Fed guidance.
 """
+from __future__ import annotations
 
 import math
 from collections import deque

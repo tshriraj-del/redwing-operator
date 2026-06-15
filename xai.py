@@ -11,6 +11,7 @@ EU AI Act (Annex III): credit/fraud scoring systems are high-risk AI.
 SR 26-02 (Fed, April 2026): model governance requires documented explanation
 artefacts for every production prediction.
 """
+from __future__ import annotations
 
 import json
 import uuid

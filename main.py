@@ -49,7 +49,10 @@ import gnn_lite
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
-MODELS_DIR = Path.home() / "pulseml_models"
+# Path to the ML backend (pulseml_models / redwing-ml): its trained models AND its
+# shared feature foundation (features.py, graph_layer.py) are loaded from here, so the
+# operator computes features identically to training. Override for non-default deploys.
+MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_models"))
 
 app = FastAPI(title="SyntheticID Operator", version="1.0.0")
 
@@ -61,14 +64,35 @@ app.add_middleware(
 )
 
 # Load models once at startup
+import sys
+sys.path.insert(0, str(MODELS_DIR))   # share the ML backend's feature foundation
 try:
-    scaler  = pickle.load(open(MODELS_DIR / "scaler.pkl",         "rb"))
-    xgb     = pickle.load(open(MODELS_DIR / "xgboost.pkl",        "rb"))
+    # Prefer the retrained, skew-free model + scaler when present.
+    if (MODELS_DIR / "xgboost_retrained.pkl").exists():
+        scaler = pickle.load(open(MODELS_DIR / "scaler_retrained.pkl", "rb"))
+        xgb    = pickle.load(open(MODELS_DIR / "xgboost_retrained.pkl", "rb"))
+        MODEL_TAG = "retrained"
+    else:
+        scaler = pickle.load(open(MODELS_DIR / "scaler.pkl",  "rb"))
+        xgb    = pickle.load(open(MODELS_DIR / "xgboost.pkl", "rb"))
+        MODEL_TAG = "original"
     config  = json.load(open(MODELS_DIR  / "model_config.json"))
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
-    print(f"✓ Models loaded — {len(df_all):,} transactions available")
+    print(f"✓ Models loaded ({MODEL_TAG}) — {len(df_all):,} transactions available")
+    # Shared feature foundation — the SAME transform used to train the model, so the
+    # operator computes features identically to training (no training-serving skew).
+    try:
+        import features as mlfeat
+        from graph_layer import RecipientReputation
+        _rep = (RecipientReputation.load()
+                if (MODELS_DIR / "recipient_reputation.json").exists() else None)
+        FEATURE_ENGINE = mlfeat.FeatureEngineer(mlfeat.build_profiles(), _rep)
+        print(f"✓ Feature foundation loaded — {len(FEATURE_ENGINE.profiles):,} user profiles")
+    except Exception as _fe:
+        FEATURE_ENGINE = None
+        print(f"⚠ Feature foundation unavailable ({_fe}); using raw feature passthrough")
     graph_features.precompute(df_all)
     print(f"✓ Graph features precomputed — {graph_features.get_stats()['entities']:,} entities indexed")
     gnn_lite.init(df_all)
@@ -77,6 +101,7 @@ except Exception as e:
     MODEL_OK = False
     FEATURES = []
     df_all   = pd.DataFrame()
+    FEATURE_ENGINE = None
     print(f"⚠ Model load failed: {e}")
 
 # ── Injection pipeline state ───────────────────────────────────────────────────
@@ -86,6 +111,15 @@ _ingest_log_path: Path  = MODELS_DIR / "ingest_log.jsonl"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def compute_features(raw: dict) -> dict:
+    """Compute the model's features through the shared foundation (the same transform
+    used at training → no training-serving skew). Falls back to raw passthrough only
+    if the foundation is unavailable — which is the legacy zero-fill behaviour."""
+    if FEATURE_ENGINE is not None:
+        return FEATURE_ENGINE.compute(raw)
+    return {f: float(raw.get(f, 0.0)) for f in FEATURES}
+
 
 def ml_score_row(features: dict) -> float:
     """Run XGBoost on a feature dict; returns fraud probability 0–1."""
@@ -101,7 +135,7 @@ def build_event(row) -> dict:
     if isinstance(row, pd.Series):
         row = row.to_dict()
 
-    features = {f: float(row.get(f, 0.0)) for f in FEATURES}
+    features = compute_features(row)
     ml  = ml_score_row(features)
     matches = score_transaction(features)
     top = matches[0] if matches else None
@@ -207,7 +241,7 @@ def score(body: dict):
     if not MODEL_OK:
         raise HTTPException(503, "ML models not loaded. Run the ML Fraud Engine notebook first.")
 
-    features = {f: float(body.get(f, 0.0)) for f in FEATURES}
+    features = compute_features(body)
     ml       = ml_score_row(features)
     matches  = score_transaction(features)
     top      = matches[0] if matches else None
