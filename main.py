@@ -1,11 +1,11 @@
 """
-SyntheticID Operator — Real-time fraud pattern detection service.
+SyntheticID Operator - Real-time fraud pattern detection service.
 
 Loads the trained ML models from ~/pulseml_models and exposes:
   GET  /health            → system health + model info
   GET  /patterns          → full pattern library
   POST /score             → score a single transaction (one-shot, no pipeline routing)
-  GET  /monitor/stream    → SSE stream — drains injection buffer, falls back to historical
+  GET  /monitor/stream    → SSE stream - drains injection buffer, falls back to historical
   GET  /alerts            → recent high-confidence alerts
   POST /ingest            → inject a live transaction into the full scoring pipeline
   POST /ingest/batch      → inject up to 1 000 transactions in one call
@@ -46,6 +46,9 @@ from agent import (
 import drift_monitor
 import graph_features
 import gnn_lite
+import case_file
+import fraud_env
+import adversary
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -80,8 +83,8 @@ try:
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
-    print(f"✓ Models loaded ({MODEL_TAG}) — {len(df_all):,} transactions available")
-    # Shared feature foundation — the SAME transform used to train the model, so the
+    print(f"✓ Models loaded ({MODEL_TAG}) - {len(df_all):,} transactions available")
+    # Shared feature foundation - the SAME transform used to train the model, so the
     # operator computes features identically to training (no training-serving skew).
     try:
         import features as mlfeat
@@ -89,14 +92,14 @@ try:
         _rep = (RecipientReputation.load()
                 if (MODELS_DIR / "recipient_reputation.json").exists() else None)
         FEATURE_ENGINE = mlfeat.FeatureEngineer(mlfeat.build_profiles(), _rep)
-        print(f"✓ Feature foundation loaded — {len(FEATURE_ENGINE.profiles):,} user profiles")
+        print(f"✓ Feature foundation loaded - {len(FEATURE_ENGINE.profiles):,} user profiles")
     except Exception as _fe:
         FEATURE_ENGINE = None
         print(f"⚠ Feature foundation unavailable ({_fe}); using raw feature passthrough")
     graph_features.precompute(df_all)
-    print(f"✓ Graph features precomputed — {graph_features.get_stats()['entities']:,} entities indexed")
+    print(f"✓ Graph features precomputed - {graph_features.get_stats()['entities']:,} entities indexed")
     gnn_lite.init(df_all)
-    print(f"✓ GNN Tier 2 initialised — {gnn_lite.get_stats()['users']:,} user embeddings")
+    print(f"✓ GNN Tier 2 initialised - {gnn_lite.get_stats()['users']:,} user embeddings")
 except Exception as e:
     MODEL_OK = False
     FEATURES = []
@@ -104,9 +107,32 @@ except Exception as e:
     FEATURE_ENGINE = None
     print(f"⚠ Model load failed: {e}")
 
+# ── Real-data payment model (ULB Credit Card Fraud) - engine-validation anchor ──
+# Independent of the synthetic pipeline above: this is the ONE model trained and
+# validated on REAL labels. A missing artifact must not break the main operator.
+import xgboost as xgblib  # noqa: E402
+PAYMENT_REAL = None
+try:
+    _pm_booster = xgblib.Booster()
+    _pm_booster.load_model(str(MODELS_DIR / "payment_real_xgb.json"))
+    _pm_meta = json.load(open(MODELS_DIR / "payment_real_meta.json"))
+    _pm_best_it = int(_pm_meta.get("model", {}).get("best_iteration", 0))
+    PAYMENT_REAL = {
+        "booster":   _pm_booster,
+        "platt":     pickle.load(open(MODELS_DIR / "payment_real_platt.pkl", "rb")),
+        "meta":      _pm_meta,
+        "feats":     _pm_meta["feature_order"],
+        "threshold": float(_pm_meta["metrics"]["threshold"]),
+        # Serve with the SAME tree range training calibrated on - no serving skew.
+        "iter_range": (0, _pm_best_it + 1) if _pm_best_it else None,
+    }
+    print(f"✓ Real-data payment model loaded - PR-AUC {_pm_meta['metrics']['pr_auc']} (ULB, real labels)")
+except Exception as _pe:
+    print(f"⚠ Real-data payment model unavailable ({_pe}) - run payment_real_model.py")
+
 # ── Injection pipeline state ───────────────────────────────────────────────────
 
-_ingest_buffer:   deque = deque(maxlen=500)   # ring buffer — latest injected events
+_ingest_buffer:   deque = deque(maxlen=500)   # ring buffer - latest injected events
 _ingest_log_path: Path  = MODELS_DIR / "ingest_log.jsonl"
 
 
@@ -115,7 +141,7 @@ _ingest_log_path: Path  = MODELS_DIR / "ingest_log.jsonl"
 def compute_features(raw: dict) -> dict:
     """Compute the model's features through the shared foundation (the same transform
     used at training → no training-serving skew). Falls back to raw passthrough only
-    if the foundation is unavailable — which is the legacy zero-fill behaviour."""
+    if the foundation is unavailable - which is the legacy zero-fill behaviour."""
     if FEATURE_ENGINE is not None:
         return FEATURE_ENGINE.compute(raw)
     return {f: float(raw.get(f, 0.0)) for f in FEATURES}
@@ -161,7 +187,7 @@ def build_event(row) -> dict:
         recipient_id = row.get("recipient_id"),
     )
 
-    # ── Drift monitoring — non-blocking, appends to rolling buffer ────────────
+    # ── Drift monitoring - non-blocking, appends to rolling buffer ────────────
     drift_monitor.record(ml, features)
 
     return {
@@ -225,13 +251,13 @@ def privacy_curve():
     event- and user-level DP trade-off on the cross-user graph signal."""
     p = MODELS_DIR / "privacy_utility_curve.json"
     if not p.exists():
-        raise HTTPException(404, "privacy_utility_curve.json not found — run privacy_layer.py")
+        raise HTTPException(404, "privacy_utility_curve.json not found - run privacy_layer.py")
     return json.loads(p.read_text())
 
 
 @app.get("/observability/skew")
 def observability_skew():
-    """Training-serving skew analysis — measured before/after the feature-foundation
+    """Training-serving skew analysis - measured before/after the feature-foundation
     fix. Same model, same thresholds; only feature reproduction changed."""
     return {
         "offline_auc": 0.984,
@@ -241,7 +267,7 @@ def observability_skew():
         "features_reproducible_before": 13,
         "root_cause": [
             "10 of 23 features had no reproducible definition at serving time",
-            "They silently defaulted to zero — including top-weighted features",
+            "They silently defaulted to zero - including top-weighted features",
             "~24% of the model's signal was dead in production",
             "Invisible to offline AUC, computed where the features still exist",
         ],
@@ -251,6 +277,41 @@ def observability_skew():
             "23/23 features restored; field catch 0.3% → 91%",
         ],
     }
+
+
+@app.get("/payment/meta")
+def payment_meta():
+    """Real-data validation report for the ULB card-fraud model - PR-AUC headline,
+    PR curve, confusion, feature importance, and honest held-out samples."""
+    if not PAYMENT_REAL:
+        raise HTTPException(404, "Real-data payment model not built - run payment_real_model.py")
+    return PAYMENT_REAL["meta"]
+
+
+@app.post("/score/payment")
+def score_payment(body: dict):
+    """Live inference through the REAL-data ULB model. Accepts V1..V28 + Amount
+    (or a `features` dict). Returns Platt-calibrated P(fraud) + the decision against
+    the calibration-tuned threshold."""
+    if not PAYMENT_REAL:
+        raise HTTPException(503, "Real-data payment model not loaded.")
+    import math
+    src = body.get("features", body)
+    row = []
+    for f in PAYMENT_REAL["feats"]:
+        if f == "log_amount":
+            row.append(float(src["log_amount"]) if "log_amount" in src
+                       else math.log1p(float(src.get("Amount", src.get("amount", 0.0)))))
+        else:
+            row.append(float(src.get(f, 0.0)))
+    _dm = xgblib.DMatrix(np.array([row], dtype=float))
+    _ir = PAYMENT_REAL.get("iter_range")
+    raw = float(PAYMENT_REAL["booster"].predict(_dm, iteration_range=_ir)[0] if _ir
+                else PAYMENT_REAL["booster"].predict(_dm)[0])
+    p = float(PAYMENT_REAL["platt"].predict_proba([[raw]])[0][1])
+    thr = PAYMENT_REAL["threshold"]
+    return {"p_fraud": round(p, 4), "raw_score": round(raw, 4), "threshold": round(thr, 4),
+            "decision": "BLOCK" if p >= thr else "ALLOW"}
 
 
 @app.get("/patterns")
@@ -372,8 +433,8 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
     back to historical dataset replay so the stream never goes silent.
 
     Query params:
-      speed  — seconds between events (default 0.25 = 4 tx/sec)
-      limit  — max transactions to stream (default 300)
+      speed  - seconds between events (default 0.25 = 4 tx/sec)
+      limit  - max transactions to stream (default 300)
     """
     if not MODEL_OK:
         async def error_stream():
@@ -392,7 +453,7 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
         stats = {"processed": 0, "alerts": 0, "injected": 0, "historical": 0}
         emitted = 0
 
-        # 1. Drain injection buffer (already scored — emit directly)
+        # 1. Drain injection buffer (already scored - emit directly)
         for event in injected:
             if emitted >= limit:
                 break
@@ -448,10 +509,145 @@ def get_alerts(limit: int = 30):
     return alerts[:limit]
 
 
+# ── Investigator Case File ────────────────────────────────────────────────────
+
+def _assemble_case(row) -> dict:
+    """Score a transaction row and assemble the full investigator case file."""
+    scored = build_event(row)
+    graph_ctx = scored.get("graph_context") or {}
+
+    # Best-effort XAI explanation for the alert panel's top features.
+    explanation = None
+    try:
+        features = compute_features(row)
+        ml = ml_score_row(features)
+        matches = score_transaction(features)
+        top = matches[0] if matches else None
+        c_score = combined_score(ml, top["confidence"]) if top else ml
+        explanation = _xai_explain(
+            features=features, ml_score=ml, pattern_match=top, combined_score=c_score,
+            model=xgb, scaler=scaler, feature_names=FEATURES,
+            model_version=config.get("version", "1.0.0"),
+            transaction_id=str(row.get("transaction_id", "")),
+        )
+    except Exception:
+        explanation = None
+
+    return case_file.assemble(row, scored, graph_ctx=graph_ctx, explanation=explanation)
+
+
+@app.get("/case/{transaction_id}")
+def get_case(transaction_id: str):
+    """Full investigator case file for one transaction - the decisioning surface a
+    fraud analyst works from: Customer 360 / CDD, card-usage detail, card-fraud
+    signals, dispute-evidence study, device/network context, timeline, and a
+    recommended disposition. SAR is a downstream action, not the entry point."""
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded.")
+    if df_all.empty or "transaction_id" not in df_all.columns:
+        raise HTTPException(404, "No transaction dataset loaded.")
+
+    match = df_all[df_all["transaction_id"].astype(str) == str(transaction_id)]
+    if match.empty:
+        raise HTTPException(404, f"transaction_id '{transaction_id}' not found.")
+    return _assemble_case(match.iloc[0].to_dict())
+
+
+@app.post("/case")
+def post_case(body: dict):
+    """Assemble a case file from an ad-hoc transaction payload (e.g. an injected or
+    streamed transaction not in the historical dataset)."""
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded.")
+    return _assemble_case(body)
+
+
+# ── Agent-Evaluation Environment ──────────────────────────────────────────────
+# The investigator case workbench, exposed as a resettable environment an agent can
+# be evaluated against: known case state → bounded action space → trajectory →
+# process + outcome verifiers. See fraud_env.py.
+
+def _case_for_env(transaction_id: str) -> dict:
+    if not MODEL_OK or df_all.empty or "transaction_id" not in df_all.columns:
+        raise HTTPException(404, "No transaction dataset loaded.")
+    match = df_all[df_all["transaction_id"].astype(str) == str(transaction_id)]
+    if match.empty:
+        raise HTTPException(404, f"transaction_id '{transaction_id}' not found.")
+    return _assemble_case(match.iloc[0].to_dict())
+
+
+@app.get("/env/spec")
+def env_spec():
+    """The environment contract: observation schema, action space, reward design."""
+    return fraud_env.env_spec()
+
+
+@app.post("/env/run")
+def env_run(body: dict):
+    """Run a reference policy end-to-end on one case and return its trajectory +
+    verifier scorecard. Body: {transaction_id, agent}. agent ∈ investigator |
+    trigger_happy | cautious."""
+    case = _case_for_env(str(body.get("transaction_id", "")))
+    return fraud_env.run_episode(case, agent=str(body.get("agent", "investigator")))
+
+
+@app.post("/env/run-all")
+def env_run_all(body: dict):
+    """Run every reference policy on one case - shows that the verifiers discriminate
+    a disciplined investigator from naive baselines. Body: {transaction_id}."""
+    case = _case_for_env(str(body.get("transaction_id", "")))
+    return {
+        "transaction_id": case.get("transaction_id"),
+        "case_id": case.get("case_id"),
+        "ground_truth_label": case.get("alert", {}).get("ground_truth_label"),
+        "gold_disposition": fraud_env.gold_disposition(case),
+        "runs": [fraud_env.run_episode(case, agent=a) for a in fraud_env.POLICIES],
+    }
+
+
+@app.post("/env/step")
+def env_step(body: dict):
+    """One stateless step so ANY agent (LLM or otherwise) can drive the environment.
+    Body: {transaction_id, history:[actions], action} → observation, reward, done, info."""
+    case = _case_for_env(str(body.get("transaction_id", "")))
+    return fraud_env.step(case, body.get("history", []), str(body.get("action", "")))
+
+
+# ── Adversary Simulator ───────────────────────────────────────────────────────
+# Mutates a seed fraud with cost-tagged evasions and re-scores against the live
+# model to measure detection decay. See adversary.py.
+
+@app.get("/adversary/strategies")
+def adversary_strategies():
+    """The cost-tagged evasion registry (cheap = adversary controls for free)."""
+    return adversary.strategies()
+
+
+@app.post("/adversary/simulate")
+def adversary_simulate(body: dict):
+    """Run the cheap-vs-costly evasion sweep on one seed fraud. Body: {transaction_id}.
+    Returns per-strategy ablation, a cheapest-first detection-decay curve, and a verdict."""
+    if not MODEL_OK:
+        raise HTTPException(503, "ML models not loaded.")
+    tid = str(body.get("transaction_id", ""))
+    if df_all.empty or "transaction_id" not in df_all.columns:
+        raise HTTPException(404, "No transaction dataset loaded.")
+    match = df_all[df_all["transaction_id"].astype(str) == tid]
+    if match.empty:
+        raise HTTPException(404, f"transaction_id '{tid}' not found.")
+    row = match.iloc[0].to_dict()
+    features = compute_features(row)
+    result = adversary.simulate(features, ml_score_row)
+    result["transaction_id"] = tid
+    result["typology"] = str(row.get("fraud_typology", "unknown"))
+    result["rail"] = str(row.get("payment_rail", row.get("rail", "card")))
+    return result
+
+
 # ── Injection Pipeline ────────────────────────────────────────────────────────
 
 def _write_ingest_log(events: list[dict]) -> None:
-    """Append scored events to the JSONL ingest log (blocking — run in executor)."""
+    """Append scored events to the JSONL ingest log (blocking - run in executor)."""
     try:
         with open(_ingest_log_path, "a") as f:
             for ev in events:
@@ -482,11 +678,11 @@ async def ingest_transaction(body: dict):
       • Append-only JSONL log                (~/pulseml_models/ingest_log.jsonl)
 
     Accepts raw transaction fields (amount, user_id, device_id, recipient_id,
-    payment_rail, …) or pre-computed ML features — or a mix of both.
+    payment_rail, …) or pre-computed ML features - or a mix of both.
     Any missing features default to 0.0.
     """
     if not MODEL_OK:
-        raise HTTPException(503, "ML models not loaded — run the ML Fraud Engine notebook first.")
+        raise HTTPException(503, "ML models not loaded - run the ML Fraud Engine notebook first.")
 
     event = build_event(body)   # drift_monitor.record() already called inside build_event
     event["source"] = "injected"
@@ -509,7 +705,7 @@ async def ingest_batch(body: dict):
     Returns: list of scored events + summary stats.
     """
     if not MODEL_OK:
-        raise HTTPException(503, "ML models not loaded — run the ML Fraud Engine notebook first.")
+        raise HTTPException(503, "ML models not loaded - run the ML Fraud Engine notebook first.")
 
     transactions = body.get("transactions", [])
     if not transactions:
@@ -581,7 +777,7 @@ def get_rule_gaps(limit: int = 50):
 
     gaps = extract_rule_gaps(df_live)
     if gaps.empty:
-        return {"gaps": [], "count": 0, "message": "No rule gaps found yet — good coverage!"}
+        return {"gaps": [], "count": 0, "message": "No rule gaps found yet - good coverage!"}
 
     preview_cols = [c for c in [
         'transaction_id','amount','payment_rail','fraud_typology',
@@ -705,7 +901,7 @@ def get_network_graph(
     if typology and "fraud_typology" in df.columns:
         df = df[df["fraud_typology"] == typology]
 
-    # Work with a manageable sample — prioritise fraud rows
+    # Work with a manageable sample - prioritise fraud rows
     if len(df) > limit_nodes * 3:
         fraud_df  = df[df["is_fraud"] == True] if "is_fraud" in df.columns else pd.DataFrame()
         legit_df  = df[df["is_fraud"] == False] if "is_fraud" in df.columns else df
@@ -826,8 +1022,8 @@ def get_drift_status():
     ADWIN-style concept drift report.
     Returns PSI on model scores and 5 key features:
       state: warming_up | stable | warning | drift
-      score_psi / feature_psi — Population Stability Index values
-      drift_events — history of state transitions into warning/drift
+      score_psi / feature_psi - Population Stability Index values
+      drift_events - history of state transitions into warning/drift
     PSI < 0.10: stable · 0.10–0.20: warning · > 0.20: retrain recommended
     """
     return drift_monitor.get_status()
@@ -840,7 +1036,7 @@ def reset_drift_monitor():
     Clears all rolling buffers and returns to warming_up state.
     """
     drift_monitor.reset()
-    return {"status": "reset", "message": "Drift monitor cleared — warming up again"}
+    return {"status": "reset", "message": "Drift monitor cleared - warming up again"}
 
 
 @app.get("/graph/stats")
@@ -901,7 +1097,7 @@ def ingest_syntheticid(body: dict):
     """
     csv_path = MODELS_DIR / "transactions.csv"
     if not csv_path.exists():
-        raise HTTPException(503, "transactions.csv not found — run the ML notebook first")
+        raise HTTPException(503, "transactions.csv not found - run the ML notebook first")
 
     platform     = body.get("platform", "Fintech")
     sophistication = body.get("sophistication", "AI Fraud Agent")
@@ -911,7 +1107,7 @@ def ingest_syntheticid(body: dict):
 
     bypassed_steps = [s for s in timeline if s.get("outcome") == "BYPASSED"]
     if not bypassed_steps:
-        return {"inserted": 0, "message": "No BYPASSED steps found — nothing to ingest"}
+        return {"inserted": 0, "message": "No BYPASSED steps found - nothing to ingest"}
 
     df = pd.read_csv(csv_path)
 
@@ -963,7 +1159,7 @@ def ingest_syntheticid(body: dict):
 
 # ── LLM Proxy ─────────────────────────────────────────────────────────────────
 # Provider-agnostic proxy: anthropic | openai | groq | mistral
-# API key never touches the browser — stored in operator/.env only.
+# API key never touches the browser - stored in operator/.env only.
 #
 # operator/.env:
 #   LLM_PROVIDER=anthropic     # anthropic | openai | groq | mistral
@@ -1116,7 +1312,7 @@ async def start_agent():
     if agent_state.running:
         return {"status": "already_running"}
     if not MODEL_OK:
-        raise HTTPException(503, "ML models not loaded — run the ML notebook first")
+        raise HTTPException(503, "ML models not loaded - run the ML notebook first")
     asyncio.create_task(run_agent(build_event, df_all, FEATURES))
     return {"status": "started"}
 
@@ -1137,7 +1333,7 @@ def get_agent_config():
 @app.put("/agent/config")
 def update_agent_config(body: dict):
     """
-    Update agent config. Changes apply immediately on the next tick — no restart.
+    Update agent config. Changes apply immediately on the next tick - no restart.
     Accepts partial updates; merges deeply with current config.
     """
     try:
@@ -1309,7 +1505,7 @@ def report_fraud(body: dict):
     if not body.get("transaction_id") or not body.get("user_id"):
         raise HTTPException(400, "transaction_id and user_id are required")
     if not body.get("connectors"):
-        raise HTTPException(400, "connectors list is required — specify which agencies to report to")
+        raise HTTPException(400, "connectors list is required - specify which agencies to report to")
 
     req = ReportRequest(
         transaction_id = body["transaction_id"],
