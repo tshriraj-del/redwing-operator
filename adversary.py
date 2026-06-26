@@ -1,6 +1,6 @@
 """
-adversary.py - the cheap-vs-costly adversary simulator (live productisation of the
-red-team concept in redwing-ml/redteam.py).
+adversary.py - the cheap-vs-costly adversary simulator. This is REDWING's canonical
+adversarial surface: it red-teams the live model directly, in-process.
 
 Takes a seed fraud the model currently CATCHES, applies NAMED 2026 evasion moves each
 tagged by adversary COST, re-scores every variant against the LIVE model, and measures

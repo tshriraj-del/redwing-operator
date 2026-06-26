@@ -49,6 +49,7 @@ import gnn_lite
 import case_file
 import fraud_env
 import adversary
+import feedback
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,7 @@ app.add_middleware(
 # Load models once at startup
 import sys
 sys.path.insert(0, str(MODELS_DIR))   # share the ML backend's feature foundation
+_feedback = None   # closed-loop feedback store (set once the reputation layer loads)
 try:
     # Prefer the retrained, skew-free model + scaler when present.
     if (MODELS_DIR / "xgboost_retrained.pkl").exists():
@@ -93,6 +95,10 @@ try:
                 if (MODELS_DIR / "recipient_reputation.json").exists() else None)
         FEATURE_ENGINE = mlfeat.FeatureEngineer(mlfeat.build_profiles(), _rep)
         print(f"✓ Feature foundation loaded - {len(FEATURE_ENGINE.profiles):,} user profiles")
+        # Closed feedback loop: dispositions online-update the SAME reputation instance
+        # the feature foundation reads, so a confirmed-fraud payee scores higher at once.
+        _feedback = feedback.FeedbackStore(MODELS_DIR / "feedback_log.jsonl", reputation=_rep)
+        print(f"✓ Feedback loop wired - {_feedback.status()['labeled_total']} prior labels")
     except Exception as _fe:
         FEATURE_ENGINE = None
         print(f"⚠ Feature foundation unavailable ({_fe}); using raw feature passthrough")
@@ -252,6 +258,17 @@ def privacy_curve():
     p = MODELS_DIR / "privacy_utility_curve.json"
     if not p.exists():
         raise HTTPException(404, "privacy_utility_curve.json not found - run privacy_layer.py")
+    return json.loads(p.read_text())
+
+
+@app.get("/consortium/demo")
+def consortium_demo():
+    """Privacy-preserving cross-institution fraud network: the network-effect scale
+    curve, the differential-privacy utility curve, flagship cross-bank mules, and the
+    real-data anchor. Built by redwing-ml/consortium_build.py."""
+    p = MODELS_DIR / "consortium_demo.json"
+    if not p.exists():
+        raise HTTPException(404, "consortium_demo.json not found - run consortium_build.py")
     return json.loads(p.read_text())
 
 
@@ -533,7 +550,26 @@ def _assemble_case(row) -> dict:
     except Exception:
         explanation = None
 
-    return case_file.assemble(row, scored, graph_ctx=graph_ctx, explanation=explanation)
+    case = case_file.assemble(row, scored, graph_ctx=graph_ctx, explanation=explanation)
+
+    # External enrichment via the connector hub (credit bureaus, fraud consortia,
+    # sanctions, open banking). Live API when credentialed, else derived signals -
+    # this is what populates the identity/device view the feature families scaffolded.
+    try:
+        er = _hub.enrich(EnrichRequest(
+            transaction_id=str(row.get("transaction_id", "")),
+            user_id=str(row.get("user_id", "")),
+            amount=float(row.get("amount", 0.0) or 0.0),
+            payment_rail=str(row.get("payment_rail", row.get("rail", ""))),
+            recipient_id=str(row.get("recipient_id", "")),
+            fraud_typology=str(row.get("fraud_typology", "")),
+            raw=row,
+        ))
+        case["enrichment"] = er
+    except Exception:
+        case["enrichment"] = None
+
+    return case
 
 
 @app.get("/case/{transaction_id}")
@@ -642,6 +678,33 @@ def adversary_simulate(body: dict):
     result["typology"] = str(row.get("fraud_typology", "unknown"))
     result["rail"] = str(row.get("payment_rail", row.get("rail", "card")))
     return result
+
+
+# ── Closed Feedback Loop ──────────────────────────────────────────────────────
+# Analyst dispositions become labeled feedback that online-updates the reputation
+# layer (immediate) and queues for retrain (logged). See feedback.py.
+
+@app.post("/feedback")
+def post_feedback(body: dict):
+    """Record an analyst disposition. Body: {transaction_id, label, recipient_id, source}.
+    label: confirm_fraud / clear_false_positive / etc. Returns the online reputation
+    update so the caller can see the loop close."""
+    if _feedback is None:
+        raise HTTPException(503, "Feedback loop not available (reputation layer not loaded).")
+    return _feedback.record(
+        transaction_id=str(body.get("transaction_id", "")),
+        label=str(body.get("label", "")),
+        recipient_id=str(body.get("recipient_id", "")),
+        source=str(body.get("source", "investigator")),
+    )
+
+
+@app.get("/feedback/status")
+def feedback_status():
+    """Loop status: labeled totals, online updates applied, retrain queue depth."""
+    if _feedback is None:
+        return {"loop": "unavailable", "labeled_total": 0}
+    return _feedback.status()
 
 
 # ── Injection Pipeline ────────────────────────────────────────────────────────

@@ -36,6 +36,7 @@ from typing import Optional
 from .base import (
     BaseConnector, ConnectorCategory, ConnectorStatus,
     EnrichRequest, EnrichResponse, ReportRequest, ReportResponse,
+    derived_signals,
 )
 
 # ── Import all connectors ──────────────────────────────────────────────────
@@ -119,7 +120,8 @@ class IntegrationHub:
               "connectors_run": int,
             }
         """
-        targets = self._resolve_targets(connectors, categories, configured_only=True)
+        # Include uncredentialed connectors: they return derived enrichment, not nothing.
+        targets = self._resolve_targets(connectors, categories, configured_only=False)
         start   = time.time()
         results = {"signals": {}, "errors": {}, "latency_ms": 0, "connectors_run": len(targets)}
 
@@ -190,7 +192,8 @@ class IntegrationHub:
     def health(self) -> dict:
         """Return health status of all connectors."""
         return {
-            c.id: c.health_check().value
+            c.id: (ConnectorStatus.DERIVED.value if not c.is_configured()
+                   else c.health_check().value)
             for c in self._registry.values()
         }
 
@@ -215,8 +218,17 @@ class IntegrationHub:
         return targets
 
     def _safe_enrich(self, connector: BaseConnector, req: EnrichRequest, timeout: int) -> EnrichResponse:
+        # No live credentials: return deterministic derived enrichment, clearly flagged.
+        if not connector.is_configured():
+            return EnrichResponse(connector=connector.id, status=ConnectorStatus.DERIVED,
+                                  signals=derived_signals(connector, req))
         try:
-            return connector.enrich(req)
+            resp = connector.enrich(req)
+            # A configured-but-stubbed connector may still report UNCONFIGURED; derive then.
+            if resp.status == ConnectorStatus.UNCONFIGURED or not resp.signals:
+                return EnrichResponse(connector=connector.id, status=ConnectorStatus.DERIVED,
+                                      signals=derived_signals(connector, req))
+            return resp
         except Exception as e:
             logger.warning(f"Connector {connector.id} enrich failed: {e}")
             return EnrichResponse(connector=connector.id, status=ConnectorStatus.UNAVAILABLE, error=str(e))
