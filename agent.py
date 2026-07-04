@@ -1,5 +1,5 @@
 """
-SyntheticID Autonomous Agent — ML-backed real-time AI fraud detection.
+SyntheticID Autonomous Agent - ML-backed real-time AI fraud detection.
 
 Runs as a FastAPI background task. On each tick:
   1. Scores a transaction via build_event() (real XGBoost inference)
@@ -9,7 +9,7 @@ Runs as a FastAPI background task. On each tick:
   5. Buffers novel attack patterns → triggers Rule Factory self-learning
 
 Config is persisted at ~/pulseml_models/agent_config.json and applied live
-without restart — PUT /agent/config takes effect on the next tick.
+without restart - PUT /agent/config takes effect on the next tick.
 """
 
 import asyncio
@@ -90,7 +90,7 @@ def validate_config(cfg: dict) -> dict:
     return merged
 
 
-# Mutable singleton — mutated in place by PUT /agent/config so run_agent
+# Mutable singleton - mutated in place by PUT /agent/config so run_agent
 # picks up changes on the next tick without restart.
 agent_config: dict = load_config()
 
@@ -154,7 +154,7 @@ def detect_ai_signature(tx: dict) -> dict:
         for s in matched_signals
     )
 
-    # Signal 1: timing regularity — velocity/automated keywords in matched signals
+    # Signal 1: timing regularity - velocity/automated keywords in matched signals
     if any(kw in matched_labels for kw in ("velocity", "automated", "high velocity", "inter_tx")):
         signals_hit.append("timing_regularity")
         confidence += AI_SIGNATURES["timing_regularity"]["weight"]
@@ -243,9 +243,9 @@ def autonomous_decision(
     Config changes (via PUT /agent/config) apply immediately on next tick.
 
     Effective score blends three signals (4-tier cascade, Tier 1+3):
-      60% XGBoost combined score — primary ML signal
-      25% AI behavioral confidence — bot/synthetic ID patterns
-      15% graph risk score — ring membership, shared device, recipient fraud rate
+      60% XGBoost combined score - primary ML signal
+      25% AI behavioral confidence - bot/synthetic ID patterns
+      15% graph risk score - ring membership, shared device, recipient fraud rate
     """
     per_threat = config["per_threat"].get(threat_type, {"block": 0.65, "flag": 0.45, "enabled": True})
     toggles    = config["toggles"]
@@ -270,11 +270,11 @@ def autonomous_decision(
 
     if effective_score >= block_thr:
         action    = "block"
-        reason    = f"{THREAT_META.get(threat_type, {}).get('label', threat_type)} detected — score {effective_score:.2f} ≥ block threshold {block_thr:.2f}"
+        reason    = f"{THREAT_META.get(threat_type, {}).get('label', threat_type)} detected - score {effective_score:.2f} ≥ block threshold {block_thr:.2f}"
         escalate  = effective_score >= 0.90 or threat_type in ("deepfake_bypass", "adversarial_ml")
     elif effective_score >= flag_thr:
         action    = "flag"
-        reason    = f"{THREAT_META.get(threat_type, {}).get('label', threat_type)} suspected — score {effective_score:.2f}, monitoring"
+        reason    = f"{THREAT_META.get(threat_type, {}).get('label', threat_type)} suspected - score {effective_score:.2f}, monitoring"
         escalate  = False
     else:
         action    = "allow"
@@ -336,7 +336,7 @@ async def trigger_learning() -> None:
     """
     Pull a snapshot of novel_attack_buffer, run Rule Factory pipeline in a
     thread pool (it uses blocking urllib I/O), update counters.
-    Respects the self_learning toggle — exits early if disabled.
+    Respects the self_learning toggle - exits early if disabled.
     """
     global novel_attack_buffer
 
@@ -393,7 +393,7 @@ def _broadcast(event: dict) -> None:
 async def run_agent(build_event_fn, df_all, features) -> None:
     """
     Autonomous detection loop. Accepts build_event from main.py as a parameter
-    to avoid circular imports — agent.py never imports from main.py.
+    to avoid circular imports - agent.py never imports from main.py.
 
     Runs continuously until agent_state.running is set to False.
     """

@@ -6,7 +6,7 @@ Every agency/bureau connector inherits from BaseConnector and implements:
   - report(payload)  → push a fraud event or regulatory filing
   - health_check()   → verify the connection is live
 
-The hub calls connectors through this interface — it never needs to know
+The hub calls connectors through this interface - it never needs to know
 the specifics of any individual agency.
 """
 
@@ -108,7 +108,7 @@ class BaseConnector(ABC):
     def enrich(self, req: EnrichRequest) -> EnrichResponse:
         """
         Pull fraud/identity signals from this agency for a given transaction.
-        Should never raise — catch internally and return status=UNAVAILABLE on error.
+        Should never raise - catch internally and return status=UNAVAILABLE on error.
         """
         ...
 

@@ -3,13 +3,13 @@ ADWIN-inspired concept drift monitor for the RedWing scoring pipeline.
 
 Tracks Population Stability Index (PSI) on model score distributions and
 key feature distributions. Flags when incoming traffic drifts from the
-historical baseline — indicating concept drift, data pipeline shift, or
+historical baseline - indicating concept drift, data pipeline shift, or
 an adversarial probing campaign.
 
 PSI interpretation (industry standard):
-  < 0.10  — stable
-  0.10–0.20 — warning (monitor closely)
-  > 0.20  — drift (consider retraining)
+  < 0.10  - stable
+  0.10–0.20 - warning (monitor closely)
+  > 0.20  - drift (consider retraining)
 
 Reference: ADWIN (Bifet & Gavalda, 2007); PSI as used in SR 11-7 / Fed guidance.
 """
@@ -171,7 +171,7 @@ def get_status() -> dict:
 
 
 def reset() -> None:
-    """Clear all buffers — call after retraining the model."""
+    """Clear all buffers - call after retraining the model."""
     global _since_last_check, _drift_events
     with _lock:
         _score_buf.clear()

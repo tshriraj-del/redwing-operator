@@ -1,12 +1,12 @@
 """
-Offline graph feature store — Tier 3 of the RedWing 4-tier cascade.
+Offline graph feature store - Tier 3 of the RedWing 4-tier cascade.
 
 Precomputes per-entity statistics from transactions.csv at startup and
 refreshes every hour. At score time, get_features() is an O(1) dict lookup
 with zero latency overhead.
 
 This implements the "batch-precomputed embeddings" half of the BRIGHT
-architecture (arXiv 2205.13084) — real node features rather than learned
+architecture (arXiv 2205.13084) - real node features rather than learned
 embeddings, but the same latency-separation pattern.
 
 Features per entity type:
@@ -45,7 +45,7 @@ _stats: dict = {"entities": 0, "transactions": 0, "last_refresh": None}
 def precompute(df: pd.DataFrame) -> None:
     """
     Build all lookup tables from a transactions DataFrame.
-    Thread-safe atomic swap — reads are never blocked by a running precompute.
+    Thread-safe atomic swap - reads are never blocked by a running precompute.
     Called at startup and by the hourly refresh task.
     """
     if df is None or df.empty:
@@ -97,7 +97,7 @@ def precompute(df: pd.DataFrame) -> None:
     # ── 1-hop fraud neighbor count (ring membership proxy) ────────────────────
     # For each device shared by multiple users, count how many users on that
     # device have a non-zero fraud rate. Clean users on a "dirty" device are
-    # flagged with the count of those dirty co-users — a simplified GNN
+    # flagged with the count of those dirty co-users - a simplified GNN
     # 1-hop neighbourhood aggregation.
     new_ufn: dict = defaultdict(int)
     for did, users in device_users.items():
@@ -125,7 +125,7 @@ def precompute(df: pd.DataFrame) -> None:
 
 
 def refresh_from_disk(models_dir: Path) -> None:
-    """Reload from transactions.csv. Run in executor — reads 880K rows."""
+    """Reload from transactions.csv. Run in executor - reads 880K rows."""
     try:
         df = pd.read_csv(models_dir / "transactions.csv")
         precompute(df)
@@ -178,11 +178,11 @@ def _aggregate(
     Aggregate per-entity graph stats into a single 0–1 risk score.
 
     Weights match the information value of each signal for fraud ring detection:
-      30% recipient fraud rate  — who is this money going to?
-      25% device fraud rate     — is this device contaminated?
-      20% shared device risk    — ≥4 co-users on device = suspicious
-      15% user historical fraud — this user's own fraud history
-      10% fraud neighbors       — ring membership (normalized at 5+ neighbors)
+      30% recipient fraud rate  - who is this money going to?
+      25% device fraud rate     - is this device contaminated?
+      20% shared device risk    - ≥4 co-users on device = suspicious
+      15% user historical fraud - this user's own fraud history
+      10% fraud neighbors       - ring membership (normalized at 5+ neighbors)
     """
     shared_risk   = min((device_shared_users - 1) / 4.0, 1.0) if device_shared_users > 1 else 0.0
     neighbor_risk = min(user_fraud_neighbors / 5.0, 1.0)

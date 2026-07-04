@@ -1,4 +1,4 @@
-# Match Engine — scores a transaction against the pattern library.
+# Match Engine - scores a transaction against the pattern library.
 # Returns soft confidence scores (0.0–1.0) per pattern using weighted signal matching.
 # Supports partial credit for near-miss thresholds so borderline cases surface.
 

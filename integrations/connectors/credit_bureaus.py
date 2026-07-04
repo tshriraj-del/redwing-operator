@@ -1,5 +1,5 @@
 """
-Credit Bureau Connectors — Equifax, Experian, TransUnion.
+Credit Bureau Connectors - Equifax, Experian, TransUnion.
 
 Purpose:
   enrich()  → identity verification, fraud alert flags, credit file existence,

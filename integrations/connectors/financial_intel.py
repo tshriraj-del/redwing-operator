@@ -1,5 +1,5 @@
 """
-Financial Intelligence Connectors — FinCEN, FCA, AUSTRAC, RBI.
+Financial Intelligence Connectors - FinCEN, FCA, AUSTRAC, RBI.
 
 Purpose:
   enrich()  → sanctions screening, PEP (politically exposed person) check,
@@ -11,7 +11,7 @@ Key compliance notes:
   - SAR filings are legally mandated above certain thresholds (US: $5,000+)
   - CTR filings required for cash transactions > $10,000
   - Filing must occur within 30 days of detection (FinCEN)
-  - Reports are confidential — do NOT notify the subject (tipping-off offense)
+  - Reports are confidential - do NOT notify the subject (tipping-off offense)
   - All filings must be audit-logged with analyst name, timestamp, rationale
 
 Credentials needed (in operator/.env):
@@ -65,7 +65,7 @@ class FinCENConnector(BaseConnector):
         # 1. Build FinXML payload per BSA E-Filing schema
         # 2. POST https://bsaefiling1.fincen.treas.gov/api/v1/sar/submit
         # 3. Store BSA ID (reference_id) returned by FinCEN
-        # 4. Set async_pending=True — FinCEN acknowledges within 24-48h
+        # 4. Set async_pending=True - FinCEN acknowledges within 24-48h
         # NOTE: DO NOT notify the subject. Tipping-off is a federal offense.
         return ReportResponse(connector=self.id, status=ConnectorStatus.UNCONFIGURED,
                               async_pending=True)

@@ -1,5 +1,5 @@
 """
-build_goldset.py — assemble a BLIND, stratified gold set for human re-adjudication.
+build_goldset.py - assemble a BLIND, stratified gold set for human re-adjudication.
 
 Why: the agent-eval verifiers are anchored to the synthetic ground-truth label and a
 derived gold disposition. To claim the verifiers are *trustworthy* we must show a human
@@ -22,14 +22,14 @@ import main, fraud_env
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEED = 20260629
 
-# Fields that would leak the answer — stripped from the rater's view.
+# Fields that would leak the answer - stripped from the rater's view.
 LEAK_KEYS = {"recommended_disposition", "disposition_options", "sar_eligible",
              "sar_note", "_enrichment_note"}
 LEAK_ALERT_KEYS = {"ground_truth_label"}
 
 
 def rater_view(case: dict) -> dict:
-    """The case as the human sees it — full evidence, zero answer leakage."""
+    """The case as the human sees it - full evidence, zero answer leakage."""
     c = {k: v for k, v in case.items() if k not in LEAK_KEYS}
     a = dict(c.get("alert", {}))
     for k in LEAK_ALERT_KEYS:

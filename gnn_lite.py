@@ -1,5 +1,5 @@
 """
-gnn_lite.py — Tier 2 GNN cascade: 1-layer Graph Convolutional Network.
+gnn_lite.py - Tier 2 GNN cascade: 1-layer Graph Convolutional Network.
 
 Implements message-passing neighborhood aggregation over the transaction graph:
   Round 0: per-entity fraud rate features (user, device, recipient)
@@ -9,7 +9,7 @@ Implements message-passing neighborhood aggregation over the transaction graph:
 
 Both Round 1 aggregates are stored as scalar lookup tables (no runtime graph
 traversal) following the BRIGHT batch/realtime separation pattern. Inference
-is O(1) dict lookup — identical latency to the existing Tier 3 store.
+is O(1) dict lookup - identical latency to the existing Tier 3 store.
 
 Only invoked for borderline transactions (TIER2_LO ≤ Tier 1 score ≤ TIER2_HI).
 Final cascade score: Tier1 * 0.65 + GNN * 0.35
@@ -69,7 +69,7 @@ def init(df: pd.DataFrame) -> None:
     Build all GNN tables from a transactions DataFrame.
 
     Expected columns: user_id, device_id (optional), recipient_id (optional),
-                      is_fraud (optional — defaults to 0 if absent).
+                      is_fraud (optional - defaults to 0 if absent).
 
     Uses vectorized pandas operations throughout; runs in ~2s on 880K rows.
     Thread-safe atomic swap: reads are never blocked by a running init.
@@ -146,11 +146,11 @@ def score(user_id, device_id, recipient_id) -> GNNResult:
     GNN Tier 2 score for a single transaction.
 
     Embedding layout: [f_R, h_D1, f_U, h_U1, f_D]
-      f_R  — recipient fraud rate (Round 0)
-      h_D1 — device co-user mean fraud rate (Round 1 aggregate)
-      f_U  — user fraud rate (Round 0)
-      h_U1 — user's recipient mean fraud rate (Round 1 aggregate)
-      f_D  — device fraud rate (Round 0)
+      f_R  - recipient fraud rate (Round 0)
+      h_D1 - device co-user mean fraud rate (Round 1 aggregate)
+      f_U  - user fraud rate (Round 0)
+      h_U1 - user's recipient mean fraud rate (Round 1 aggregate)
+      f_D  - device fraud rate (Round 0)
 
     Score: min(dot(W, embedding) * SCALE, 1.0)
     Returns fallback GNNResult with hops=0 if tables not yet initialised.

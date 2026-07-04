@@ -1,4 +1,4 @@
-# Pattern Library — structured attack fingerprints for all 6 fraud typologies.
+# Pattern Library - structured attack fingerprints for all 6 fraud typologies.
 # Each pattern maps directly to the FRAUD_TYPOLOGIES in the ML Fraud Engine.
 # Signals reference the 10 engineered features in the XGBoost model.
 
@@ -33,7 +33,7 @@ PATTERNS = [
         "prevalence": 0.20,
         "description": (
             "Authorized push payment where victim is socially engineered into sending money "
-            "voluntarily — impersonation of bank, HMRC/IRS, police, or romantic partner. "
+            "voluntarily - impersonation of bank, HMRC/IRS, police, or romantic partner. "
             "Transaction is technically authorized but victim is manipulated."
         ),
         "evasion": "Payment rail is legitimate; victim authorizes. High amount, urgent framing.",
@@ -76,9 +76,9 @@ PATTERNS = [
         "description": (
             "AI-generated voice or video impersonates a trusted authority (CEO, bank official, family). "
             "Victim is convinced during business hours to authorize an unusually large transfer. "
-            "Device and recipient may be familiar — the manipulation happens out-of-band."
+            "Device and recipient may be familiar - the manipulation happens out-of-band."
         ),
-        "evasion": "Known device, business hours, victim authorizes — evades device/time signals.",
+        "evasion": "Known device, business hours, victim authorizes - evades device/time signals.",
         "signals": [
             {"feature": "amount_vs_max",         "op": "gt", "threshold": 0.80, "weight": 0.35, "label": "Extremely large relative to history"},
             {"feature": "amount_zscore",         "op": "gt", "threshold": 3.0,  "weight": 0.25, "label": "Far outside normal distribution"},
@@ -95,7 +95,7 @@ PATTERNS = [
         "prevalence": 0.10,
         "description": (
             "AI-generated synthetic identity: fabricated SSN, address, employment history. "
-            "Gradual credit building over months, then bust-out — maxing every available credit "
+            "Gradual credit building over months, then bust-out - maxing every available credit "
             "line in rapid succession before disappearing. High velocity, all new payees."
         ),
         "evasion": "Slow build phase mimics legitimate user; bust-out happens in a single window.",

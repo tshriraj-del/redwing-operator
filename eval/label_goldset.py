@@ -1,5 +1,5 @@
 """
-label_goldset.py — interactive BLIND labeler for the gold set.
+label_goldset.py - interactive BLIND labeler for the gold set.
 
 Shows each case the way an analyst would see it (alert + full evidence, NO answer),
 asks for a disposition, optional confidence, optional note. Resumable: re-running skips
@@ -13,10 +13,10 @@ import os, json, argparse, time, textwrap
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 CHOICES = {
-    "1": ("confirm_fraud",            "Fraud — confirm / block the instrument"),
-    "2": ("clear_false_positive",     "Legitimate — clear the alert, no action"),
-    "3": ("deny_dispute_first_party", "First-party fraud — deny the customer's dispute"),
-    "4": ("escalate_or_hold",         "Not confident — escalate / step-up / hold for review"),
+    "1": ("confirm_fraud",            "Fraud - confirm / block the instrument"),
+    "2": ("clear_false_positive",     "Legitimate - clear the alert, no action"),
+    "3": ("deny_dispute_first_party", "First-party fraud - deny the customer's dispute"),
+    "4": ("escalate_or_hold",         "Not confident - escalate / step-up / hold for review"),
 }
 CONF = {"1": "low", "2": "medium", "3": "high"}
 
@@ -24,7 +24,7 @@ CONF = {"1": "low", "2": "medium", "3": "high"}
 def load_cases():
     p = os.path.join(HERE, "goldset_cases.jsonl")
     if not os.path.exists(p):
-        raise SystemExit("No goldset_cases.jsonl — run: python3 eval/build_goldset.py")
+        raise SystemExit("No goldset_cases.jsonl - run: python3 eval/build_goldset.py")
     return [json.loads(l) for l in open(p) if l.strip()]
 
 
@@ -62,7 +62,7 @@ def render(case, n, total):
     print(line)
     print("CUSTOMER 360")
     print(kv("tenure / KYC", f"{cust.get('tenure_band')}  ·  KYC {cust.get('kyc_status')}  ·  CIP {cust.get('cip_verified')}"))
-    print(kv("risk rating", f"{cust.get('risk_rating')}   drivers: {', '.join(cust.get('risk_drivers', []) or []) or '—'}"))
+    print(kv("risk rating", f"{cust.get('risk_rating')}   drivers: {', '.join(cust.get('risk_drivers', []) or []) or '-'}"))
     print(kv("PEP / sanctions", f"PEP {cust.get('pep')}  ·  sanctions match {cust.get('sanctions_match')}"))
     print(kv("prior cases/SARs/disp", f"{cust.get('prior_cases')} / {cust.get('prior_sars')} / {cust.get('prior_disputes')}"))
     if b:
@@ -77,7 +77,7 @@ def render(case, n, total):
         print(kv("active / reason", f"{disp.get('active')}  ·  {disp.get('reason_code')} {disp.get('reason')}"))
         ev = disp.get("evidence", {}) or {}
         if ev:
-            print(kv("evidence", ", ".join(f"{k}={v}" for k, v in ev.items() if v is not None) or "—"))
+            print(kv("evidence", ", ".join(f"{k}={v}" for k, v in ev.items() if v is not None) or "-"))
         if disp.get("assessment"):
             for ln in textwrap.wrap(str(disp.get("assessment")), 70):
                 print("    " + ln)
@@ -106,7 +106,7 @@ def run(rater):
     todo = [c for c in cases if c["case_id"] not in done]
     out = os.path.join(HERE, f"goldset_labels__{rater}.jsonl")
     print(f"Rater '{rater}': {len(done)} already labeled, {len(todo)} remaining of {len(cases)}.")
-    print("Decide each case from the evidence as if it were live. Blind — no answer key shown.")
+    print("Decide each case from the evidence as if it were live. Blind - no answer key shown.")
     print("Menu: " + "  ".join(f"[{k}] {v[1]}" for k, v in CHOICES.items()))
     for n, case in enumerate(todo, len(done) + 1):
         render(case, n, len(cases))
