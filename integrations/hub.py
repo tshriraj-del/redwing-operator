@@ -1,5 +1,5 @@
 """
-Integration Hub — central registry and orchestrator for all external connectors.
+Integration Hub - central registry and orchestrator for all external connectors.
 
 The operator never calls individual connectors directly.
 It calls the hub with a list of signal types needed, and the hub:
@@ -56,7 +56,7 @@ REPORT_TIMEOUT = 15  # seconds per connector for reporting
 class IntegrationHub:
     """
     Central registry of all external connectors.
-    Call hub.enrich() or hub.report() — never instantiate connectors directly.
+    Call hub.enrich() or hub.report() - never instantiate connectors directly.
     """
 
     def __init__(self):
@@ -263,5 +263,5 @@ class IntegrationHub:
             logger.warning(f"Audit log write failed: {e}")
 
 
-# Singleton — import this everywhere
+# Singleton - import this everywhere
 hub = IntegrationHub()

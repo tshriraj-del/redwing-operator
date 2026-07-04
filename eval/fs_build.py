@@ -1,5 +1,5 @@
 """
-fs_build.py — build a BLIND, labeled eval set for the FraudSense LLM copilot.
+fs_build.py - build a BLIND, labeled eval set for the FraudSense LLM copilot.
 
 FraudSense is a single-shot LLM investigation (claude-sonnet-4-6). To measure its
 quality we need cases with known answers. The operator already produces fully-labeled

@@ -1,5 +1,5 @@
 """
-RedWing Rule Factory — Self-improving rule engine.
+RedWing Rule Factory - Self-improving rule engine.
 
 Identifies fraud vectors that ML caught but rules missed (rule gaps),
 sends them to Claude for pattern analysis, generates candidate rules,
@@ -51,7 +51,7 @@ You will receive:
 
 Generate 2-3 candidate detection rules. Each rule MUST be a Python lambda that:
 - Takes a dict `r` with float feature values
-- Uses ONLY r.get('feature_name', default) — no other function calls
+- Uses ONLY r.get('feature_name', default) - no other function calls
 - Returns True if the transaction matches the fraud pattern
 
 Output a JSON array of rule objects:
@@ -71,7 +71,7 @@ Rules:
 - tier 1 = instant block (score 88-100): very high confidence, low FP risk
 - tier 2 = high risk (score 70-85): strong signal combination
 - tier 3 = elevated (score 50-65): single or weak signals
-- fn_code must be valid Python — use only r.get(), no imports, no side effects
+- fn_code must be valid Python - use only r.get(), no imports, no side effects
 - Thresholds must be grounded in the statistics you see, not arbitrary
 - Output ONLY the JSON array, no other text"""
 
@@ -113,7 +113,7 @@ def format_gap_statistics(gaps: pd.DataFrame) -> str:
         return "No feature data available."
 
     stats = gaps[available].describe().round(4)
-    lines = [f"Gap transactions (n={len(gaps)}) — confirmed fraud, rule_score=0:\n"]
+    lines = [f"Gap transactions (n={len(gaps)}) - confirmed fraud, rule_score=0:\n"]
 
     for feat in available:
         if feat not in stats.columns:
@@ -194,7 +194,7 @@ Generate 2-3 new rules that close these gaps."""
 def _safe_lambda(fn_code: str):
     """
     Compile a lambda string into a callable.
-    Only allows r.get() — no imports, no arbitrary calls.
+    Only allows r.get() - no imports, no arbitrary calls.
     Raises ValueError if the code is unsafe.
     """
     # Security: only allow safe patterns
@@ -307,7 +307,7 @@ def load_generated_rules() -> list:
         return []
 
 
-# Module-level dict of deployed rules — populated on import, kept in sync by
+# Module-level dict of deployed rules - populated on import, kept in sync by
 # deploy_rule() and retire_rule(). Imported by main.py /patterns endpoint.
 _deployed_rules: dict = {
     r["id"]: r

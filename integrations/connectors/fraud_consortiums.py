@@ -1,5 +1,5 @@
 """
-Fraud Consortium Connectors — Early Warning Services, ThreatMetrix, NICE Actimize.
+Fraud Consortium Connectors - Early Warning Services, ThreatMetrix, NICE Actimize.
 
 Purpose:
   enrich()  → cross-institution fraud signals, device reputation, email/phone risk,
@@ -10,7 +10,7 @@ These are the highest-value enrichment sources for real-time fraud decisions
 because they see signals across thousands of institutions simultaneously.
 
 Credentials needed (in operator/.env):
-  EWS_API_KEY, EWS_ORG_ID           (Early Warning Services — Zelle network)
+  EWS_API_KEY, EWS_ORG_ID           (Early Warning Services - Zelle network)
   THREATMETRIX_API_KEY, THREATMETRIX_ORG_ID
   ACTIMIZE_API_KEY, ACTIMIZE_TENANT
 """
@@ -51,7 +51,7 @@ class EarlyWarningConnector(BaseConnector):
         if not self.is_configured():
             return ReportResponse(connector=self.id, status=ConnectorStatus.UNCONFIGURED,
                                   error="Credentials not configured")
-        # TODO: POST /fraud-report — contribute confirmed fraud signal to network
+        # TODO: POST /fraud-report - contribute confirmed fraud signal to network
         return ReportResponse(connector=self.id, status=ConnectorStatus.UNCONFIGURED)
 
 

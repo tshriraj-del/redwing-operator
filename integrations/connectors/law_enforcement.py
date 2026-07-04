@@ -1,5 +1,5 @@
 """
-Law Enforcement Connectors — FBI IC3, INTERPOL, Europol EC3.
+Law Enforcement Connectors - FBI IC3, INTERPOL, Europol EC3.
 
 Purpose:
   enrich()  → check if recipient/device/IP appears in known fraud databases,
@@ -12,7 +12,7 @@ Escalation thresholds (guidelines, not hard rules):
   Europol:   EU-based victims or perpetrators
 
 Important:
-  - Law enforcement referrals are one-way — no real-time enrichment signal returned
+  - Law enforcement referrals are one-way - no real-time enrichment signal returned
   - Most responses are async (acknowledgement within days, not seconds)
   - Maintain a local case reference log for follow-up
 
@@ -33,7 +33,7 @@ class FBII3Connector(BaseConnector):
     id          = "fbi_ic3"
     name        = "FBI IC3"
     category    = ConnectorCategory.LAW_ENFORCEMENT
-    description = "Internet Crime Complaint Center — cybercrime and fraud referrals"
+    description = "Internet Crime Complaint Center - cybercrime and fraud referrals"
 
     REFERRAL_THRESHOLD = 10_000  # USD
 
@@ -47,7 +47,7 @@ class FBII3Connector(BaseConnector):
         return ConnectorStatus.UNCONFIGURED
 
     def enrich(self, req: EnrichRequest) -> EnrichResponse:
-        # IC3 does not offer real-time enrichment — reporting only
+        # IC3 does not offer real-time enrichment - reporting only
         return EnrichResponse(connector=self.id, status=ConnectorStatus.ACTIVE,
                               signals={"referral_threshold_met": req.amount >= self.REFERRAL_THRESHOLD})
 
@@ -101,7 +101,7 @@ class EuropolConnector(BaseConnector):
     id          = "europol"
     name        = "Europol EC3"
     category    = ConnectorCategory.LAW_ENFORCEMENT
-    description = "European Cybercrime Centre — EU fraud ring referrals and intelligence sharing"
+    description = "European Cybercrime Centre - EU fraud ring referrals and intelligence sharing"
 
     def is_configured(self) -> bool:
         return bool(os.environ.get("EUROPOL_API_KEY") and os.environ.get("EUROPOL_ORG_ID"))

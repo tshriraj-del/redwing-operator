@@ -1,5 +1,5 @@
 """
-Open Banking Connectors — Plaid, Finicity, TrueLayer.
+Open Banking Connectors - Plaid, Finicity, TrueLayer.
 
 Purpose:
   enrich()  → account verification, balance check, transaction history,
@@ -52,7 +52,7 @@ class PlaidConnector(BaseConnector):
 
     def report(self, req: ReportRequest) -> ReportResponse:
         return ReportResponse(connector=self.id, status=ConnectorStatus.ACTIVE,
-                              error="Plaid is read-only — no reporting endpoint")
+                              error="Plaid is read-only - no reporting endpoint")
 
 
 class FinicityConnector(BaseConnector):
@@ -80,14 +80,14 @@ class FinicityConnector(BaseConnector):
 
     def report(self, req: ReportRequest) -> ReportResponse:
         return ReportResponse(connector=self.id, status=ConnectorStatus.ACTIVE,
-                              error="Finicity is read-only — no reporting endpoint")
+                              error="Finicity is read-only - no reporting endpoint")
 
 
 class TrueLayerConnector(BaseConnector):
     id          = "truelayer"
     name        = "TrueLayer"
     category    = ConnectorCategory.OPEN_BANKING
-    description = "UK/EU open banking — account info, transaction history, payment initiation"
+    description = "UK/EU open banking - account info, transaction history, payment initiation"
 
     def is_configured(self) -> bool:
         return bool(os.environ.get("TRUELAYER_CLIENT_ID") and os.environ.get("TRUELAYER_CLIENT_SECRET"))
@@ -109,4 +109,4 @@ class TrueLayerConnector(BaseConnector):
 
     def report(self, req: ReportRequest) -> ReportResponse:
         return ReportResponse(connector=self.id, status=ConnectorStatus.ACTIVE,
-                              error="TrueLayer is read-only for enrichment — payment initiation is separate")
+                              error="TrueLayer is read-only for enrichment - payment initiation is separate")

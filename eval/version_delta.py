@@ -1,13 +1,13 @@
 """
-version_delta.py — MEASURE the training-serving-skew fix (the '0.3% -> 91%' claim).
+version_delta.py - MEASURE the training-serving-skew fix (the '0.3% -> 91%' claim).
 
 Same retrained model, same alert threshold. Only the feature-reproduction path changes:
-  • BROKEN serving  = raw passthrough — the 10 non-column features default to 0.0
+  • BROKEN serving  = raw passthrough - the 10 non-column features default to 0.0
                       (the exact pre-fix behavior, still in main.compute_features fallback)
   • FIXED serving   = the shared feature foundation recomputes all 23 identically to training
 
 Catch = combined_score >= 0.65 (main's is_alert). Reports fraud catch-rate and legit
-false-alert rate under each path — turning the asserted skew number into a measured one.
+false-alert rate under each path - turning the asserted skew number into a measured one.
 """
 import warnings; warnings.filterwarnings("ignore")
 import sys, os, random
@@ -54,7 +54,7 @@ lb, lf, lmlb, lmlf = run(lg)
 nfr, nlg = len(fr), len(lg)
 
 print("=" * 70)
-print("TRAINING-SERVING SKEW — measured (same model, same 0.65 threshold)")
+print("TRAINING-SERVING SKEW - measured (same model, same 0.65 threshold)")
 print("=" * 70)
 print(f"Sample: {nfr} frauds, {nlg} legit.  10 of 23 features zero out on the broken path.")
 print(f"\nFRAUD CATCH-RATE (frauds that fire an alert):")

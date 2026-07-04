@@ -1,5 +1,5 @@
 """
-XAI Engine — Explainable AI layer for the RedWing Operator.
+XAI Engine - Explainable AI layer for the RedWing Operator.
 
 Attaches to every ML score output:
   - SHAP tree values (XGBoost built-in, no extra library needed)
@@ -46,7 +46,7 @@ def _get_shap_contributions(model, scaler, X_scaled, feature_names: list) -> dic
     try:
         import xgboost as _xgb
         dm = _xgb.DMatrix(X_scaled)
-        # shape: (1, n_features + 1) — last col is the SHAP base value
+        # shape: (1, n_features + 1) - last col is the SHAP base value
         shap_raw = model.get_booster().predict(dm, pred_contribs=True)[0]
         return {feature_names[i]: float(shap_raw[i]) for i in range(len(feature_names))}
     except Exception:
@@ -101,10 +101,10 @@ def explain_score(
         "LOW"
     )
 
-    # Plain-English narrative (EU AI Act Article 13 — transparency to affected persons)
+    # Plain-English narrative (EU AI Act Article 13 - transparency to affected persons)
     risk_drivers    = [f for f in top_factors if f["direction"] == "increases_risk"]
     mitigators      = [f for f in top_factors if f["direction"] == "decreases_risk"]
-    parts = [f"Score: {round(combined_score * 100)}/100 — {verdict} risk."]
+    parts = [f"Score: {round(combined_score * 100)}/100 - {verdict} risk."]
     if risk_drivers:
         parts.append("Primary risk drivers: " + ", ".join(f['label'] for f in risk_drivers[:3]) + ".")
     if pattern_match and pattern_match.get("confidence", 0) > 0.35:
@@ -136,7 +136,7 @@ def explain_score(
         "human_review_required": verdict == "CRITICAL",
     }
 
-    # Append-only audit log — immutable per BSA 7-year retention requirement
+    # Append-only audit log - immutable per BSA 7-year retention requirement
     try:
         EXPLANATIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with EXPLANATIONS_LOG.open("a") as fh:
@@ -154,7 +154,7 @@ def get_model_card(config: dict, feature_names: list) -> dict:
     """
     return {
         "model_id":     "redwing-fraud-xgb-v1",
-        "model_type":   "XGBClassifier — gradient boosted decision trees",
+        "model_type":   "XGBClassifier - gradient boosted decision trees",
         "version":      config.get("version", "1.0.0"),
         "training_date": config.get("training_date", None),
         "task":         "Binary fraud classification (fraud / not fraud)",
@@ -182,7 +182,7 @@ def get_model_card(config: dict, feature_names: list) -> dict:
             "next_audit_due":    None,
         },
         "eu_ai_act_compliance": {
-            "risk_tier":              "High-risk (Annex III — financial services / credit scoring)",
+            "risk_tier":              "High-risk (Annex III - financial services / credit scoring)",
             "conformity_assessment":  "pending",
             "explainability_method":  "SHAP tree values (XGBoost built-in)",
             "human_oversight_policy": "Analyst review required for all CRITICAL verdicts",

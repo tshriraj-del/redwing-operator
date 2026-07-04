@@ -1,12 +1,12 @@
 """
-score_agreement.py — turn the blind human labels into the headline eval-quality metric:
+score_agreement.py - turn the blind human labels into the headline eval-quality metric:
 does an independent human analyst agree with the verifiers' answer key?
 
 Reports, over the labeled gold set:
-  • Human vs GOLD disposition  — agreement % + Cohen's kappa  (is the answer key trustworthy?)
-  • Human vs AGENT disposition  — agreement %                  (does the rewarded policy match a human?)
-  • Human vs ground-truth fraud — agreement %                  (does the human even see it as fraud?)
-  • Inter-rater (if ≥2 raters) — agreement % + Cohen's kappa   (is human judgment itself reliable?)
+  • Human vs GOLD disposition  - agreement % + Cohen's kappa  (is the answer key trustworthy?)
+  • Human vs AGENT disposition  - agreement %                  (does the rewarded policy match a human?)
+  • Human vs ground-truth fraud - agreement %                  (does the human even see it as fraud?)
+  • Inter-rater (if ≥2 raters) - agreement % + Cohen's kappa   (is human judgment itself reliable?)
   • Confusion + per-class breakdown + time-on-task.
 
 Run:  python3 eval/score_agreement.py
@@ -92,7 +92,7 @@ def main():
     truth = load_truth()
     raters = load_labels()
     if not raters:
-        raise SystemExit("No goldset_labels__*.jsonl yet — run: python3 eval/label_goldset.py --rater <id>")
+        raise SystemExit("No goldset_labels__*.jsonl yet - run: python3 eval/label_goldset.py --rater <id>")
     print("=" * 74)
     print("HUMAN ↔ VERIFIER AGREEMENT  (blind re-adjudication of the gold set)")
     print("=" * 74)

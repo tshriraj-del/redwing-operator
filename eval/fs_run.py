@@ -1,5 +1,5 @@
 """
-fs_run.py — run the REAL FraudSense pipeline over the eval set.
+fs_run.py - run the REAL FraudSense pipeline over the eval set.
 
 Uses the EXACT model (claude-sonnet-4-6), system prompt, schema, and JSON parsing from
 fraudsense/api.js, so the metric reconciles with the shipped product. Reads the API key

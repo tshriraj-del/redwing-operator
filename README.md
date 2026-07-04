@@ -7,7 +7,7 @@ FastAPI backend for the RedWing fraud prevention platform. Runs on port 8000 and
 ## Requirements
 
 - Python 3.9+
-- The ML backend at `~/pulseml_models/` — provides the trained models **and** the shared
+- The ML backend at `~/pulseml_models/` - provides the trained models **and** the shared
   feature foundation (`features.py`, `graph_layer.py`). The operator imports these so it
   computes features identically to training, eliminating training-serving skew. Override
   the location with the `REDWING_MODELS_DIR` environment variable.
@@ -26,7 +26,7 @@ pip install -r requirements.txt
 Create an `.env` file in this directory:
 
 ```env
-# LLM — used by Rule Factory and the /llm/proxy endpoint
+# LLM - used by Rule Factory and the /llm/proxy endpoint
 ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional: switch to a different LLM provider for the proxy
@@ -34,7 +34,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 # LLM_API_KEY=sk-...
 # LLM_MODEL=gpt-4o
 
-# Integration Hub — add credentials as you onboard each agency
+# Integration Hub - add credentials as you onboard each agency
 # OFAC_API_KEY=
 # FINCEN_API_KEY=
 # FINCEN_ORG_ID=
@@ -78,12 +78,12 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/agent/status` | Agent state — running, blocked/flagged/allowed counts, uptime |
-| GET | `/agent/events` | SSE fan-out — real-time block/flag/allow decisions (per-client queue) |
+| GET | `/agent/status` | Agent state - running, blocked/flagged/allowed counts, uptime |
+| GET | `/agent/events` | SSE fan-out - real-time block/flag/allow decisions (per-client queue) |
 | POST | `/agent/start` | Start the agent (idempotent, guards model availability) |
 | POST | `/agent/stop` | Gracefully stop the agent loop |
 | GET | `/agent/config` | Current agent config (thresholds, toggles, speed) |
-| PUT | `/agent/config` | Update config live — no restart needed |
+| PUT | `/agent/config` | Update config live - no restart needed |
 | GET | `/agent/cases` | Case review queue; supports `?status=pending\|approved\|declined` |
 | POST | `/agent/cases/{case_id}/resolve` | Approve or decline a flagged case (analyst override) |
 | POST | `/agent/override/{tx_id}` | Direct action override on a specific transaction |
@@ -116,7 +116,7 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/network/graph` | Fraud ring graph — nodes and edges from transaction data |
+| GET | `/network/graph` | Fraud ring graph - nodes and edges from transaction data |
 | GET | `/network/typologies` | Distinct fraud typologies available for filtering |
 
 ### Rule Factory
@@ -141,7 +141,7 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/llm/proxy` | Routes LLM requests server-side — supports Anthropic, OpenAI, Groq, Mistral. API key never touches the browser. |
+| POST | `/llm/proxy` | Routes LLM requests server-side - supports Anthropic, OpenAI, Groq, Mistral. API key never touches the browser. |
 | POST | `/llm/stream` | Streaming variant of the LLM proxy (SSE) |
 
 ### Integration Hub
@@ -159,11 +159,11 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 
 The hub connects to external agencies and bureaus for transaction enrichment and regulatory reporting. All 15 connectors are registered but return `UNCONFIGURED` until credentials are added to `.env`.
 
-**Credit Bureaus** — Equifax, Experian, TransUnion  
-**Financial Intelligence** — FinCEN (SAR/CTR), OFAC SDN screening, FCA  
-**Fraud Consortiums** — Early Warning Services, ThreatMetrix, NICE Actimize  
-**Law Enforcement** — FBI IC3, INTERPOL, Europol EC3  
-**Open Banking** — Plaid, Finicity, TrueLayer  
+**Credit Bureaus** - Equifax, Experian, TransUnion  
+**Financial Intelligence** - FinCEN (SAR/CTR), OFAC SDN screening, FCA  
+**Fraud Consortiums** - Early Warning Services, ThreatMetrix, NICE Actimize  
+**Law Enforcement** - FBI IC3, INTERPOL, Europol EC3  
+**Open Banking** - Plaid, Finicity, TrueLayer  
 
 ---
 
@@ -171,8 +171,8 @@ The hub connects to external agencies and bureaus for transaction enrichment and
 
 | Repo | Role |
 |------|------|
-| [redwing-fraud-os](https://github.com/tshriraj-del/redwing-fraud-os) | React command center — dashboard, all analyst tools, SyntheticID Agent UI |
-| [redwing-operator](https://github.com/tshriraj-del/redwing-operator) | This repo — FastAPI backend, ML scoring, autonomous agent, rule factory |
+| [redwing-fraud-os](https://github.com/tshriraj-del/redwing-fraud-os) | React command center - dashboard, all analyst tools, SyntheticID Agent UI |
+| [redwing-operator](https://github.com/tshriraj-del/redwing-operator) | This repo - FastAPI backend, ML scoring, autonomous agent, rule factory |
 | [fraudsense](https://github.com/tshriraj-del/fraudsense) | Standalone LLM-powered fraud investigation copilot |
 | [rulebreaker](https://github.com/tshriraj-del/rulebreaker) | Standalone adversarial rule stress-tester |
 | [sar-writer](https://github.com/tshriraj-del/sar-writer) | Standalone FinCEN SAR narrative generator |

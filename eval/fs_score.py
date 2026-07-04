@@ -1,16 +1,16 @@
 """
-fs_score.py — score FraudSense outputs into defensible generative-AI quality metrics.
+fs_score.py - score FraudSense outputs into defensible generative-AI quality metrics.
 
 Headline metrics (the ones not given away by the alert context):
-  • Schema reliability  — % responses that parse and satisfy every enum/shape rule.
-  • Evidence grounding  — of every signal the model tagged "Observed", the fraction whose
+  • Schema reliability  - % responses that parse and satisfy every enum/shape rule.
+  • Evidence grounding  - of every signal the model tagged "Observed", the fraction whose
                           cited specifics (numbers + salient terms) actually appear in the
                           case input. 1 - this = hallucinated-observation rate. This directly
                           tests the product's own #1 rule ("Observed = explicitly stated").
-  • Risk calibration    — mean risk score on fraud vs legit (separation), and whether the
+  • Risk calibration    - mean risk score on fraud vs legit (separation), and whether the
                           severity band agrees with ground-truth fraud.
-Secondary (alert-contextualized, so near-ceiling — reported with that caveat):
-  • Action agreement    — model action vs the ground-truth disposition.
+Secondary (alert-contextualized, so near-ceiling - reported with that caveat):
+  • Action agreement    - model action vs the ground-truth disposition.
 
 Run:  python3 eval/fs_score.py
 """
@@ -77,7 +77,7 @@ def main():
     outs = [json.loads(l) for l in open(os.path.join(HERE, "fs_outputs.jsonl")) if l.strip()] \
         if os.path.exists(os.path.join(HERE, "fs_outputs.jsonl")) else []
     if not outs:
-        raise SystemExit("No fs_outputs.jsonl — run: export ANTHROPIC_API_KEY=... && python3 eval/fs_run.py")
+        raise SystemExit("No fs_outputs.jsonl - run: export ANTHROPIC_API_KEY=... && python3 eval/fs_run.py")
 
     n = len(outs)
     parsed = [o for o in outs if o.get("parsed_ok")]
@@ -105,7 +105,7 @@ def main():
         sev_high = a["risk_score"]["severity"] in {"High", "Critical"}
         if sev_high == bool(t.get("is_fraud")):
             sev_correct += 1
-        # action vs ground-truth disposition (alert-contextualized — see caveat)
+        # action vs ground-truth disposition (alert-contextualized - see caveat)
         gold = t.get("gold_disposition")
         want_decline = gold in {"confirm_fraud", "deny_dispute_first_party"}
         act = a["recommendation"]["action"]
@@ -123,7 +123,7 @@ def main():
     print("=" * 72)
     print(f"Cases run: {n}   ·   parsed clean: {len(parsed)} ({p(len(parsed),n)})   ·   "
           f"schema+enum valid: {len(enum_valid)} ({p(len(enum_valid),n)})")
-    print("\nHEADLINE — generative quality:")
+    print("\nHEADLINE - generative quality:")
     print(f"  Evidence grounding (Observed signals supported by input): "
           f"{p(obs_grounded,obs_total)}  [{obs_grounded}/{obs_total}]")
     print(f"    → hallucinated-observation rate: {p(obs_total-obs_grounded,obs_total)}")
@@ -139,7 +139,7 @@ def main():
     if flagged:
         print(f"\nFlagged 'Observed' signals to eyeball (grounding check is conservative/lexical):")
         for cid, name, reason in flagged[:10]:
-            print(f"  · {cid}: \"{name}\" — {str(reason)[:90]}")
+            print(f"  · {cid}: \"{name}\" - {str(reason)[:90]}")
     print("\n" + "=" * 72)
     print("RESUME-READY:")
     print(f"  • Built an automated eval for the FraudSense LLM copilot over {n} labeled cases: "
