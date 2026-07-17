@@ -136,6 +136,30 @@ try:
 except Exception as _pe:
     print(f"⚠ Real-data payment model unavailable ({_pe}) - run payment_real_model.py")
 
+# ── Phase 1 backbone: durable entity/event store ──────────────────────────────
+# The platform's shared nervous system (core/store.py). build_event() writes every
+# scored transaction here as entities + events, so scoring leaves a durable trail
+# instead of an ephemeral dict - the substrate the closed loop (WS2) and the
+# cross-institution network (WS3) are built on. A store failure must never break
+# scoring, so every write is best-effort.
+# Pure helpers (stdlib-only) import at module scope so they exist even if the SQLite
+# store fails to open; only the Store() instantiation is guarded.
+from core.store import Store, DEFAULT_DB_PATH
+from core.record import record_scored_event
+from core.loop import close_loop
+from core.liability import expected_liability
+from core.narrative import scam_narrative
+try:
+    STORE = Store(DEFAULT_DB_PATH)
+    _bb = STORE.stats()
+    print(f"✓ Backbone online - {_bb['entities_total']:,} entities, "
+          f"{_bb['events_total']:,} events ({STORE.path})")
+    if _bb["events_total"] == 0:
+        print("  (backbone empty - run `python3 -m core.seed_from_csv` to seed history)")
+except Exception as _se:
+    STORE = None
+    print(f"⚠ Backbone unavailable ({_se}); scoring continues without a durable trail")
+
 # ── Injection pipeline state ───────────────────────────────────────────────────
 
 _ingest_buffer:   deque = deque(maxlen=500)   # ring buffer - latest injected events
@@ -196,7 +220,7 @@ def build_event(row) -> dict:
     # ── Drift monitoring - non-blocking, appends to rolling buffer ────────────
     drift_monitor.record(ml, features)
 
-    return {
+    event = {
         "transaction_id":    str(row.get("transaction_id", f"txn_{random.randint(10000,99999)}")),
         "amount":            round(float(row.get("amount", 0.0)), 2),
         "user_id":           str(row.get("user_id", "unknown")),
@@ -216,6 +240,16 @@ def build_event(row) -> dict:
         "graph_risk_score":  graph_ctx["graph_risk_score"],
         "timestamp":         datetime.utcnow().isoformat() + "Z",
     }
+
+    # WS4: price the decision in dollars of expected reimbursement liability, not just
+    # probability - the number the buyer's P&L actually cares about post-regulation.
+    event["expected_liability"] = expected_liability(
+        cascade_score, event["amount"],
+        typology=str(row.get("fraud_typology", "") or ""), rail=event["rail"])
+
+    # Durable trail on the backbone (best-effort; never changes the score above).
+    record_scored_event(STORE, event, row)
+    return event
 
 
 # ── Autonomous Agent Startup ──────────────────────────────────────────────────
@@ -552,6 +586,14 @@ def _assemble_case(row) -> dict:
 
     case = case_file.assemble(row, scored, graph_ctx=graph_ctx, explanation=explanation)
 
+    # WS4: a plain-language read of the con (deterministic; the copilot can enrich it).
+    case["scam_narrative"] = scam_narrative(
+        typology=str(row.get("fraud_typology", "") or ""),
+        signals={"amount": scored.get("amount", row.get("amount", 0.0)),
+                 "rail": scored.get("rail", row.get("payment_rail", "")),
+                 "is_new_recipient": row.get("is_new_recipient"),
+                 "expected_liability": scored.get("expected_liability")})
+
     # External enrichment via the connector hub (credit bureaus, fraud consortia,
     # sanctions, open banking). Live API when credentialed, else derived signals -
     # this is what populates the identity/device view the feature families scaffolded.
@@ -691,12 +733,29 @@ def post_feedback(body: dict):
     update so the caller can see the loop close."""
     if _feedback is None:
         raise HTTPException(503, "Feedback loop not available (reputation layer not loaded).")
-    return _feedback.record(
-        transaction_id=str(body.get("transaction_id", "")),
-        label=str(body.get("label", "")),
-        recipient_id=str(body.get("recipient_id", "")),
-        source=str(body.get("source", "investigator")),
-    )
+
+    transaction_id = str(body.get("transaction_id", ""))
+    label          = str(body.get("label", ""))
+    recipient_id   = str(body.get("recipient_id", ""))
+    source         = str(body.get("source", "investigator"))
+
+    # Existing loop: online reputation update (next payment scores higher) + log.
+    result = _feedback.record(transaction_id, label, recipient_id, source)
+
+    # WS2: mirror the disposition onto the durable backbone and return the receipt
+    # that makes the compounding visible (pending payments, exposure, retrain queue).
+    if STORE is not None:
+        try:
+            online   = result.get("online_reputation_update") or {}
+            rep_rate = online.get("recipient_global_fraud_rate") if online else None
+            lc       = result.get("label_class")
+            is_fraud = True if lc == "fraud" else (False if lc == "legit" else None)
+            result["receipt"] = close_loop(
+                STORE, transaction_id, recipient_id, label, is_fraud, rep_rate, source)
+        except Exception:
+            pass   # receipt is additive; a backbone failure must not fail the disposition
+
+    return result
 
 
 @app.get("/feedback/status")
@@ -1118,6 +1177,116 @@ def get_gnn_stats():
     precomputed 1-hop neighbourhood aggregate counts.
     """
     return gnn_lite.get_stats()
+
+
+# ── Backbone (entity/event store) ─────────────────────────────────────────────
+# The Phase 1 substrate: every scored transaction leaves a durable entity+event
+# trail here. These endpoints expose it for the loop receipt (WS2) and the UI.
+
+@app.get("/backbone/stats")
+def backbone_stats():
+    """Entity and event counts in the durable store, by type, plus tenants."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    return STORE.stats()
+
+
+@app.post("/narrative")
+def narrative(body: dict):
+    """Scam-narrative for a case (WS4): explains the con, not the transaction. Body:
+    {typology, amount, rail, is_new_recipient, expected_liability}. No LLM key needed."""
+    return scam_narrative(
+        typology=str(body.get("typology", "") or ""),
+        signals={"amount": body.get("amount", 0.0), "rail": body.get("rail", ""),
+                 "is_new_recipient": body.get("is_new_recipient"),
+                 "expected_liability": body.get("expected_liability")})
+
+
+@app.get("/backbone/liability")
+def backbone_liability(event_type: str = "alert"):
+    """Portfolio liability-at-risk (WS4): expected reimbursement dollars summed over
+    open alerts. The number a fraud-ops lead answers to, priced not just probability."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    return STORE.liability_at_risk(event_type)
+
+
+@app.get("/backbone/recent")
+def backbone_recent(event_type: str = "", limit: int = 50):
+    """Most recent events on the backbone (optionally filtered by type)."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    evs = STORE.recent_events(event_type or None, limit=limit)
+    return [e.__dict__ for e in evs]
+
+
+@app.get("/backbone/entity/{entity_id:path}")
+def backbone_entity(entity_id: str, events: int = 20):
+    """One entity (with its live reputation) plus the events that touch it -
+    the object an investigator and the network layer both read."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    ent = STORE.get_entity(entity_id)
+    if ent is None:
+        raise HTTPException(404, f"entity '{entity_id}' not found")
+    return {"entity": ent.__dict__,
+            "events": [e.__dict__ for e in STORE.events_for_entity(entity_id, limit=events)]}
+
+
+# ── Consortium: privacy-preserving cross-institution network (WS3) ────────────
+# The n=2 moat. A payee's fraud reputation combined across institutions via
+# differential privacy, so a victim's bank can flag a mule it cannot see alone
+# without any institution sharing raw data. Fictional tenants (see core/consortium).
+
+@app.get("/consortium/recipient/{recipient_id:path}")
+def consortium_recipient(recipient_id: str, as_institution: str = "inst_neobank",
+                         epsilon: float = 1.0):
+    """Cross-institution reputation for one payee, from a querying institution's view:
+    each institution's LOCAL view, the DP-COMBINED network view, and whether the
+    network reveals a mule the querying institution could not see in its own data."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    from core.consortium import local_views, network_reveal, INSTITUTIONS
+    if as_institution not in INSTITUTIONS:
+        raise HTTPException(400, f"as_institution must be one of {list(INSTITUTIONS)}")
+    rid = recipient_id if recipient_id.startswith("recipient:") else f"recipient:{recipient_id}"
+    labels = STORE.recipient_sender_labels(rid)
+    if not labels:
+        raise HTTPException(404, f"no transactions found for payee '{recipient_id}'")
+    local  = local_views(labels)
+    reveal = network_reveal(local, as_institution, epsilon)
+    reveal["recipient_id"]          = rid
+    reveal["all_institution_views"] = local
+    return reveal
+
+
+@app.get("/consortium/mules")
+def consortium_mules(min_fraud: int = 3, scan: int = 300, epsilon: float = 1.0, limit: int = 20):
+    """Find flagship cross-institution mules in the live data: payees BELOW the alert
+    line at an institution that banks with them, yet flagged by the DP-combined
+    network. These are exactly the mules no single bank can catch alone."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    from core.consortium import local_views, consortium_view, INSTITUTIONS, ALERT_THRESHOLD
+    out = []
+    for rid, _f, _t in STORE.fraudy_recipients(min_fraud=min_fraud, limit=scan):
+        labels = STORE.recipient_sender_labels(rid)
+        if not labels:
+            continue
+        local = local_views(labels)
+        cons  = consortium_view(local, epsilon)
+        blind = [k for k, d in local.items() if d["tx"] > 0 and not d["alerts"]]
+        if cons["alerts"] and blind:
+            out.append({
+                "recipient_id": rid,
+                "blind_to": [{"institution": k, "name": INSTITUTIONS[k],
+                              "local_rate": local[k]["rate"], "tx": local[k]["tx"]} for k in blind],
+                "institutions": {k: {"tx": d["tx"], "fraud": d["fraud"], "rate": d["rate"],
+                                     "alerts": d["alerts"], "name": d["name"]} for k, d in local.items()},
+                "consortium": cons,
+            })
+    out.sort(key=lambda m: m["consortium"]["combined_rate_dp"], reverse=True)
+    return {"threshold": ALERT_THRESHOLD, "epsilon": epsilon, "found": len(out), "mules": out[:limit]}
 
 
 # ── SyntheticID Ingest ────────────────────────────────────────────────────────
