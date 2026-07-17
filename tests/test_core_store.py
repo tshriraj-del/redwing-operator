@@ -263,6 +263,21 @@ def test_consortium_dp_is_deterministic_per_seed():
     assert consortium_view(local, 1.0, seed=5) == consortium_view(local, 1.0, seed=5)
 
 
+def test_consortium_index_finds_the_cross_bank_mule():
+    from core.consortium import build_index, find_mules_in_index, views_from_counts, institution_of
+    # build edges for one mule: victims (clean) at one bank, flagged cash-outs at another
+    victims = [u for u in (f"vv{i}" for i in range(200)) if institution_of(u) == "inst_neobank"][:10]
+    cashout = [u for u in (f"cc{i}" for i in range(200)) if institution_of(u) == "inst_crypto"][:9]
+    edges = [("recipient:MULE", u, 0) for u in victims] + \
+            [("recipient:MULE", u, 1 if i < 7 else 0) for i, u in enumerate(cashout)]
+    idx = build_index(edges)
+    lv = views_from_counts(idx["recipient:MULE"])
+    assert lv["inst_neobank"]["alerts"] is False        # victim bank blind
+    assert lv["inst_crypto"]["alerts"] is True          # off-ramp sees it
+    mules = find_mules_in_index(idx, epsilon=1.0)
+    assert any(m["recipient_id"] == "recipient:MULE" for m in mules)
+
+
 def test_consortium_stays_silent_below_evidence_floor():
     from core.consortium import consortium_view, network_reveal, MIN_EVIDENCE_TX
     # a tiny-volume payee must never alert on DP noise (the ws2_demo_mule bug)
