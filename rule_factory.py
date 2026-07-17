@@ -152,7 +152,7 @@ def analyze_and_generate(gaps: pd.DataFrame, existing_rules: list, api_key: str)
 
     user_message = f"""Analyze these rule gaps and generate detection rules.
 
-RULE GAPS (fraud ML caught, but 41 existing rules missed):
+RULE GAPS (fraud ML caught, but the {len(existing_rules)} existing rules missed):
 {gap_stats}
 
 EXISTING RULES (do not duplicate):
