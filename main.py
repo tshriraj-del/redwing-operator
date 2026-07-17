@@ -596,6 +596,7 @@ def _assemble_case(row) -> dict:
                  "rail": scored.get("rail", row.get("payment_rail", "")),
                  "is_new_recipient": row.get("is_new_recipient"),
                  "expected_liability": scored.get("expected_liability")})
+    case["expected_liability"] = scored.get("expected_liability")   # WS4: priced in dollars
 
     # External enrichment via the connector hub (credit bureaus, fraud consortia,
     # sanctions, open banking). Live API when credentialed, else derived signals -
