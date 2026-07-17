@@ -107,6 +107,50 @@ def consortium_view(local: dict, epsilon: float = 1.0, seed: int = 0) -> dict:
     }
 
 
+def build_index(edges) -> dict:
+    """One pass over all transaction edges -> {recipient_id: {institution: [tx, fraud]}}.
+    Built once and cached: a live scan cannot afford a JOIN per recipient."""
+    from collections import defaultdict
+    idx: dict = defaultdict(lambda: {k: [0, 0] for k in INSTITUTIONS})
+    for recip, usr, fr in edges:
+        d = idx[recip][institution_of(usr)]
+        d[0] += 1
+        d[1] += int(bool(fr))
+    return idx
+
+
+def views_from_counts(counts: dict) -> dict:
+    """{institution: [tx, fraud]} -> the local_views shape (per-institution rate/alert)."""
+    out = {}
+    for k in INSTITUTIONS:
+        tx, fraud = counts.get(k, [0, 0])
+        rate = round(_smoothed(fraud, tx), 6)
+        out[k] = {"tx": tx, "fraud": fraud, "rate": rate,
+                  "alerts": rate >= ALERT_THRESHOLD, "name": INSTITUTIONS[k]}
+    return out
+
+
+def find_mules_in_index(index: dict, epsilon: float = 1.0, limit: int = 20) -> list:
+    """Cross-institution mules from the cached index: flagged by the DP network yet
+    below the alert line at an institution that banks with them."""
+    out = []
+    for rid, counts in index.items():
+        local = views_from_counts(counts)
+        cons = consortium_view(local, epsilon)
+        blind = [k for k, d in local.items() if d["tx"] > 0 and not d["alerts"]]
+        if cons["alerts"] and blind:
+            out.append({
+                "recipient_id": rid,
+                "blind_to": [{"institution": k, "name": INSTITUTIONS[k],
+                              "local_rate": local[k]["rate"], "tx": local[k]["tx"]} for k in blind],
+                "institutions": {k: {"tx": d["tx"], "fraud": d["fraud"], "rate": d["rate"],
+                                     "alerts": d["alerts"], "name": d["name"]} for k, d in local.items()},
+                "consortium": cons,
+            })
+    out.sort(key=lambda m: m["consortium"]["combined_rate_dp"], reverse=True)
+    return out[:limit]
+
+
 def network_reveal(local: dict, querying_institution: str,
                    epsilon: float = 1.0, seed: int = 0) -> dict:
     """The payoff: does the consortium reveal a mule the querying institution could not

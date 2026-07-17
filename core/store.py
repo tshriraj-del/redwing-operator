@@ -360,6 +360,20 @@ class Store:
         ).fetchall()
         return [(r["uid"], int(r["fr"] or 0)) for r in rows]
 
+    def all_transaction_edges(self):
+        """Stream (recipient_entity_id, sender_user_entity_id, is_fraud) for every
+        transaction, in ONE pass. The raw material for the cross-institution index,
+        which is built once and cached (per-recipient JOINs do not scale to a scan)."""
+        cur = self._conn.execute(
+            "SELECT er.entity_id recip, eu.entity_id usr, "
+            "CAST(json_extract(e.derived,'$.is_fraud') AS INTEGER) fr "
+            "FROM events e "
+            "JOIN event_entities er ON e.event_id=er.event_id AND er.entity_id LIKE 'recipient:%' "
+            "JOIN event_entities eu ON e.event_id=eu.event_id AND eu.entity_id LIKE 'user:%' "
+            "WHERE e.event_type='transaction'")
+        for row in cur:
+            yield row["recip"], row["usr"], int(row["fr"] or 0)
+
     def fraudy_recipients(self, min_fraud: int = 3, limit: int = 400) -> list:
         """Candidate mules: recipient entities whose seeded reputation shows at least
         `min_fraud` confirmed frauds, most-fraudulent first. The cheap pre-filter so

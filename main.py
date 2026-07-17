@@ -260,6 +260,9 @@ async def start_autonomous_agent():
     if MODEL_OK and not agent_state.running:
         asyncio.create_task(run_agent(build_event, df_all, FEATURES))
     asyncio.create_task(_graph_refresh_loop())
+    # WS3: warm the consortium index off the event loop so the first lookup is instant
+    if STORE is not None:
+        asyncio.get_event_loop().run_in_executor(None, _get_consortium_index)
 
 
 async def _graph_refresh_loop() -> None:
@@ -1237,6 +1240,53 @@ def backbone_entity(entity_id: str, events: int = 20):
 # The n=2 moat. A payee's fraud reputation combined across institutions via
 # differential privacy, so a victim's bank can flag a mule it cannot see alone
 # without any institution sharing raw data. Fictional tenants (see core/consortium).
+#
+# The cross-institution view is served from a cached index built in ONE pass over
+# all transaction edges (a per-recipient JOIN scan does not scale). The index is
+# warmed in the background at startup, so lookups are instant.
+
+import threading as _cthreading
+_consortium_index = None
+_consortium_index_lock = _cthreading.Lock()
+
+
+def _get_consortium_index(force: bool = False):
+    """Build (once) and cache {recipient_id: {institution: [tx, fraud]}}. Built from
+    the in-memory ledger with vectorised pandas (a SQLite per-recipient or triple-join
+    scan does not scale to 880k rows), then overlaid with the few store-only recipients
+    (e.g. the injected demo mule) that are not in the ledger."""
+    global _consortium_index
+    if STORE is None:
+        return {}
+    with _consortium_index_lock:
+        if _consortium_index is not None and not force:
+            return _consortium_index
+        from core.consortium import institution_of, INSTITUTIONS
+        idx: dict = {}
+        # base: the 880k ledger already in memory, grouped by (recipient, institution)
+        if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
+            d = df_all[["user_id", "recipient_id", "is_fraud"]].dropna(subset=["recipient_id"]).copy()
+            d["is_fraud"] = pd.to_numeric(d["is_fraud"], errors="coerce").fillna(0).astype(int)
+            d["inst"] = d["user_id"].astype(str).map(institution_of)
+            d["rid"]  = "recipient:" + d["recipient_id"].astype(str)
+            g = d.groupby(["rid", "inst"])["is_fraud"].agg(cnt="count", frd="sum")
+            for (rid, inst), r in g.iterrows():
+                idx.setdefault(rid, {k: [0, 0] for k in INSTITUTIONS})[inst] = [int(r.cnt), int(r.frd)]
+        # overlay: store-only recipients not present in the ledger (injected/demo)
+        try:
+            for ent in STORE.entities_by_type("recipient", limit=100000):
+                if ent.entity_id in idx:
+                    continue
+                counts = {k: [0, 0] for k in INSTITUTIONS}
+                for uid, fr in STORE.recipient_sender_labels(ent.entity_id):
+                    c = counts[institution_of(uid)]; c[0] += 1; c[1] += int(fr)
+                if any(c[0] for c in counts.values()):
+                    idx[ent.entity_id] = counts
+        except Exception:
+            pass
+        _consortium_index = idx
+        return _consortium_index
+
 
 @app.get("/consortium/recipient/{recipient_id:path}")
 def consortium_recipient(recipient_id: str, as_institution: str = "inst_neobank",
@@ -1246,14 +1296,14 @@ def consortium_recipient(recipient_id: str, as_institution: str = "inst_neobank"
     network reveals a mule the querying institution could not see in its own data."""
     if STORE is None:
         raise HTTPException(503, "Backbone store not available.")
-    from core.consortium import local_views, network_reveal, INSTITUTIONS
+    from core.consortium import views_from_counts, network_reveal, INSTITUTIONS
     if as_institution not in INSTITUTIONS:
         raise HTTPException(400, f"as_institution must be one of {list(INSTITUTIONS)}")
     rid = recipient_id if recipient_id.startswith("recipient:") else f"recipient:{recipient_id}"
-    labels = STORE.recipient_sender_labels(rid)
-    if not labels:
+    counts = _get_consortium_index().get(rid)
+    if not counts:
         raise HTTPException(404, f"no transactions found for payee '{recipient_id}'")
-    local  = local_views(labels)
+    local  = views_from_counts(counts)
     reveal = network_reveal(local, as_institution, epsilon)
     reveal["recipient_id"]          = rid
     reveal["all_institution_views"] = local
@@ -1261,32 +1311,17 @@ def consortium_recipient(recipient_id: str, as_institution: str = "inst_neobank"
 
 
 @app.get("/consortium/mules")
-def consortium_mules(min_fraud: int = 3, scan: int = 300, epsilon: float = 1.0, limit: int = 20):
-    """Find flagship cross-institution mules in the live data: payees BELOW the alert
+def consortium_mules(epsilon: float = 1.0, limit: int = 20):
+    """Flagship cross-institution mules from the cached index: payees BELOW the alert
     line at an institution that banks with them, yet flagged by the DP-combined
-    network. These are exactly the mules no single bank can catch alone."""
+    network. Exactly the mules no single bank can catch alone."""
     if STORE is None:
         raise HTTPException(503, "Backbone store not available.")
-    from core.consortium import local_views, consortium_view, INSTITUTIONS, ALERT_THRESHOLD
-    out = []
-    for rid, _f, _t in STORE.fraudy_recipients(min_fraud=min_fraud, limit=scan):
-        labels = STORE.recipient_sender_labels(rid)
-        if not labels:
-            continue
-        local = local_views(labels)
-        cons  = consortium_view(local, epsilon)
-        blind = [k for k, d in local.items() if d["tx"] > 0 and not d["alerts"]]
-        if cons["alerts"] and blind:
-            out.append({
-                "recipient_id": rid,
-                "blind_to": [{"institution": k, "name": INSTITUTIONS[k],
-                              "local_rate": local[k]["rate"], "tx": local[k]["tx"]} for k in blind],
-                "institutions": {k: {"tx": d["tx"], "fraud": d["fraud"], "rate": d["rate"],
-                                     "alerts": d["alerts"], "name": d["name"]} for k, d in local.items()},
-                "consortium": cons,
-            })
-    out.sort(key=lambda m: m["consortium"]["combined_rate_dp"], reverse=True)
-    return {"threshold": ALERT_THRESHOLD, "epsilon": epsilon, "found": len(out), "mules": out[:limit]}
+    from core.consortium import find_mules_in_index, ALERT_THRESHOLD
+    idx   = _get_consortium_index()
+    mules = find_mules_in_index(idx, epsilon=epsilon, limit=limit)
+    return {"threshold": ALERT_THRESHOLD, "epsilon": epsilon,
+            "found": len(mules), "mules": mules, "index_recipients": len(idx)}
 
 
 # ── SyntheticID Ingest ────────────────────────────────────────────────────────
