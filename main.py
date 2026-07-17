@@ -260,9 +260,12 @@ async def start_autonomous_agent():
     if MODEL_OK and not agent_state.running:
         asyncio.create_task(run_agent(build_event, df_all, FEATURES))
     asyncio.create_task(_graph_refresh_loop())
-    # WS3: warm the consortium index off the event loop so the first lookup is instant
+    # WS3/WS5: warm the consortium index and the fraud graph off the event loop so the
+    # first lookups are instant
     if STORE is not None:
-        asyncio.get_event_loop().run_in_executor(None, _get_consortium_index)
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _get_consortium_index)
+        loop.run_in_executor(None, lambda: backbone_graph(refresh=True))
 
 
 async def _graph_refresh_loop() -> None:
@@ -1235,6 +1238,60 @@ def backbone_entity(entity_id: str, events: int = 20):
         raise HTTPException(404, f"entity '{entity_id}' not found")
     return {"entity": ent.__dict__,
             "events": [e.__dict__ for e in STORE.events_for_entity(entity_id, limit=events)]}
+
+
+import threading as _gthreading
+_fraud_graph_cache = None
+_fraud_graph_lock = _gthreading.RLock()
+
+
+def _build_graph_edges() -> list:
+    """Edges for the fraud graph: fraud rows from the in-memory ledger (fast) plus a
+    small legit sample, overlaid with the store-only demo mule. Building from df_all
+    avoids the per-recipient SQLite scan that made this ~40s."""
+    edges = []
+    if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
+        def _rows(frame, is_fraud):
+            # vectorised column extraction (itertuples/_asdict is pathologically slow here)
+            n = len(frame)
+            users  = frame["user_id"].astype(str).tolist()
+            recips = frame["recipient_id"].astype(str).tolist()
+            devs   = frame["device_id"].astype(str).tolist() if "device_id" in frame else [""] * n
+            amts   = pd.to_numeric(frame.get("amount", 0), errors="coerce").fillna(0.0).tolist()
+            typs   = (frame["fraud_typology"].astype(str).tolist()
+                      if is_fraud and "fraud_typology" in frame else ["none"] * n)
+            for u, d, r, a, t in zip(users, devs, recips, amts, typs):
+                edges.append({"user": u, "device": d, "recipient": r,
+                              "is_fraud": is_fraud, "amount": float(a), "typology": t})
+        mask = df_all["is_fraud"] == True if "is_fraud" in df_all.columns else None
+        _rows(df_all[mask].head(5000) if mask is not None else df_all.iloc[0:0], 1)
+        _rows(df_all[~mask].head(150) if mask is not None else df_all.head(150), 0)
+    # overlay: the store-only demo mule
+    try:
+        for e in STORE.events_for_entity("recipient:DEMO-MULE-PIG-01", event_type="transaction", limit=40):
+            uid = next((x[5:] for x in e.entities if x.startswith("user:")), None)
+            edges.append({"user": uid, "device": None, "recipient": "DEMO-MULE-PIG-01",
+                          "is_fraud": int(e.derived.get("is_fraud", 0) or 0),
+                          "amount": float(e.payload.get("amount") or 0.0),
+                          "typology": str(e.payload.get("typology") or "")})
+    except Exception:
+        pass
+    return edges
+
+
+@app.get("/backbone/graph")
+def backbone_graph(refresh: bool = False):
+    """A real fraud graph from the backbone: the top mule recipients as detected
+    rings, their accounts and shared devices, plus a clean periphery. Cached (the
+    graph is stable); pass refresh=true to rebuild. Replaces the curated demo."""
+    global _fraud_graph_cache
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    with _fraud_graph_lock:
+        if _fraud_graph_cache is None or refresh:
+            from core.graph import build_fraud_graph
+            _fraud_graph_cache = build_fraud_graph(_build_graph_edges())
+        return _fraud_graph_cache
 
 
 # ── Consortium: privacy-preserving cross-institution network (WS3) ────────────

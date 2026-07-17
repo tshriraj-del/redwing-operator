@@ -263,6 +263,25 @@ def test_consortium_dp_is_deterministic_per_seed():
     assert consortium_view(local, 1.0, seed=5) == consortium_view(local, 1.0, seed=5)
 
 
+def test_fraud_graph_builds_rings_from_edges():
+    from core.graph import build_fraud_graph
+    edges = []
+    # a mule ring: 5 fraud senders, 2 sharing one device
+    for i in range(5):
+        edges.append({"user": f"u{i}", "device": ("shared" if i < 2 else f"dev{i}"),
+                      "recipient": "mule1", "is_fraud": 1, "amount": 3000.0, "typology": "mule_cashout"})
+    # clean periphery
+    for i in range(4):
+        edges.append({"user": f"c{i}", "device": f"cd{i}", "recipient": f"legit{i}",
+                      "is_fraud": 0, "amount": 50.0, "typology": "none"})
+    g = build_fraud_graph(edges, rings=2, per_ring=20, clean=10)
+    assert any(n["label"] == "mule1" and n.get("mule_flag") for n in g["nodes"])
+    assert any(r["name"] == "mule1" and r["typology"] == "mule_cashout" for r in g["rings"])
+    assert g["stats"]["shared_devices"] >= 1                      # the shared device
+    assert g["stats"]["fraud_edges"] >= 5
+    assert all("type" in n and "label" in n for n in g["nodes"])  # renderer contract
+
+
 def test_consortium_index_finds_the_cross_bank_mule():
     from core.consortium import build_index, find_mules_in_index, views_from_counts, institution_of
     # build edges for one mule: victims (clean) at one bank, flagged cash-outs at another

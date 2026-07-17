@@ -311,13 +311,18 @@ class Store:
                           limit: int = 200) -> list:
         """Every event touching an entity, newest first. The query WS2 and WS3
         are built on (pending payments to a mule; a recipient across banks)."""
-        q = ("SELECT e.* FROM events e JOIN event_entities ee ON e.event_id=ee.event_id "
-             "WHERE ee.entity_id=?")
+        # Filter by entity FIRST (idx_ee_entity) via a subquery, then order/limit the
+        # small result. A plain JOIN + ORDER BY e.ts makes the planner scan the entire
+        # events table by the ts index, which is catastrophic for a low-volume entity
+        # (measured 53s for a 19-event payee); the subquery keeps it in milliseconds.
+        q = ("SELECT * FROM (SELECT e.event_id, e.event_type, e.ts, e.institution_id, "
+             "e.payload, e.derived FROM events e WHERE e.event_id IN "
+             "(SELECT event_id FROM event_entities WHERE entity_id=?)")
         args: list = [entity_id]
         if event_type:
             q += " AND e.event_type=?"
             args.append(event_type)
-        q += " ORDER BY e.ts DESC LIMIT ?"
+        q += ") ORDER BY ts DESC LIMIT ?"
         args.append(limit)
         return [self._row_to_event(r) for r in self._conn.execute(q, args).fetchall()]
 
