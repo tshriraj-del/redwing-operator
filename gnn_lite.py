@@ -1,20 +1,25 @@
 """
-gnn_lite.py - Tier 2 GNN cascade: 1-layer Graph Convolutional Network.
+gnn_lite.py - Tier 2 graph neighborhood aggregation (fixed-weight, NOT a learned GNN).
 
-Implements message-passing neighborhood aggregation over the transaction graph:
+Honesty note: this is graph-shaped feature aggregation, not a trained graph neural
+network. The weights below are hand-set domain constants, not learned parameters, and
+there is no training or message-passing at inference - just precomputed 1-hop fraud-rate
+lookups combined linearly. Read it as "graph reputation aggregation"; a real learned
+GNN (even a 1-layer GraphSAGE on this graph) is a roadmap item, not what this is.
+
+Computes, per transaction:
   Round 0: per-entity fraud rate features (user, device, recipient)
   Round 1: 1-hop aggregates precomputed at startup
              user's recipient neighborhood mean fraud rate
              device's co-user neighborhood mean fraud rate
 
 Both Round 1 aggregates are stored as scalar lookup tables (no runtime graph
-traversal) following the BRIGHT batch/realtime separation pattern. Inference
-is O(1) dict lookup - identical latency to the existing Tier 3 store.
+traversal). Inference is O(1) dict lookup - identical latency to the Tier 3 store.
 
 Only invoked for borderline transactions (TIER2_LO ≤ Tier 1 score ≤ TIER2_HI).
-Final cascade score: Tier1 * 0.65 + GNN * 0.35
+Final cascade score: Tier1 * 0.65 + aggregate * 0.35
 
-GCN output weights calibrated from fraud domain knowledge:
+Fixed output weights (hand-set from fraud domain knowledge, not learned):
   f_R  recipient fraud rate         0.35  fraud rings share recipient endpoints
   h_D1 device co-user mean fraud    0.30  shared device = ring membership signal
   f_U  user fraud rate              0.15  user's own transaction history

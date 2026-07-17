@@ -8,3 +8,11 @@ venv/
 *.pkl
 *.csv
 *.jsonl
+
+# Phase 1 backbone: durable entity/event store (regenerable via core.seed_from_csv)
+redwing.db
+redwing.db-wal
+redwing.db-shm
+
+# Local audit / strategy docs (candid; kept out of the public repo)
+docs/
