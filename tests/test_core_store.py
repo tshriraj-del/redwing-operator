@@ -698,6 +698,74 @@ def test_substrate_separates_observed_from_censored_outcomes():
     s.close()
 
 
+def test_stream_publishes_and_consumes_fifo_with_ack():
+    from core.stream import DurableQueue
+    q = DurableQueue(_fresh_db())
+    for i in range(3):
+        q.publish("ingest", f"k{i}", {"n": i})
+    seen = []
+    res = q.consume_batch("ingest", lambda p: seen.append(p["n"]))
+    assert seen == [0, 1, 2]                                 # FIFO by offset
+    assert res["succeeded"] == 3
+    assert q.stats("ingest")["done"] == 3 and q.stats("ingest")["ready"] == 0
+    q.close()
+
+
+def test_stream_publish_is_idempotent_by_key():
+    from core.stream import DurableQueue
+    q = DurableQueue(_fresh_db())
+    assert q.publish("ingest", "dup", {"a": 1}) is not None
+    assert q.publish("ingest", "dup", {"a": 1}) is None      # duplicate key ignored
+    assert q.stats("ingest")["ready"] == 1                   # only one enqueued
+    q.close()
+
+
+def test_stream_retries_then_dead_letters_then_replays():
+    from core.stream import DurableQueue
+    q = DurableQueue(_fresh_db(), max_attempts=2)
+    q.publish("ingest", "boom", {"x": 1})
+
+    def always_fails(_):
+        raise RuntimeError("scorer down")
+
+    q.consume_batch("ingest", always_fails)                  # attempt 1 -> stays ready
+    assert q.stats("ingest")["ready"] == 1
+    q.consume_batch("ingest", always_fails)                  # attempt 2 -> dead-lettered
+    assert q.stats("ingest")["dead"] == 1 and q.stats("ingest")["ready"] == 0
+    dl = q.dead_letters("ingest")
+    assert dl and "scorer down" in dl[0]["last_error"]
+
+    assert q.replay("ingest") == 1                           # DLQ -> ready
+    ok = []
+    q.consume_batch("ingest", lambda p: ok.append(p["x"]))   # now processes cleanly
+    assert ok == [1] and q.stats("ingest")["done"] == 1
+    q.close()
+
+
+def test_stream_backpressure_raises_instead_of_dropping():
+    from core.stream import DurableQueue, BackpressureError
+    q = DurableQueue(_fresh_db(), max_depth=2)
+    q.publish("ingest", "a", {})
+    q.publish("ingest", "b", {})
+    try:
+        q.publish("ingest", "c", {})
+        assert False, "expected BackpressureError"
+    except BackpressureError:
+        pass
+    q.close()
+
+
+def test_stream_is_durable_across_reopen():
+    from core.stream import DurableQueue
+    path = _fresh_db()
+    q = DurableQueue(path)
+    q.publish("ingest", "persist", {"v": 9})
+    q.close()
+    q2 = DurableQueue(path)                                  # reopen the same file
+    assert q2.stats("ingest")["ready"] == 1                  # the event survived the restart
+    q2.close()
+
+
 def test_ingest_schema_normalises_a_valid_event():
     from core.ingest_schema import validate_event
     v = validate_event({"transaction_id": "t1", "amount": "1500.5", "payment_rail": "Faster_Payments",
