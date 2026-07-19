@@ -151,6 +151,7 @@ from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
 from core.ingest_schema import validate_event, contract as ingest_contract
 from core.stream import DurableQueue, BackpressureError
+from core.connectors import FileConnector
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -172,6 +173,18 @@ try:
 except Exception as _te:
     TRANSPORT = None
     print(f"⚠ Stream transport unavailable ({_te}); /stream/* disabled")
+
+# Source connector: a pull ingestion source (a JSONL drop file), checkpointed on the backbone
+# so it resumes where it left off, publishing into the durable transport.
+try:
+    FILE_CONNECTOR = (FileConnector("file_drop", TRANSPORT, STORE, MODELS_DIR / "ingest_drop.jsonl")
+                      if (TRANSPORT is not None and STORE is not None) else None)
+    if FILE_CONNECTOR is not None:
+        print(f"✓ Source connector 'file_drop' watching {FILE_CONNECTOR.path} "
+              f"(checkpoint {STORE.get_checkpoint('file_drop')})")
+except Exception as _ce:
+    FILE_CONNECTOR = None
+    print(f"⚠ Source connector unavailable ({_ce})")
 
 # ── Injection pipeline state ───────────────────────────────────────────────────
 
@@ -326,6 +339,8 @@ async def start_autonomous_agent():
     asyncio.create_task(_graph_refresh_loop())
     if TRANSPORT is not None:
         asyncio.create_task(_stream_consumer_loop())        # drain the durable queue into scoring
+    if FILE_CONNECTOR is not None:
+        asyncio.create_task(_connector_poll_loop())         # auto-ingest source (file) drops
     # WS3/WS5: warm the consortium index and the fraud graph off the event loop so the
     # first lookups are instant
     if STORE is not None:
@@ -1062,6 +1077,42 @@ def stream_replay():
     if TRANSPORT is None:
         return {"stream": "unavailable"}
     return {"replayed": TRANSPORT.replay("ingest")}
+
+
+# ── Source connectors: pull ingestion (checkpointed, resumable, idempotent) ──
+
+async def _connector_poll_loop() -> None:
+    """Poll the source connector on an interval so a file drop is auto-ingested. The connector
+    checkpoints its offset, so this only ever picks up what is new."""
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            if FILE_CONNECTOR is not None and MODEL_OK:
+                await loop.run_in_executor(None, FILE_CONNECTOR.poll)
+        except Exception:
+            pass
+        await asyncio.sleep(5.0)
+
+
+@app.get("/connectors")
+def connectors_list():
+    """Registered source connectors and their durable checkpoints (how far each has consumed)."""
+    if STORE is None:
+        return {"connectors": []}
+    conns = []
+    if FILE_CONNECTOR is not None:
+        conns.append({"connector": FILE_CONNECTOR.connector_id, "source_type": FILE_CONNECTOR.source_type,
+                      "path": FILE_CONNECTOR.path, "checkpoint": STORE.get_checkpoint(FILE_CONNECTOR.connector_id)})
+    return {"connectors": conns, "checkpoints": STORE.checkpoints()}
+
+
+@app.post("/connectors/file/poll")
+def connectors_file_poll():
+    """Trigger a poll of the file connector now: read new lines since the checkpoint, validate,
+    publish valid events to the transport, advance the checkpoint. Returns the poll stats."""
+    if FILE_CONNECTOR is None:
+        raise HTTPException(503, "file connector unavailable")
+    return FILE_CONNECTOR.poll()
 
 
 @app.get("/ingest/stats")

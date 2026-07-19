@@ -254,6 +254,14 @@ CREATE TABLE IF NOT EXISTS telemetry (
 );
 CREATE INDEX IF NOT EXISTS idx_tel_subject ON telemetry(subject_ref);
 CREATE INDEX IF NOT EXISTS idx_tel_ts      ON telemetry(ts);
+
+-- checkpoints: how far a source connector has consumed a source. Durable so a connector
+-- resumes where it left off after a restart instead of re-reading from the beginning.
+CREATE TABLE IF NOT EXISTS checkpoints (
+    name       TEXT PRIMARY KEY,
+    offset     INTEGER NOT NULL DEFAULT 0,
+    updated_ts TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -781,6 +789,28 @@ class Store:
             (str(subject_ref or ""),),
         ).fetchone()
         return _loads(row["raw"]) if row else {}
+
+    # ── Connector checkpoints (resumable source ingestion) ──────────────────────
+
+    def get_checkpoint(self, name: str) -> int:
+        """The last consumed offset for a named source, or 0 if never seen."""
+        row = self._conn.execute(
+            "SELECT offset FROM checkpoints WHERE name=?", (str(name),)).fetchone()
+        return int(row["offset"]) if row else 0
+
+    def set_checkpoint(self, name: str, offset: int) -> None:
+        """Record how far a source has been consumed (durably, so ingestion resumes here)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO checkpoints (name, offset, updated_ts) VALUES (?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET offset=excluded.offset, updated_ts=excluded.updated_ts",
+                (str(name), int(offset), _now()))
+            self._conn.commit()
+
+    def checkpoints(self) -> dict:
+        """All connector checkpoints, name -> offset."""
+        return {r["name"]: int(r["offset"]) for r in
+                self._conn.execute("SELECT name, offset FROM checkpoints").fetchall()}
 
     # ── Introspection ─────────────────────────────────────────────────────────
 

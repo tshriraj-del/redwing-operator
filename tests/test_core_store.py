@@ -766,6 +766,74 @@ def test_stream_is_durable_across_reopen():
     q2.close()
 
 
+def _write_jsonl(path, rows):
+    import json as _json
+    with open(path, "w") as f:
+        for r in rows:
+            f.write((r if isinstance(r, str) else _json.dumps(r)) + "\n")
+
+
+def test_file_connector_pulls_validates_and_resumes():
+    import json as _json
+    from core.stream import DurableQueue
+    from core.connectors import FileConnector
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "drop.jsonl")
+    q = DurableQueue(os.path.join(d, "q.db"))
+    s = Store(os.path.join(d, "cp.db"))
+    _write_jsonl(path, [
+        {"transaction_id": "a", "amount": 100, "user_id": "u1"},
+        {"transaction_id": "b", "amount": 200, "user_id": "u2"},
+        "{not valid json}",                                   # malformed -> rejected (visible)
+        "",                                                   # blank -> skipped
+    ])
+    c = FileConnector("filedrop", q, s, path)
+    r1 = c.poll()
+    assert r1["published"] == 2 and r1["rejected"] == 1 and r1["skipped"] == 1
+    assert q.stats("ingest")["ready"] == 2
+    assert s.get_checkpoint("filedrop") == 4                  # consumed all four lines
+
+    assert c.poll()["consumed"] == 0                          # nothing new: resumable no-op
+
+    with open(path, "a") as f:                                # a new drop arrives
+        f.write(_json.dumps({"transaction_id": "c", "amount": 300, "user_id": "u3"}) + "\n")
+    r3 = c.poll()
+    assert r3["published"] == 1 and s.get_checkpoint("filedrop") == 5
+    assert q.stats("ingest")["ready"] == 3
+    q.close(); s.close()
+
+
+def test_file_connector_reread_is_idempotent():
+    from core.stream import DurableQueue
+    from core.connectors import FileConnector
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "drop.jsonl")
+    q = DurableQueue(os.path.join(d, "q.db"))
+    s = Store(os.path.join(d, "cp.db"))
+    _write_jsonl(path, [{"transaction_id": "a", "amount": 100, "user_id": "u1"},
+                        {"transaction_id": "b", "amount": 200, "user_id": "u2"}])
+    c = FileConnector("filedrop", q, s, path)
+    c.poll()
+    assert q.stats("ingest")["ready"] == 2
+
+    s.set_checkpoint("filedrop", 0)                           # simulate a lost checkpoint / replay
+    r = c.poll()
+    assert r["deduped"] == 2 and r["published"] == 0          # transport dedupe: no double-processing
+    assert q.stats("ingest")["ready"] == 2                    # still two, not four
+    q.close(); s.close()
+
+
+def test_checkpoint_survives_store_reopen():
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "cp.db")
+    s = Store(p)
+    s.set_checkpoint("conn_x", 42)
+    s.close()
+    s2 = Store(p)
+    assert s2.get_checkpoint("conn_x") == 42                  # durable across restart
+    s2.close()
+
+
 def test_ingest_schema_normalises_a_valid_event():
     from core.ingest_schema import validate_event
     v = validate_event({"transaction_id": "t1", "amount": "1500.5", "payment_rail": "Faster_Payments",
