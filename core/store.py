@@ -59,6 +59,14 @@ def _loads(s: str) -> dict:
         return {}
 
 
+def _to_text(value) -> str:
+    """Normalise a label value to text. Booleans become '1'/'0' so an outcome label reads
+    the same whether it arrives as True or as 1; everything else stringifies."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return "" if value is None else str(value)
+
+
 # ── Records ───────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -85,11 +93,67 @@ class Event:
     derived:        dict = field(default_factory=dict)
 
 
+@dataclass
+class Decision:
+    """A point-in-time record of one scored subject. `features` is the snapshot as-of
+    decision time; `shadow` marks a scored-but-not-enforced (counterfactual) decision."""
+    decision_id:        str
+    ts:                 str
+    entity_id:          str = ""
+    subject_ref:        str = ""
+    action:             str = ""
+    module:             str = ""
+    score:              Optional[float] = None
+    expected_liability: Optional[float] = None
+    shadow:             bool = False
+    institution_id:     str = ""
+    features:           dict = field(default_factory=dict)
+    rationale:          dict = field(default_factory=dict)
+    model_version:      str = ""
+    policy_version:     str = ""
+
+
+@dataclass
+class Label:
+    """A delayed, revisable ground-truth label. `superseded_by` == '' means current."""
+    label_id:      str
+    label_space:   str
+    label_key:     str
+    label_value:   str = ""
+    decision_id:   str = ""
+    subject_ref:   str = ""
+    entity_id:     str = ""
+    source:        str = ""
+    confidence:    float = 0.0
+    ts:            str = ""
+    effective_ts:  str = ""
+    superseded_by: str = ""
+    annotator:     str = ""
+    notes:         str = ""
+
+
 # Recognised event types (a soft contract, not enforced - the log stays open).
 EVENT_TYPES = (
     "transaction", "alert", "disposition", "enrichment", "feedback", "model_update",
 )
 ENTITY_TYPES = ("user", "device", "recipient", "account", "institution")
+
+# Soft contracts for the training substrate (documentation, not enforced).
+DECISION_ACTIONS = (
+    "ALLOW", "STEP_UP", "HOLD", "BLOCK", "DECLINE", "PROTECT", "SHADOW", "MONITOR",
+)
+# The two label spaces: an OUTCOME (was it fraud, was the money lost) that falls out of
+# the ledger, and INTENT (motive, witting-ness, scam stage) that only a human adjudicator
+# produces. The psychological modules can only ever be trained on the second.
+LABEL_SPACES = (
+    "outcome", "intent", "witting", "scam_stage", "vulnerability_outcome", "loophole_outcome",
+)
+# Provenance, ranked roughly by trust. A heuristic self-label is the weakest; a confirmed
+# loss or an analyst adjudication is the strongest. training_rows() can filter on these.
+LABEL_SOURCES = (
+    "heuristic", "analyst", "confirmed_loss", "chargeback", "victim_report",
+    "law_enforcement", "consortium",
+)
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
@@ -125,6 +189,56 @@ CREATE TABLE IF NOT EXISTS event_entities (
 );
 CREATE INDEX IF NOT EXISTS idx_ee_entity ON event_entities(entity_id);
 CREATE INDEX IF NOT EXISTS idx_ee_event  ON event_entities(event_id);
+
+-- The training substrate (labeling schema).
+-- decisions: the POINT-IN-TIME record of every scored subject, including the ones we
+-- did not enforce (shadow=1). Storing the feature snapshot as-of decision time is what
+-- prevents training-serving skew, and scoring everything (not just what we let through)
+-- is what defeats the selection-bias / counterfactual trap.
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id        TEXT PRIMARY KEY,
+    ts                 TEXT NOT NULL,
+    entity_id          TEXT NOT NULL DEFAULT '',
+    subject_ref        TEXT NOT NULL DEFAULT '',   -- the tx / application / session this was about
+    action             TEXT NOT NULL DEFAULT '',   -- ALLOW | STEP_UP | HOLD | BLOCK | DECLINE | PROTECT | SHADOW | MONITOR
+    module             TEXT NOT NULL DEFAULT '',   -- which module produced it (model | motive | scam_arc | ...)
+    score              REAL,
+    expected_liability REAL,
+    shadow             INTEGER NOT NULL DEFAULT 0, -- 1 = scored but not enforced (counterfactual)
+    institution_id     TEXT NOT NULL DEFAULT '',
+    features           TEXT NOT NULL DEFAULT '{}', -- the exact feature snapshot at decision time
+    rationale          TEXT NOT NULL DEFAULT '{}', -- drivers / posture the module gave
+    model_version      TEXT NOT NULL DEFAULT '',
+    policy_version     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_dec_subject ON decisions(subject_ref);
+CREATE INDEX IF NOT EXISTS idx_dec_entity  ON decisions(entity_id);
+CREATE INDEX IF NOT EXISTS idx_dec_ts      ON decisions(ts);
+CREATE INDEX IF NOT EXISTS idx_dec_shadow  ON decisions(shadow);
+
+-- labels: delayed, revisable ground truth across the TWO label spaces (outcome AND
+-- intent). A label can arrive late, carry a provenance and a confidence, and be revised
+-- by a newer label (superseded_by chains the history instead of overwriting it).
+CREATE TABLE IF NOT EXISTS labels (
+    label_id      TEXT PRIMARY KEY,
+    decision_id   TEXT NOT NULL DEFAULT '',        -- resolved from subject_ref when possible
+    subject_ref   TEXT NOT NULL DEFAULT '',
+    entity_id     TEXT NOT NULL DEFAULT '',
+    label_space   TEXT NOT NULL,                   -- outcome | intent | witting | scam_stage | ...
+    label_key     TEXT NOT NULL,                   -- is_fraud | motive | witting_role | scam_stage | ...
+    label_value   TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT '',        -- heuristic | analyst | confirmed_loss | chargeback | victim_report | ...
+    confidence    REAL NOT NULL DEFAULT 0.0,
+    ts            TEXT NOT NULL,                    -- when the label was recorded
+    effective_ts  TEXT NOT NULL DEFAULT '',        -- when the labeled fact became true (for latency)
+    superseded_by TEXT NOT NULL DEFAULT '',        -- '' = current; else the label_id that revised this
+    annotator     TEXT NOT NULL DEFAULT '',
+    notes         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_lbl_decision ON labels(decision_id);
+CREATE INDEX IF NOT EXISTS idx_lbl_subject  ON labels(subject_ref);
+CREATE INDEX IF NOT EXISTS idx_lbl_space    ON labels(label_space, label_key);
+CREATE INDEX IF NOT EXISTS idx_lbl_current  ON labels(superseded_by);
 """
 
 
@@ -414,6 +528,204 @@ class Store:
             ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
+    # ── Decisions + labels (the training substrate) ─────────────────────────────
+
+    def log_decision(
+        self,
+        subject_ref: str,
+        entity_id: str = "",
+        action: str = "",
+        module: str = "",
+        score: Optional[float] = None,
+        expected_liability: Optional[float] = None,
+        features: Optional[dict] = None,
+        rationale: Optional[dict] = None,
+        shadow: bool = False,
+        institution_id: str = "",
+        model_version: str = "",
+        policy_version: str = "",
+        ts: Optional[str] = None,
+        decision_id: Optional[str] = None,
+    ) -> str:
+        """Record ONE scored subject at decision time. Pass a stable `decision_id` to make
+        it idempotent (re-scoring the same case overwrites); omit it and each scoring is a
+        new immutable row. `features` is the point-in-time snapshot; `shadow=True` records a
+        counterfactual (scored but not enforced) so training data stays uncensored."""
+        decision_id = decision_id or uuid.uuid4().hex
+        ts = ts or _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO decisions (decision_id, ts, entity_id, subject_ref, "
+                "action, module, score, expected_liability, shadow, institution_id, features, "
+                "rationale, model_version, policy_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (decision_id, ts, entity_id, str(subject_ref or ""), action, module,
+                 (float(score) if score is not None else None),
+                 (float(expected_liability) if expected_liability is not None else None),
+                 1 if shadow else 0, institution_id,
+                 json.dumps(features or {}), json.dumps(rationale or {}),
+                 model_version, policy_version),
+            )
+            self._conn.commit()
+        return decision_id
+
+    def get_decision(self, decision_id: str) -> Optional[Decision]:
+        row = self._conn.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (decision_id,)
+        ).fetchone()
+        return self._row_to_decision(row) if row else None
+
+    def latest_decision_for_subject(self, subject_ref: str) -> Optional[Decision]:
+        row = self._conn.execute(
+            "SELECT * FROM decisions WHERE subject_ref=? ORDER BY ts DESC LIMIT 1",
+            (str(subject_ref or ""),),
+        ).fetchone()
+        return self._row_to_decision(row) if row else None
+
+    def add_label(
+        self,
+        label_space: str,
+        label_key: str,
+        label_value,
+        source: str = "",
+        confidence: float = 0.0,
+        decision_id: str = "",
+        subject_ref: str = "",
+        entity_id: str = "",
+        effective_ts: str = "",
+        annotator: str = "",
+        notes: str = "",
+        ts: Optional[str] = None,
+    ) -> str:
+        """Attach a label. Resolves the decision from `subject_ref` when `decision_id` is
+        not given, so a chargeback that arrives keyed only by transaction id still links to
+        the point-in-time features. Supersedes (does not overwrite) the current label for the
+        same target + space + key, so revisions keep their history."""
+        ts = ts or _now()
+        subject_ref = str(subject_ref or "")
+        with self._lock:
+            if not decision_id and subject_ref:
+                row = self._conn.execute(
+                    "SELECT decision_id, entity_id FROM decisions WHERE subject_ref=? "
+                    "ORDER BY ts DESC LIMIT 1", (subject_ref,),
+                ).fetchone()
+                if row:
+                    decision_id = row["decision_id"]
+                    entity_id = entity_id or row["entity_id"]
+
+            label_id = uuid.uuid4().hex
+            key_col = "decision_id" if decision_id else "subject_ref"
+            key_val = decision_id or subject_ref
+            if key_val:
+                self._conn.execute(
+                    f"UPDATE labels SET superseded_by=? WHERE {key_col}=? AND label_space=? "
+                    "AND label_key=? AND superseded_by=''",
+                    (label_id, key_val, label_space, label_key),
+                )
+            self._conn.execute(
+                "INSERT INTO labels (label_id, decision_id, subject_ref, entity_id, "
+                "label_space, label_key, label_value, source, confidence, ts, effective_ts, "
+                "superseded_by, annotator, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (label_id, decision_id, subject_ref, entity_id, label_space, label_key,
+                 _to_text(label_value), source, float(confidence or 0.0), ts,
+                 effective_ts, "", annotator, notes),
+            )
+            self._conn.commit()
+        return label_id
+
+    def current_labels(self, decision_id: str = "", subject_ref: str = "") -> list:
+        """The live (non-superseded) labels for a decision or subject."""
+        if decision_id:
+            rows = self._conn.execute(
+                "SELECT * FROM labels WHERE decision_id=? AND superseded_by='' ORDER BY ts",
+                (decision_id,)).fetchall()
+        elif subject_ref:
+            rows = self._conn.execute(
+                "SELECT * FROM labels WHERE subject_ref=? AND superseded_by='' ORDER BY ts",
+                (str(subject_ref),)).fetchall()
+        else:
+            return []
+        return [self._row_to_label(r) for r in rows]
+
+    def label_history(self, decision_id: str = "", subject_ref: str = "") -> list:
+        """Every label including superseded ones, oldest first: the audit trail of how a
+        label was revised (e.g. a 'fraud' outcome later re-adjudicated as friendly-fraud)."""
+        if decision_id:
+            rows = self._conn.execute(
+                "SELECT * FROM labels WHERE decision_id=? ORDER BY ts", (decision_id,)).fetchall()
+        elif subject_ref:
+            rows = self._conn.execute(
+                "SELECT * FROM labels WHERE subject_ref=? ORDER BY ts", (str(subject_ref),)).fetchall()
+        else:
+            return []
+        return [self._row_to_label(r) for r in rows]
+
+    def training_rows(
+        self,
+        label_space: str,
+        label_key: str,
+        include_shadow: bool = True,
+        min_confidence: float = 0.0,
+        sources: Optional[Iterable[str]] = None,
+        limit: int = 100000,
+    ) -> list:
+        """Materialise (features-at-decision-time, label) rows for one target. Includes
+        shadow decisions by default so the set is UNCENSORED. Filter by `sources` to build a
+        gold set (analyst/confirmed only) versus a silver set (with heuristic self-labels)."""
+        q = ("SELECT d.decision_id, d.ts dts, d.entity_id, d.subject_ref, d.features, "
+             "d.score, d.expected_liability, d.shadow, d.module, d.model_version, "
+             "l.label_value, l.source, l.confidence, l.effective_ts, l.ts lts "
+             "FROM labels l JOIN decisions d ON d.decision_id=l.decision_id "
+             "WHERE l.label_space=? AND l.label_key=? AND l.superseded_by='' "
+             "AND l.confidence>=?")
+        args: list = [label_space, label_key, float(min_confidence)]
+        if not include_shadow:
+            q += " AND d.shadow=0"
+        srcs = list(sources or [])
+        if srcs:
+            q += " AND l.source IN (%s)" % ",".join("?" * len(srcs))
+            args.extend(srcs)
+        q += " LIMIT ?"
+        args.append(limit)
+        out = []
+        for r in self._conn.execute(q, args).fetchall():
+            out.append({
+                "decision_id": r["decision_id"], "entity_id": r["entity_id"],
+                "subject_ref": r["subject_ref"], "features": _loads(r["features"]),
+                "label": r["label_value"], "confidence": round(float(r["confidence"]), 3),
+                "source": r["source"], "shadow": bool(r["shadow"]), "module": r["module"],
+                "model_version": r["model_version"],
+                "decided_ts": r["dts"], "labeled_ts": r["lts"], "effective_ts": r["effective_ts"],
+            })
+        return out
+
+    def labeling_stats(self) -> dict:
+        """Health of the labeling substrate: how much data, how much is enforced vs shadow,
+        and what fraction of decisions have a confirmed OUTCOME label yet (label coverage)."""
+        c = self._conn
+        dec_total = int(c.execute("SELECT COUNT(*) n FROM decisions").fetchone()["n"])
+        enforced = int(c.execute("SELECT COUNT(*) n FROM decisions WHERE shadow=0").fetchone()["n"])
+        labels_current = int(c.execute(
+            "SELECT COUNT(*) n FROM labels WHERE superseded_by=''").fetchone()["n"])
+        by_space = {r["label_space"]: r["n"] for r in c.execute(
+            "SELECT label_space, COUNT(*) n FROM labels WHERE superseded_by='' "
+            "GROUP BY label_space").fetchall()}
+        by_source = {r["source"]: r["n"] for r in c.execute(
+            "SELECT source, COUNT(*) n FROM labels WHERE superseded_by='' "
+            "GROUP BY source").fetchall()}
+        outcome_covered = int(c.execute(
+            "SELECT COUNT(DISTINCT decision_id) n FROM labels "
+            "WHERE label_space='outcome' AND superseded_by='' AND decision_id<>''"
+        ).fetchone()["n"])
+        return {
+            "decisions_total":  dec_total,
+            "decisions_enforced": enforced,
+            "decisions_shadow": dec_total - enforced,
+            "labels_current":   labels_current,
+            "labels_by_space":  by_space,
+            "labels_by_source": by_source,
+            "outcome_coverage": round(outcome_covered / dec_total, 3) if dec_total else 0.0,
+        }
+
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
@@ -456,6 +768,27 @@ class Store:
             event_id=r["event_id"], event_type=r["event_type"], ts=r["ts"],
             institution_id=r["institution_id"], entities=ents,
             payload=_loads(r["payload"]), derived=_loads(r["derived"]),
+        )
+
+    @staticmethod
+    def _row_to_decision(r: sqlite3.Row) -> Decision:
+        return Decision(
+            decision_id=r["decision_id"], ts=r["ts"], entity_id=r["entity_id"],
+            subject_ref=r["subject_ref"], action=r["action"], module=r["module"],
+            score=r["score"], expected_liability=r["expected_liability"],
+            shadow=bool(r["shadow"]), institution_id=r["institution_id"],
+            features=_loads(r["features"]), rationale=_loads(r["rationale"]),
+            model_version=r["model_version"], policy_version=r["policy_version"],
+        )
+
+    @staticmethod
+    def _row_to_label(r: sqlite3.Row) -> Label:
+        return Label(
+            label_id=r["label_id"], label_space=r["label_space"], label_key=r["label_key"],
+            label_value=r["label_value"], decision_id=r["decision_id"],
+            subject_ref=r["subject_ref"], entity_id=r["entity_id"], source=r["source"],
+            confidence=float(r["confidence"]), ts=r["ts"], effective_ts=r["effective_ts"],
+            superseded_by=r["superseded_by"], annotator=r["annotator"], notes=r["notes"],
         )
 
 

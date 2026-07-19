@@ -144,9 +144,10 @@ except Exception as _pe:
 # scoring, so every write is best-effort.
 # Pure helpers (stdlib-only) import at module scope so they exist even if the SQLite
 # store fails to open; only the Store() instantiation is guarded.
-from core.store import Store, DEFAULT_DB_PATH
+from core.store import Store, DEFAULT_DB_PATH, eid
 from core.record import record_scored_event
-from core.loop import close_loop
+from core.loop import close_loop, record_decision
+from core.holdout import holdout_decision, holdout_rationale
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -249,6 +250,32 @@ def build_event(row) -> dict:
 
     # Durable trail on the backbone (best-effort; never changes the score above).
     record_scored_event(STORE, event, row)
+
+    # Training substrate: log this scoring as a POINT-IN-TIME decision (the feature snapshot
+    # as it was used), and apply the monitored-holdout policy so a capped, low-liability slice
+    # of would-be-holds is released and observed as clean counterfactual ground truth. This is
+    # additive and best-effort: it records what the policy decides, and never alters the score
+    # or alert returned above (a production enforcer would honour the release downstream).
+    if STORE is not None:
+        try:
+            tid = event["transaction_id"]
+            proposed = "HOLD" if event["is_alert"] else "ALLOW"
+            ho = holdout_decision(tid, proposed, event["expected_liability"])
+            event["holdout"] = ho["holdout"]
+            record_decision(
+                STORE, subject_ref=tid,
+                entity_id=eid("user", str(row.get("user_id", "unknown"))),
+                action=ho["enforced_action"], module="model",
+                score=cascade_score, expected_liability=event["expected_liability"],
+                features=features,
+                rationale={**holdout_rationale(ho), "pattern": event.get("top_pattern")},
+                shadow=False, institution_id=str(row.get("institution_id", "") or ""),
+                model_version=str(config.get("version", "")),
+                decision_id=(f"dec:{tid}" if tid else None),
+            )
+        except Exception:
+            pass   # the substrate is additive; a failure here must never fail scoring
+
     return event
 
 
@@ -757,8 +784,10 @@ def post_feedback(body: dict):
             rep_rate = online.get("recipient_global_fraud_rate") if online else None
             lc       = result.get("label_class")
             is_fraud = True if lc == "fraud" else (False if lc == "legit" else None)
+            intent = body.get("intent") if isinstance(body.get("intent"), dict) else None
             result["receipt"] = close_loop(
-                STORE, transaction_id, recipient_id, label, is_fraud, rep_rate, source)
+                STORE, transaction_id, recipient_id, label, is_fraud, rep_rate, source,
+                intent=intent)
         except Exception:
             pass   # receipt is additive; a backbone failure must not fail the disposition
 
@@ -771,6 +800,25 @@ def feedback_status():
     if _feedback is None:
         return {"loop": "unavailable", "labeled_total": 0}
     return _feedback.status()
+
+
+@app.get("/substrate/stats")
+def substrate_stats():
+    """Health of the labeling substrate: decisions logged, enforced vs shadow, outcome
+    coverage and label provenance. The training-readiness dashboard's data source."""
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    return STORE.labeling_stats()
+
+
+@app.get("/substrate/readiness")
+def substrate_readiness():
+    """Per-module graduation readiness: heuristic-vs-gold agreement and a verdict for each
+    trainable target. Answers 'is this heuristic layer ready to become a trained model yet?'"""
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    from core.graduation import readiness_report
+    return readiness_report(STORE)
 
 
 # ── Injection Pipeline ────────────────────────────────────────────────────────
