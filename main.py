@@ -148,6 +148,7 @@ from core.store import Store, DEFAULT_DB_PATH, eid
 from core.record import record_scored_event
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
+from core.telemetry import assess_from_telemetry, derive_signals
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -267,6 +268,7 @@ def build_event(row) -> dict:
                 event["is_alert"] = False
                 event["monitored"] = True
             event["holdout"] = ho["holdout"]
+            did = f"dec:{tid}" if tid else None
             record_decision(
                 STORE, subject_ref=tid,
                 entity_id=eid("user", str(row.get("user_id", "unknown"))),
@@ -276,8 +278,27 @@ def build_event(row) -> dict:
                 rationale={**holdout_rationale(ho), "pattern": event.get("top_pattern")},
                 shadow=False, institution_id=str(row.get("institution_id", "") or ""),
                 model_version=str(config.get("version", "")),
-                decision_id=(f"dec:{tid}" if tid else None),
+                decision_id=did,
             )
+
+            # Real-telemetry actor read: ONLY when the client reported behaviour for this
+            # subject. Derived from reported telemetry (never the typology), so the motive
+            # heuristic label it bootstraps is honest. No telemetry -> the actor layer stays
+            # silent, which is correct: motive cannot be inferred from an amount and a rail.
+            tel = STORE.get_telemetry(tid)
+            if tel:
+                actor = assess_from_telemetry(tel)
+                if actor.get("actor"):
+                    m = actor["actor"]["motive"]["motive"]
+                    event["actor_motive"] = m
+                    event["actor_victim_stage"] = actor["victim"]["arc"]["stage_label"]
+                    # only bootstrap a training label from a confident read, never from an
+                    # inconclusive one (that would teach the model noise)
+                    if m != "inconclusive":
+                        STORE.add_label("intent", "motive", m, source="heuristic", confidence=0.3,
+                                        decision_id=did, subject_ref=tid,
+                                        entity_id=eid("user", str(row.get("user_id", "unknown"))),
+                                        annotator="motive_from_telemetry")
         except Exception:
             pass   # the substrate is additive; a failure here must never fail scoring
 
@@ -824,6 +845,33 @@ def substrate_readiness():
         return {"substrate": "unavailable"}
     from core.graduation import readiness_report
     return readiness_report(STORE)
+
+
+@app.post("/telemetry")
+def post_telemetry(body: dict):
+    """Ingest REAL behavioural telemetry a client SDK reports for a subject (session /
+    transaction). Body: {subject_ref, entity_id?, telemetry:{...}}. This is what lets the actor
+    modules run on genuine behaviour instead of on values derived from the typology (leakage).
+    Returns the tells derived from the reported values so the caller can see what fired."""
+    if STORE is None:
+        return {"telemetry": "unavailable"}
+    subject_ref = str(body.get("subject_ref", "")).strip()
+    if not subject_ref:
+        raise HTTPException(400, "subject_ref is required")
+    tel = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
+    STORE.record_telemetry(subject_ref, tel, entity_id=str(body.get("entity_id", "") or ""))
+    return {"ok": True, "subject_ref": subject_ref, "derived_signals": derive_signals(tel)}
+
+
+@app.get("/actor/{subject_ref}")
+def actor_read(subject_ref: str):
+    """The telemetry-derived actor read for a subject: the offender view (motive, lifecycle,
+    intervention) and the victim view (scam arc, coercion-in-flight, protection). Silent when no
+    telemetry was reported, which is the honest answer with no behaviour to reason over."""
+    if STORE is None:
+        return {"actor": "unavailable"}
+    from core.telemetry import assess_subject
+    return assess_subject(STORE, subject_ref)
 
 
 # ── Injection Pipeline ────────────────────────────────────────────────────────

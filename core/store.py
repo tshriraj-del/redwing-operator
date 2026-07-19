@@ -239,6 +239,21 @@ CREATE INDEX IF NOT EXISTS idx_lbl_decision ON labels(decision_id);
 CREATE INDEX IF NOT EXISTS idx_lbl_subject  ON labels(subject_ref);
 CREATE INDEX IF NOT EXISTS idx_lbl_space    ON labels(label_space, label_key);
 CREATE INDEX IF NOT EXISTS idx_lbl_current  ON labels(superseded_by);
+
+-- telemetry: REAL behavioural / device / session signals reported by the client for a
+-- subject (a session or transaction). This is what lets the actor modules run on genuine
+-- behaviour rather than on values derived from the answer (typology), which would be
+-- leakage. Stored raw; core/telemetry.py maps it to the actor modules' signal tells.
+CREATE TABLE IF NOT EXISTS telemetry (
+    telemetry_id   TEXT PRIMARY KEY,
+    subject_ref    TEXT NOT NULL DEFAULT '',
+    entity_id      TEXT NOT NULL DEFAULT '',
+    ts             TEXT NOT NULL,
+    institution_id TEXT NOT NULL DEFAULT '',
+    raw            TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_tel_subject ON telemetry(subject_ref);
+CREATE INDEX IF NOT EXISTS idx_tel_ts      ON telemetry(ts);
 """
 
 
@@ -738,6 +753,34 @@ class Store:
             "labels_by_source": by_source,
             "outcome_coverage": round(outcome_covered / dec_total, 3) if dec_total else 0.0,
         }
+
+    # ── Telemetry (real client-reported behavioural signals) ────────────────────
+
+    def record_telemetry(self, subject_ref: str, raw: dict, entity_id: str = "",
+                         institution_id: str = "", ts: Optional[str] = None,
+                         telemetry_id: Optional[str] = None) -> str:
+        """Store a raw telemetry payload for a subject (session / transaction). Idempotent
+        when a stable telemetry_id is supplied; otherwise each report is a new row."""
+        telemetry_id = telemetry_id or uuid.uuid4().hex
+        ts = ts or _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO telemetry (telemetry_id, subject_ref, entity_id, ts, "
+                "institution_id, raw) VALUES (?,?,?,?,?,?)",
+                (telemetry_id, str(subject_ref or ""), entity_id, ts, institution_id,
+                 json.dumps(raw or {})),
+            )
+            self._conn.commit()
+        return telemetry_id
+
+    def get_telemetry(self, subject_ref: str) -> dict:
+        """The most recent raw telemetry for a subject, or {} if none was reported. Absence is
+        meaningful: with no behavioural telemetry, the actor modules have nothing to run on."""
+        row = self._conn.execute(
+            "SELECT raw FROM telemetry WHERE subject_ref=? ORDER BY ts DESC LIMIT 1",
+            (str(subject_ref or ""),),
+        ).fetchone()
+        return _loads(row["raw"]) if row else {}
 
     # ── Introspection ─────────────────────────────────────────────────────────
 

@@ -698,6 +698,53 @@ def test_substrate_separates_observed_from_censored_outcomes():
     s.close()
 
 
+def test_motive_is_inconclusive_on_weak_evidence():
+    from core.motive import assess_actor
+    # a whiff of hesitation must never escalate to enforcement
+    r = assess_actor({"hesitation_entropy": 0.2})
+    assert r["motive"]["motive"] == "inconclusive"
+    assert r["intervention"]["posture"] == "MONITOR"
+    assert r["intervention"]["reportable"] is False
+
+
+def test_telemetry_round_trips_and_derives_reported_tells():
+    from core.telemetry import derive_signals
+    s = Store(_fresh_db())
+    coached = {"call_active": True, "long_reads_before_field": 0.8,
+               "remote_access_tool_active": True, "safe_account_narrative": True}
+    s.record_telemetry("txA", coached, entity_id=eid("user", "uA"))
+    assert s.get_telemetry("txA")["call_active"] is True          # durable round-trip
+    assert s.get_telemetry("nope") == {}                          # absence is meaningful
+
+    sig = derive_signals(coached)
+    for tell in ("coaching_copresence", "script_reading", "remote_access_active", "safe_account_move"):
+        assert sig.get(tell, 0) > 0                               # reported values became tells
+    s.close()
+
+
+def test_telemetry_actor_read_separates_victim_from_automated():
+    from core.telemetry import assess_from_telemetry
+    coached = assess_from_telemetry({"call_active": True, "long_reads_before_field": 0.8,
+                                     "remote_access_tool_active": True, "safe_account_narrative": True})
+    assert coached["actor"]["motive"]["motive"] == "coerced_victim"
+    assert "VICTIM-PROTECT" in coached["victim"]["intervention"]["posture"]
+
+    automated = assess_from_telemetry({"automation_framework": True, "headless": True,
+                                       "action_cadence_regularity": 0.92, "ttfa_seconds": 1,
+                                       "nav_path_directness": 0.95, "emulator": True})
+    assert automated["actor"]["motive"]["motive"] in ("income_source", "organized_malicious")
+
+
+def test_telemetry_is_silent_without_behaviour():
+    from core.telemetry import assess_from_telemetry
+    # no telemetry -> no actor read at all (motive cannot be inferred from nothing)
+    empty = assess_from_telemetry({})
+    assert empty["telemetry_present"] is False and empty["actor"] is None
+    # benign telemetry -> a read, but inconclusive, never an enforcement call
+    benign = assess_from_telemetry({"typing_hesitation": 0.1, "action_cadence_regularity": 0.15})
+    assert benign["actor"]["motive"]["motive"] == "inconclusive"
+
+
 def test_holdout_respects_ceiling_cap_and_determinism():
     from core.holdout import holdout_decision
     # protective / allow-like actions are never diverted, even at rate=1.0
