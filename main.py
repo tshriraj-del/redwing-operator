@@ -150,6 +150,7 @@ from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
 from core.ingest_schema import validate_event, contract as ingest_contract
+from core.stream import DurableQueue, BackpressureError
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -162,6 +163,15 @@ try:
 except Exception as _se:
     STORE = None
     print(f"⚠ Backbone unavailable ({_se}); scoring continues without a durable trail")
+
+# Durable streaming transport: decouples intake (fast, validated, enqueued) from scoring
+# (a background consumer drains it), so a slow model or a burst never drops an event.
+try:
+    TRANSPORT = DurableQueue(MODELS_DIR / "stream.db")
+    print(f"✓ Stream transport online ({TRANSPORT.path}); depth {TRANSPORT.stats('ingest')['ready']}")
+except Exception as _te:
+    TRANSPORT = None
+    print(f"⚠ Stream transport unavailable ({_te}); /stream/* disabled")
 
 # ── Injection pipeline state ───────────────────────────────────────────────────
 
@@ -314,6 +324,8 @@ async def start_autonomous_agent():
     if MODEL_OK and not agent_state.running:
         asyncio.create_task(run_agent(build_event, df_all, FEATURES))
     asyncio.create_task(_graph_refresh_loop())
+    if TRANSPORT is not None:
+        asyncio.create_task(_stream_consumer_loop())        # drain the durable queue into scoring
     # WS3/WS5: warm the consortium index and the fraud graph off the event loop so the
     # first lookups are instant
     if STORE is not None:
@@ -984,6 +996,72 @@ def ingest_schema():
     """The ingestion contract: required / recommended fields, rail normalisation, and the
     label-only fields that must never be used as model features (leakage)."""
     return ingest_contract()
+
+
+# ── Streaming transport: decoupled intake -> durable queue -> background scorer ──
+
+def _stream_handler(payload: dict) -> None:
+    """Score one dequeued event. A raised exception here is what the transport retries and,
+    on exhaustion, dead-letters, so a transient scorer failure never loses the event."""
+    event = build_event(payload)
+    event["source"] = "streamed"
+    _ingest_buffer.appendleft(event)
+    _fan_out(event)
+
+
+async def _stream_consumer_loop() -> None:
+    """Drain the durable queue into the scorer, off the request path. Idle-sleeps when empty."""
+    loop = asyncio.get_event_loop()
+    while True:
+        res = {"processed": 0}
+        try:
+            if MODEL_OK and TRANSPORT is not None:
+                res = await loop.run_in_executor(
+                    None, lambda: TRANSPORT.consume_batch("ingest", _stream_handler, 50))
+        except Exception:
+            pass
+        await asyncio.sleep(0.2 if res.get("processed", 0) else 1.0)
+
+
+@app.post("/stream/publish")
+def stream_publish(body: dict):
+    """Validate and ENQUEUE an event onto the durable transport (fast), instead of scoring it
+    inline. A background consumer drains the queue. Returns 429 under backpressure, so a burst
+    is throttled rather than silently dropped."""
+    if TRANSPORT is None:
+        raise HTTPException(503, "stream transport unavailable")
+    v = validate_event(body, source="stream")
+    if not v["valid"]:
+        raise HTTPException(422, {"error": "schema_validation_failed", "errors": v["errors"]})
+    try:
+        seq = TRANSPORT.publish("ingest", v["event"]["transaction_id"], v["event"])
+    except BackpressureError as e:
+        raise HTTPException(429, str(e))
+    return {"queued": seq is not None, "seq": seq, "deduped": seq is None, "warnings": v["warnings"]}
+
+
+@app.get("/stream/stats")
+def stream_stats():
+    """Transport health: ready depth, processed, dead-letter count, capacity."""
+    if TRANSPORT is None:
+        return {"stream": "unavailable"}
+    return TRANSPORT.stats("ingest")
+
+
+@app.get("/stream/dead_letter")
+def stream_dead_letter():
+    """Events that failed scoring past the retry limit (a real pipeline's DLQ)."""
+    if TRANSPORT is None:
+        return {"stream": "unavailable"}
+    return {"dead_letters": TRANSPORT.dead_letters("ingest")}
+
+
+@app.post("/stream/replay")
+def stream_replay():
+    """Reset dead-lettered events back to ready for reprocessing (replay from the DLQ)."""
+    if TRANSPORT is None:
+        return {"stream": "unavailable"}
+    return {"replayed": TRANSPORT.replay("ingest")}
 
 
 @app.get("/ingest/stats")
