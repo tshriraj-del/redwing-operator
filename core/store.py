@@ -666,13 +666,17 @@ class Store:
         include_shadow: bool = True,
         min_confidence: float = 0.0,
         sources: Optional[Iterable[str]] = None,
+        observed_only: bool = False,
         limit: int = 100000,
     ) -> list:
         """Materialise (features-at-decision-time, label) rows for one target. Includes
         shadow decisions by default so the set is UNCENSORED. Filter by `sources` to build a
-        gold set (analyst/confirmed only) versus a silver set (with heuristic self-labels)."""
+        gold set (analyst/confirmed only) versus a silver set (with heuristic self-labels).
+        Set `observed_only=True` for reject inference on OUTCOME targets: keep only decisions
+        that were allowed (action='ALLOW', including holdout releases), where the outcome was
+        actually observed rather than censored by our own block."""
         q = ("SELECT d.decision_id, d.ts dts, d.entity_id, d.subject_ref, d.features, "
-             "d.score, d.expected_liability, d.shadow, d.module, d.model_version, "
+             "d.score, d.expected_liability, d.shadow, d.action, d.module, d.model_version, "
              "l.label_value, l.source, l.confidence, l.effective_ts, l.ts lts "
              "FROM labels l JOIN decisions d ON d.decision_id=l.decision_id "
              "WHERE l.label_space=? AND l.label_key=? AND l.superseded_by='' "
@@ -680,6 +684,8 @@ class Store:
         args: list = [label_space, label_key, float(min_confidence)]
         if not include_shadow:
             q += " AND d.shadow=0"
+        if observed_only:
+            q += " AND d.action='ALLOW'"
         srcs = list(sources or [])
         if srcs:
             q += " AND l.source IN (%s)" % ",".join("?" * len(srcs))
@@ -692,8 +698,9 @@ class Store:
                 "decision_id": r["decision_id"], "entity_id": r["entity_id"],
                 "subject_ref": r["subject_ref"], "features": _loads(r["features"]),
                 "label": r["label_value"], "confidence": round(float(r["confidence"]), 3),
-                "source": r["source"], "shadow": bool(r["shadow"]), "module": r["module"],
-                "model_version": r["model_version"],
+                "source": r["source"], "shadow": bool(r["shadow"]),
+                "action": r["action"], "observed": r["action"] == "ALLOW",
+                "module": r["module"], "model_version": r["model_version"],
                 "decided_ts": r["dts"], "labeled_ts": r["lts"], "effective_ts": r["effective_ts"],
             })
         return out
@@ -704,6 +711,10 @@ class Store:
         c = self._conn
         dec_total = int(c.execute("SELECT COUNT(*) n FROM decisions").fetchone()["n"])
         enforced = int(c.execute("SELECT COUNT(*) n FROM decisions WHERE shadow=0").fetchone()["n"])
+        # observed = the outcome was actually seen (we allowed it); censored = we blocked it, so
+        # any outcome label is an inference, not an observation. The reject-inference split.
+        observed = int(c.execute(
+            "SELECT COUNT(*) n FROM decisions WHERE action='ALLOW'").fetchone()["n"])
         labels_current = int(c.execute(
             "SELECT COUNT(*) n FROM labels WHERE superseded_by=''").fetchone()["n"])
         by_space = {r["label_space"]: r["n"] for r in c.execute(
@@ -720,6 +731,8 @@ class Store:
             "decisions_total":  dec_total,
             "decisions_enforced": enforced,
             "decisions_shadow": dec_total - enforced,
+            "decisions_observed": observed,
+            "decisions_censored": dec_total - observed,
             "labels_current":   labels_current,
             "labels_by_space":  by_space,
             "labels_by_source": by_source,
