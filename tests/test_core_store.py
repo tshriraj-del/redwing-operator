@@ -698,6 +698,48 @@ def test_substrate_separates_observed_from_censored_outcomes():
     s.close()
 
 
+def test_ingest_schema_normalises_a_valid_event():
+    from core.ingest_schema import validate_event
+    v = validate_event({"transaction_id": "t1", "amount": "1500.5", "payment_rail": "Faster_Payments",
+                        "user_id": "u1", "device_id": "d1"}, source="ingest")
+    assert v["valid"] is True
+    ev = v["event"]
+    assert ev["amount"] == 1500.5                          # coerced + rounded
+    assert ev["payment_rail"] == "fps"                     # synonym normalised
+    assert ev["device_id"] == "d1"                         # passthrough preserved
+    assert ev["_ingest"]["schema_version"] == "1.0"
+
+
+def test_ingest_schema_rejects_silent_zero_corruption():
+    from core.ingest_schema import validate_event
+    # the whole point: a non-numeric amount is an error, not a silent 0
+    bad = validate_event({"transaction_id": "t2", "amount": "N/A", "user_id": "u1"})
+    assert bad["valid"] is False and bad["event"] is None
+    assert any(e["field"] == "amount" for e in bad["errors"])
+    # negative amount and no-amount-no-features are also rejected
+    assert validate_event({"amount": -5, "user_id": "u1"})["valid"] is False
+    assert validate_event({"user_id": "u1"})["valid"] is False
+    # but precomputed features with no amount is allowed
+    assert validate_event({"features": {"amount_zscore": 2.1}, "user_id": "u1"})["valid"] is True
+
+
+def test_ingest_schema_warns_without_failing():
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 100, "rail": "quantum_rail"})   # unknown rail, no tid, no subject
+    assert v["valid"] is True                                     # warnings never block a scoreable event
+    fields = {w["field"] for w in v["warnings"]}
+    assert "transaction_id" in fields and "payment_rail" in fields and "user_id" in fields
+    assert v["event"]["transaction_id"].startswith("txn_")        # generated id
+
+
+def test_ingest_schema_flags_label_leakage():
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 100, "user_id": "u1", "fraud_typology": "pig_butchering", "is_fraud": 1})
+    assert v["valid"] is True
+    assert set(v["event"]["_label_fields"]) == {"fraud_typology", "is_fraud"}
+    assert any("leakage" in w["message"] for w in v["warnings"])   # do-not-feature warning
+
+
 def test_motive_is_inconclusive_on_weak_evidence():
     from core.motive import assess_actor
     # a whiff of hesitation must never escalate to enforcement
