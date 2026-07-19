@@ -325,6 +325,433 @@ def test_store_recipient_sender_labels_and_fraudy_filter():
     s.close()
 
 
+def test_attribute_fabric_is_coherent_with_typology():
+    from core.attributes import evaluate, TOTAL_SURFACE
+    assert TOTAL_SURFACE > 1000                              # bureau-scale leaf surface
+    synth = evaluate("u_synth", "synthetic_id_ai")
+    assert synth["identity"]["Identity linkage"]["thin_file"] is True
+    assert synth["identity_risk"] >= 0.6                     # identity tells fire
+    card = evaluate("u_bot", "card_testing_bot")
+    assert card["device"]["Integrity & tamper"]["headless_browser"] is True
+    assert card["device_risk"] >= 0.6                        # device tells fire
+    # a scam VICTIM looks clean on device+identity; the tell is behavioural
+    victim = evaluate("u_victim", "pig_butchering")
+    assert victim["device_risk"] < 0.5 and victim["identity_risk"] < 0.5
+    assert any(s["risk"] >= 0.6 for s in synth["top_signals"])
+
+
+def test_motive_protects_the_coerced_victim():
+    from core.motive import assess_actor
+    r = assess_actor({"duress": 0.9, "coaching_copresence": 0.8, "script_reading": 0.7})
+    assert r["motive"]["motive"] == "coerced_victim" and r["motive"]["is_victim"] is True
+    assert r["offender"]["lifecycle"] == "coerced_victim"
+    assert r["intervention"]["posture"] == "VICTIM-PROTECT"
+    assert r["intervention"]["reportable"] is False          # never punish the victim
+
+
+def test_motive_separates_survival_from_professional():
+    from core.motive import assess_actor
+    survival = assess_actor({"survival_spend": 0.9, "benefit_timing": 0.7, "essential_category": 0.6})
+    assert survival["motive"]["motive"] == "survival"
+    assert survival["intervention"]["posture"] == "SUPPORT"
+    assert survival["intervention"]["reportable"] is False
+
+    pro = assess_actor({"professional_execution": 0.9, "shared_device_ring": 0.8, "sophisticated_tooling": 0.7})
+    assert pro["motive"]["motive"] in ("income_source", "organized_malicious")
+    assert pro["offender"]["lifecycle"] in ("professional", "ring_operator")
+    assert pro["intervention"]["reportable"] is True         # durable enforcement
+
+
+def test_motive_loophole_closes_the_gap():
+    from core.motive import assess_actor
+    r = assess_actor({"boundary_probing": 0.9, "threshold_walking": 0.7})
+    assert r["motive"]["motive"] == "loophole"
+    assert "CLOSE-GAP" in r["intervention"]["posture"]
+
+
+def test_gauntlet_onboards_clean_but_gates_a_farm():
+    from core.onboarding import assess_onboarding
+    clean = assess_onboarding("applicant_clean", "")
+    farm  = assess_onboarding("applicant_farm", "synthetic_id_ai",
+                              behavior={"shared_cohort": 0.9, "scripted_timing": 0.7})
+    assert clean["is_coerced"] is False
+    assert clean["tier"] < farm["tier"]                            # the farm hits more friction
+    assert farm["decision"] in ("STEP-UP", "MANUAL REVIEW", "DECLINE")
+    assert any(c["dimension"] == "coordination" for c in farm["challenges"])  # farm-specific challenge
+
+
+def test_gauntlet_targets_the_weak_dimension():
+    from core.onboarding import assess_onboarding
+    # fumbling one's own PII (reverse-familiarity) -> knowledge-based auth, not a blanket wall
+    r = assess_onboarding("applicant_kba", "", behavior={"pii_hesitation": 0.85})
+    assert any(c["dimension"] == "knowledge" for c in r["challenges"])
+    assert r["decision"] in ("STEP-UP", "MANUAL REVIEW")
+
+
+def test_gauntlet_protects_the_coerced_applicant():
+    from core.onboarding import assess_onboarding
+    r = assess_onboarding("applicant_coerced", "", behavior={"coaching_pauses": 0.8, "app_switching": 0.7})
+    assert r["is_coerced"] is True
+    assert r["decision"] == "PROTECT" and r["posture"] == "VICTIM-PROTECT"
+    assert not r["challenges"]                                     # a victim is not challenged, but protected
+
+
+def test_scam_arc_locates_the_grooming_stage_and_playbook():
+    from core.scam_arc import locate_on_arc
+    # a pig-butchering victim mid-escalation: online-only relationship, first crypto payee,
+    # escalating transfers funded by a new loan
+    r = locate_on_arc({"online_only_relationship": 0.9, "never_met_in_person": 0.8,
+                       "first_payee_new_crypto": 0.8, "escalating_transfers": 0.8,
+                       "source_of_funds_new": 0.7})
+    assert r["on_arc"] is True
+    assert r["stage"] >= 3                                         # at least escalation
+    assert r["playbook"] == "romance_pig_butchering"
+
+
+def test_scam_arc_break_glass_stops_a_coached_payment():
+    from core.scam_arc import assess_scam
+    # impersonation "safe account" scam with a live handler on the line, remote access open
+    r = assess_scam({"authority_urgency": 0.8, "safe_account_move": 0.9,
+                     "coaching_copresence": 0.9, "remote_access_active": 0.8, "duress": 0.7})
+    assert r["live"]["coached"] is True and r["live"]["duress"] is True
+    assert "VICTIM-PROTECT" in r["intervention"]["posture"]
+    assert r["intervention"]["punitive"] is False                 # the victim is never punished
+    # the break-glass steps tell the customer to disconnect remote access
+    assert any("remote-access" in s or "remote access" in s for s in r["intervention"]["steps"])
+
+
+def test_scam_arc_second_loss_guard_blocks_recovery_scam():
+    from core.scam_arc import assess_scam
+    r = assess_scam({"prior_victim": 0.9, "recovery_promise": 0.9, "fee_to_release": 0.8})
+    assert r["arc"]["playbook"] == "recovery_scam"
+    assert "second-loss" in r["intervention"]["posture"]
+    assert r["intervention"]["reportable_as_scam"] is True
+
+
+def test_scam_arc_educates_early_without_friction():
+    from core.scam_arc import assess_scam
+    # only contact/grooming signals, no money moving yet
+    r = assess_scam({"unsolicited_contact": 0.7, "too_good_returns": 0.6})
+    assert r["arc"]["money_moving"] is False
+    assert r["intervention"]["posture"] == "EDUCATE"              # awareness, not a gate
+    assert r["intervention"]["punitive"] is False
+
+
+def test_scam_arc_leaves_a_normal_customer_alone():
+    from core.scam_arc import assess_scam
+    r = assess_scam({})
+    assert r["arc"]["on_arc"] is False
+    assert r["intervention"]["posture"] == "MONITOR"             # no friction on a normal customer
+
+
+def test_mule_protects_the_unwitting_but_enforces_on_the_witting():
+    from core.mule_network import assess_mule
+    # tricked "payment-processing agent": believes it is a job, forwards everything, stops when warned
+    unwitting = assess_mule({"job_ad_referral": 0.8, "believes_legitimate_job": 0.9,
+                             "forwards_full_amount": 0.8, "stops_on_warning": 0.7,
+                             "first_inbound_unrelated": 0.8, "rapid_passthrough": 0.7})
+    assert unwitting["role"]["role"] == "unwitting"
+    assert unwitting["action"]["person_action"]["posture"] == "PROTECT + EDUCATE"
+    assert unwitting["action"]["person_action"]["reportable"] is False   # not criminalised
+    assert unwitting["action"]["person_action"]["punitive"] is False
+
+    # a paid repeat mule who carries on after a warning
+    witting = assess_mule({"keeps_consistent_cut": 0.9, "continues_after_warning": 0.8,
+                           "many_victim_sources": 0.7, "high_passthrough_ratio": 0.9,
+                           "cashout_crypto": 0.8})
+    assert witting["role"]["role"] == "witting"
+    assert "SAR" in witting["action"]["person_action"]["posture"]
+    assert witting["action"]["person_action"]["reportable"] is True
+
+
+def test_mule_freezes_funds_for_the_upstream_victim_regardless_of_culpability():
+    from core.mule_network import assess_mule
+    # even an unwitting mule holds a real victim's money: the FUND action fires while money is at risk
+    r = assess_mule({"believes_legitimate_job": 0.9, "forwards_full_amount": 0.8,
+                     "first_inbound_unrelated": 0.9, "rapid_passthrough": 0.8})
+    assert r["lifecycle"]["money_at_risk"] is True
+    assert "recover" in r["action"]["fund_action"].lower()               # hold to recover for the victim
+    assert r["action"]["person_action"]["punitive"] is False             # but the person is not punished
+
+
+def test_mule_herder_triggers_network_action():
+    from core.mule_network import assess_mule
+    r = assess_mule({"recruits_others": 0.9, "controls_multiple_accounts": 0.8,
+                     "shared_device_across_accounts": 0.8, "fanin_fanout_topology": 0.7,
+                     "launder_language": 0.6})
+    assert r["role"]["role"] == "herder"
+    assert r["herd"]["herd_role"] == "controller"
+    assert "LAW-ENFORCEMENT" in r["action"]["person_action"]["posture"]
+    assert "herd" in r["action"]["herd_action"].lower()
+
+
+def test_mule_romance_recruit_routes_to_victim_protection():
+    from core.mule_network import assess_mule
+    r = assess_mule({"romance_to_mule": 0.9, "believes_legitimate_job": 0.6,
+                     "forwards_full_amount": 0.8, "stops_on_warning": 0.7,
+                     "first_inbound_unrelated": 0.8})
+    assert r["recruitment"]["channel"] == "romance"
+    assert r["role"]["is_victim_adjacent"] is True
+    assert r["action"]["route_to_victim_protection"] is True             # hand to scam_arc safeguarding
+
+
+def test_mule_undetermined_holds_before_judging():
+    from core.mule_network import assess_mule
+    # mule-pattern movement but no evidence of intent either way
+    r = assess_mule({"first_inbound_unrelated": 0.8, "rapid_passthrough": 0.8,
+                     "high_passthrough_ratio": 0.8})
+    assert r["role"]["role"] == "undetermined"
+    assert r["action"]["person_action"]["posture"] == "HOLD + ESTABLISH-INTENT"
+    assert r["action"]["person_action"]["punitive"] is False
+
+
+def test_first_party_presumes_good_faith():
+    from core.first_party import assess_first_party
+    # a real merchant error, first dispute, cooperative: must stay genuine and be honoured
+    r = assess_first_party({"merchant_error_evidence": 0.9, "first_dispute_ever": 0.8,
+                            "cooperative_provides_evidence": 0.7})
+    assert r["intent"]["intent"] == "genuine" and r["intent"]["presumed_genuine"] is True
+    assert r["action"]["posture"] == "HONOUR"
+    assert r["action"]["punitive"] is False
+
+
+def test_first_party_separates_opportunist_serial_and_bustout():
+    from core.first_party import assess_first_party
+    opp = assess_first_party({"dispute_after_delivery_confirmed": 0.8, "moral_licensing_language": 0.8})
+    assert opp["intent"]["intent"] == "opportunistic"
+    assert "EDUCATE" in opp["action"]["posture"] and opp["action"]["reportable"] is False
+
+    serial = assess_first_party({"serial_disputer": 0.9, "selective_high_value_disputes": 0.7,
+                                 "prior_disputes_lost": 0.7})
+    assert serial["intent"]["intent"] == "serial"
+    assert "RESTRICT" in serial["action"]["posture"] and serial["action"]["reportable"] is True
+
+    bust = assess_first_party({"credit_build_then_maxout": 0.9, "never_intended_to_repay": 0.8,
+                               "contact_change_pre_default": 0.7})
+    assert bust["intent"]["intent"] == "bust_out"
+    assert "LOSS-MITIGATE" in bust["action"]["posture"]
+
+
+def test_first_party_coached_routes_to_verification():
+    from core.first_party import assess_first_party
+    r = assess_first_party({"coached_by_third_party": 0.8, "coached_dispute_template": 0.7, "duress": 0.6})
+    assert r["intent"]["intent"] == "coached"
+    assert r["action"]["posture"] == "VERIFY-COERCION"
+    assert r["action"]["punitive"] is False              # never punish before establishing intent
+
+
+def test_vulnerability_scores_and_maps_exposure():
+    from core.vulnerability import assess_vulnerability
+    # lonely, recently widowed, with a fresh windfall: high risk, romance + investment exposure
+    r = assess_vulnerability({"elderly": 0.8, "recent_bereavement": 0.9, "social_isolation": 0.8,
+                              "recent_windfall": 0.8})
+    assert r["profile"]["band"] in ("High", "Critical")
+    exposed = [e["playbook"] for e in r["profile"]["top_exposures"]]
+    assert "romance_pig_butchering" in exposed
+    assert r["protections"]["posture"] == "PROTECT-PROACTIVELY"
+
+
+def test_vulnerability_is_dignified_never_restrictive():
+    from core.vulnerability import assess_vulnerability
+    r = assess_vulnerability({"elderly": 0.9, "cognitive_decline_signals": 0.8})
+    joined = " ".join(r["protections"]["protections"]).lower()
+    # measures are supportive / opt-in, and the dignity rule forbids de-banking on vulnerability alone
+    assert "opt-in" in r["protections"]["dignity_note"].lower()
+    assert "de-bank" in r["protections"]["dignity_note"].lower()
+    assert "restrict" not in joined or "do not restrict" in r["protections"]["dignity_note"].lower()
+
+
+def test_vulnerability_leaves_a_low_risk_customer_alone():
+    from core.vulnerability import assess_vulnerability
+    r = assess_vulnerability({"financially_experienced": 0.8, "strong_support_network": 0.7})
+    assert r["profile"]["band"] == "Low"
+    assert r["protections"]["posture"] == "STANDARD-CARE"
+
+
+def test_loophole_detects_synthesizes_and_closes_the_gap():
+    from core.loophole import assess_loophole
+    r = assess_loophole({"repeated_just_below_threshold": 0.9, "velocity_just_under_limit": 0.7})
+    assert r["exploit"]["family"] == "threshold_arbitrage"
+    assert r["action"]["control"]["control"]                       # a concrete closing control is proposed
+    assert "CLOSE-GAP" in r["action"]["posture"]
+
+
+def test_loophole_systemic_flips_from_punish_to_patch():
+    from core.loophole import assess_loophole
+    # many actors on the same edge: the policy is the failure, do not mass-punish
+    r = assess_loophole({"welcome_bonus_multi_signup": 0.8, "multi_account_same_beneficiary": 0.8,
+                         "population_prevalence": 0.9})
+    assert r["systemic"]["systemic"] is True
+    assert "systemic" in r["action"]["posture"].lower()
+    assert r["action"]["reportable"] is False                      # not a thousand SARs; fix the policy
+
+
+def test_substrate_logs_point_in_time_features_and_trains_uncensored():
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+    # an enforced BLOCK and a SHADOW decision (scored but not enforced): both must appear
+    # in the training set, or the model only ever learns from what we let through.
+    record_decision(s, "t_enf", entity_id=eid("user", "u1"), action="BLOCK", module="model",
+                    score=0.91, features={"amount": 4200.0, "rail": "zelle", "device_risk": 0.8})
+    record_decision(s, "t_shadow", entity_id=eid("user", "u2"), action="SHADOW", module="model",
+                    score=0.88, shadow=True, features={"amount": 3900.0, "rail": "zelle"})
+    # outcomes arrive later, keyed only by the transaction id
+    s.add_label("outcome", "is_fraud", 1, source="confirmed_loss", confidence=1.0, subject_ref="t_enf")
+    s.add_label("outcome", "is_fraud", 1, source="chargeback", confidence=0.9, subject_ref="t_shadow")
+
+    rows = s.training_rows("outcome", "is_fraud")          # include_shadow=True by default
+    assert len(rows) == 2
+    # features are the point-in-time snapshot, not recomputed
+    enf = next(r for r in rows if r["subject_ref"] == "t_enf")
+    assert enf["features"]["amount"] == 4200.0 and enf["features"]["device_risk"] == 0.8
+    # the shadow row is present (uncensored), and can be filtered out when needed
+    assert any(r["shadow"] for r in rows)
+    assert len(s.training_rows("outcome", "is_fraud", include_shadow=False)) == 1
+    s.close()
+
+
+def test_substrate_captures_two_label_spaces_on_disposition():
+    from core.loop import record_decision, close_loop
+    s = Store(_fresh_db())
+    record_decision(s, "t7", entity_id=eid("user", "u7"), action="HOLD", module="scam_arc",
+                    score=0.7, features={"amount": 8000.0})
+    # analyst adjudicates: it was fraud (outcome) AND the person was a coerced victim (intent)
+    receipt = close_loop(s, "t7", "r7", "confirm_fraud", is_fraud=True, rep_rate=0.5,
+                         intent={"motive": "coerced_victim", "scam_stage": "extraction"})
+    assert receipt["labeling"]["outcome_written"] is True
+    assert set(receipt["labeling"]["intent_labels"]) == {"motive", "scam_stage"}
+
+    cur = {(l.label_space, l.label_key): l for l in s.current_labels(subject_ref="t7")}
+    assert cur[("outcome", "is_fraud")].label_value == "1"
+    assert cur[("intent", "motive")].label_value == "coerced_victim"
+    assert cur[("intent", "motive")].source == "analyst"       # human ground truth, high trust
+    # the intent label links back to the point-in-time decision features
+    intent_rows = s.training_rows("intent", "motive")
+    assert intent_rows and intent_rows[0]["features"]["amount"] == 8000.0
+    s.close()
+
+
+def test_substrate_revises_a_label_without_losing_history():
+    from core.loop import record_decision, close_loop
+    s = Store(_fresh_db())
+    record_decision(s, "t9", entity_id=eid("user", "u9"), action="BLOCK", module="model",
+                    score=0.8, features={"amount": 200.0})
+    # first adjudicated as fraud, later re-adjudicated as friendly-fraud (not fraud)
+    close_loop(s, "t9", "r9", "confirm_fraud", is_fraud=True, rep_rate=0.3)
+    close_loop(s, "t9", "r9", "reclassify_friendly", is_fraud=False, rep_rate=0.1)
+
+    current = s.current_labels(subject_ref="t9")
+    outcome = [l for l in current if l.label_key == "is_fraud"]
+    assert len(outcome) == 1 and outcome[0].label_value == "0"   # only the latest is current
+    # but the history is preserved (audit trail of the revision)
+    hist = [l for l in s.label_history(subject_ref="t9") if l.label_key == "is_fraud"]
+    assert len(hist) == 2
+    # training uses only the current label
+    rows = s.training_rows("outcome", "is_fraud")
+    assert len(rows) == 1 and rows[0]["label"] == "0"
+    s.close()
+
+
+def test_substrate_gold_vs_silver_by_source_and_confidence():
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+    record_decision(s, "t_h", entity_id=eid("user", "uh"), module="motive",
+                    features={"amount": 100.0},
+                    heuristic_labels=[{"space": "intent", "key": "motive",
+                                       "value": "survival", "confidence": 0.3}])
+    # a human later confirms a different case with high confidence
+    record_decision(s, "t_a", entity_id=eid("user", "ua"), module="motive",
+                    features={"amount": 100.0})
+    s.add_label("intent", "motive", "organized_malicious", source="analyst",
+                confidence=0.9, subject_ref="t_a")
+
+    silver = s.training_rows("intent", "motive")                          # everything
+    gold   = s.training_rows("intent", "motive", sources=["analyst", "confirmed_loss"])
+    assert len(silver) == 2 and len(gold) == 1
+    assert gold[0]["source"] == "analyst"
+    # the heuristic self-label is present but weak, so a min-confidence gate drops it
+    assert len(s.training_rows("intent", "motive", min_confidence=0.5)) == 1
+
+    stats = s.labeling_stats()
+    assert stats["decisions_total"] == 2
+    assert stats["labels_by_source"].get("heuristic") == 1
+    s.close()
+
+
+def test_holdout_respects_ceiling_cap_and_determinism():
+    from core.holdout import holdout_decision
+    # protective / allow-like actions are never diverted, even at rate=1.0
+    assert holdout_decision("s1", "PROTECT", 100.0, {"rate": 1.0})["release"] is False
+    assert holdout_decision("s1", "ALLOW", 100.0, {"rate": 1.0})["release"] is False
+    # the liability ceiling: a high-value case is always enforced, never gambled for data
+    big = holdout_decision("s2", "BLOCK", 50000.0, {"rate": 1.0, "max_liability": 2000.0})
+    assert big["release"] is False and "ceiling" in big["reason"]
+    # an eligible low-liability case at rate=1.0 is released and monitored
+    rel = holdout_decision("s3", "BLOCK", 100.0, {"rate": 1.0, "max_liability": 2000.0})
+    assert rel["release"] is True and rel["enforced_action"] == "ALLOW" and rel["holdout"] is True
+    # rate 0 releases nothing
+    assert holdout_decision("s3", "BLOCK", 100.0, {"rate": 0.0})["release"] is False
+    # deterministic: the same subject always resolves the same way (cannot retry into a release)
+    assert holdout_decision("s7", "BLOCK", 100.0)["release"] == holdout_decision("s7", "BLOCK", 100.0)["release"]
+
+
+def test_holdout_samples_roughly_the_configured_rate():
+    from core.holdout import holdout_decision
+    n = 2000
+    released = sum(1 for i in range(n)
+                   if holdout_decision(f"tx{i}", "BLOCK", 100.0, {"rate": 0.05})["release"])
+    assert 0.03 <= released / n <= 0.07     # ~5% with sampling slack
+
+
+def test_graduation_gates_on_gold_and_agreement():
+    from core.loop import record_decision
+    from core.graduation import evaluate_target
+    s = Store(_fresh_db())
+
+    # too little gold -> the gate refuses to graduate
+    record_decision(s, "x1", module="motive",
+                    heuristic_labels=[{"space": "intent", "key": "motive",
+                                       "value": "survival", "confidence": 0.3}])
+    s.add_label("intent", "motive", "survival", source="analyst", confidence=0.9, subject_ref="x1")
+    assert evaluate_target(s, "intent", "motive")["verdict"] == "not_enough_gold"
+
+    # 60 paired examples at ~80% agreement -> kappa in the useful band -> ready_to_train
+    for i in range(60):
+        subj = f"g{i}"
+        gold = "survival" if i % 2 == 0 else "organized_malicious"
+        wrong = i < 12
+        heur = gold if not wrong else ("organized_malicious" if gold == "survival" else "survival")
+        record_decision(s, subj, module="motive",
+                        heuristic_labels=[{"space": "intent", "key": "motive",
+                                           "value": heur, "confidence": 0.3}])
+        s.add_label("intent", "motive", gold, source="analyst", confidence=0.9, subject_ref=subj)
+
+    rep = evaluate_target(s, "intent", "motive")
+    assert rep["gold_labels"] >= 50 and rep["paired_with_heuristic"] >= 50
+    assert 0.5 <= rep["cohen_kappa"] <= 0.7          # chance-corrected agreement, not raw accuracy
+    assert rep["verdict"] == "ready_to_train"
+    s.close()
+
+
+def test_graduation_flags_a_rule_that_already_matches_humans():
+    from core.loop import record_decision
+    from core.graduation import evaluate_target
+    s = Store(_fresh_db())
+    # near-perfect agreement: a model has little to add yet
+    for i in range(60):
+        subj = f"h{i}"
+        gold = "survival" if i % 2 == 0 else "organized_malicious"
+        heur = gold if i >= 2 else ("organized_malicious" if gold == "survival" else "survival")
+        record_decision(s, subj, module="motive",
+                        heuristic_labels=[{"space": "intent", "key": "motive",
+                                           "value": heur, "confidence": 0.3}])
+        s.add_label("intent", "motive", gold, source="analyst", confidence=0.9, subject_ref=subj)
+    rep = evaluate_target(s, "intent", "motive")
+    assert rep["cohen_kappa"] >= 0.9
+    assert rep["verdict"] == "rule_already_strong"
+    s.close()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
