@@ -25,9 +25,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 
 from .ingest_schema import validate_event
 from .stream import BackpressureError
+
+
+def _safe_ident(name: str) -> bool:
+    """A SQL identifier we will interpolate must be a plain name (no injection). Values are
+    always parameterised; only table/column names are interpolated, so they are allowlisted."""
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name or "")))
 
 
 class SourceConnector:
@@ -116,3 +124,53 @@ class FileConnector(SourceConnector):
                     yield idx, json.loads(s)
                 except json.JSONDecodeError:
                     yield idx, {}                             # malformed: schema-rejected (visible), advance offset
+
+
+class DBConnector(SourceConnector):
+    """Incrementally poll a source SQL table (a core-banking / processor transactions table) by a
+    monotonic integer watermark (an id / sequence / rowid). This is the canonical realistic fraud
+    source, and it exercises two connector concerns the file source does not: watermark-based
+    incremental querying (WHERE id > checkpoint), and FIELD MAPPING to translate the source
+    schema into our canonical ingestion schema before validation.
+
+    field_map maps source column -> canonical field, e.g. {"txn_amt": "amount",
+    "cust_id": "user_id", "txn_ref": "transaction_id"}. Unmapped columns pass through untouched.
+    """
+
+    source_type = "db_table"
+
+    def __init__(self, connector_id: str, transport, checkpoints, db_path, table: str,
+                 id_column: str = "rowid", field_map: dict | None = None,
+                 topic: str = "ingest", batch: int = 500):
+        super().__init__(connector_id, transport, checkpoints, topic)
+        self.db_path = str(db_path)
+        self.table = table
+        self.id_column = id_column
+        self.field_map = dict(field_map or {})
+        self.batch = batch
+
+    def _map(self, row: dict) -> dict:
+        out = dict(row)
+        for src, dst in self.field_map.items():
+            if src in row:
+                out[dst] = row[src]
+        return out
+
+    def read(self, since_offset: int):
+        # values are parameterised; the table/column identifiers are interpolated, so guard them
+        if not (_safe_ident(self.table) and _safe_ident(self.id_column)):
+            return
+        if not os.path.exists(self.db_path):
+            return
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            q = (f"SELECT {self.id_column} AS __wm, * FROM {self.table} "
+                 f"WHERE {self.id_column} > ? ORDER BY {self.id_column} LIMIT ?")
+            for r in conn.execute(q, (int(since_offset), self.batch)):
+                raw = {k: r[k] for k in r.keys() if k != "__wm"}
+                yield int(r["__wm"]), self._map(raw)
+        except sqlite3.Error:
+            return                                            # a broken source must not crash ingestion
+        finally:
+            conn.close()
