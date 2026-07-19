@@ -81,6 +81,11 @@ _CONTRIB = {
 }
 
 
+# Minimum top-motive score before we will attribute a motive at all. Below this, the read is
+# "inconclusive": a benign tell (a hesitant typist) must never be escalated to enforcement.
+_EVIDENCE_FLOOR = 0.35
+
+
 def infer_motive(signals: dict) -> dict:
     """signals: {tell: strength 0-1}. Returns the most likely motive with confidence
     and the tells that drove it. Coercion dominates when present - a victim is never
@@ -96,12 +101,22 @@ def infer_motive(signals: dict) -> dict:
             drivers_by_motive[motive].append(tell)
 
     # Victim protection overrides: strong coercion signal wins outright.
+    total = sum(scores.values()) or 1.0
     if scores["coerced_victim"] >= 0.7:
         top = "coerced_victim"
+    elif max(scores.values()) < _EVIDENCE_FLOOR:
+        # Not enough behavioural evidence to attribute a motive. Do NOT pick a "top" motive
+        # from noise (a whiff of hesitation must not become BLOCK + SAR); say so plainly.
+        return {
+            "motive": "inconclusive",
+            "motive_label": "Inconclusive (insufficient behavioural evidence)",
+            "confidence": round(max(scores.values()) / total, 3),
+            "drivers": [], "scores": {m: round(v, 3) for m, v in scores.items() if v > 0},
+            "is_victim": False,
+        }
     else:
         top = max(scores, key=scores.get)
 
-    total = sum(scores.values()) or 1.0
     confidence = round(scores[top] / total, 3)
     return {
         "motive": top,
@@ -123,6 +138,9 @@ def offender_profile(signals: dict, motive: str) -> dict:
 
     if motive == "coerced_victim":
         return {"lifecycle": "coerced_victim", "severity": "victim", "severity_score": 0,
+                "recidivism_risk": None, "escalation_risk": None}
+    if motive == "inconclusive":
+        return {"lifecycle": "unknown", "severity": "none", "severity_score": 0,
                 "recidivism_risk": None, "escalation_risk": None}
 
     ring   = max(g("shared_device_ring"), g("cross_border_coordination"))
@@ -163,6 +181,15 @@ def recommend_intervention(motive: str, profile: dict) -> dict:
     concrete, humane-where-appropriate steps."""
     sev = profile.get("severity_score", 50)
 
+    if motive == "inconclusive":
+        return {
+            "posture": "MONITOR",
+            "primary_action": "Gather more signal before acting",
+            "rationale": "Behavioural evidence is insufficient to attribute a motive; acting now would be a guess, not a judgement.",
+            "steps": ["Do not penalise on this signal alone",
+                      "Keep monitoring; re-assess if stronger behavioural tells appear"],
+            "reportable": False,
+        }
     if motive == "coerced_victim":
         return {
             "posture": "VICTIM-PROTECT",
