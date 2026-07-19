@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -152,6 +152,7 @@ from core.telemetry import assess_from_telemetry, derive_signals
 from core.ingest_schema import validate_event, contract as ingest_contract
 from core.stream import DurableQueue, BackpressureError
 from core.connectors import FileConnector, DBConnector
+from core.webhook import WebhookReceiver
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -185,6 +186,20 @@ try:
 except Exception as _ce:
     FILE_CONNECTOR = None
     print(f"⚠ Source connector unavailable ({_ce})")
+
+# Webhook receiver: the real-time PUSH source, authenticated by a per-source HMAC secret so an
+# attacker cannot inject fabricated events. Secrets from env REDWING_WEBHOOK_SECRETS (a JSON map
+# source -> secret); a demo source is registered so the path is demonstrable out of the box.
+try:
+    _wh_secrets = json.loads(os.environ.get("REDWING_WEBHOOK_SECRETS", "") or "{}")
+    if not isinstance(_wh_secrets, dict):
+        _wh_secrets = {}
+except Exception:
+    _wh_secrets = {}
+_wh_secrets.setdefault("demo_processor", "whsec_demo_do_not_use_in_prod")
+WEBHOOK = WebhookReceiver(TRANSPORT, _wh_secrets) if TRANSPORT is not None else None
+if WEBHOOK is not None:
+    print(f"✓ Webhook receiver online; authenticated sources: {WEBHOOK.sources()}")
 
 # ── Injection pipeline state ───────────────────────────────────────────────────
 
@@ -1103,7 +1118,8 @@ def connectors_list():
     if FILE_CONNECTOR is not None:
         conns.append({"connector": FILE_CONNECTOR.connector_id, "source_type": FILE_CONNECTOR.source_type,
                       "path": FILE_CONNECTOR.path, "checkpoint": STORE.get_checkpoint(FILE_CONNECTOR.connector_id)})
-    return {"connectors": conns, "checkpoints": STORE.checkpoints()}
+    return {"connectors": conns, "checkpoints": STORE.checkpoints(),
+            "webhook_sources": WEBHOOK.sources() if WEBHOOK is not None else []}
 
 
 @app.post("/connectors/file/poll")
@@ -1134,6 +1150,24 @@ def connectors_db_poll(body: dict):
         id_column=str(body.get("id_column") or "rowid"),
         field_map=body.get("field_map") if isinstance(body.get("field_map"), dict) else None)
     return conn.poll()
+
+
+@app.post("/connectors/webhook/{source}")
+async def connectors_webhook(source: str, request: Request):
+    """Real-time PUSH ingestion from an AUTHENTICATED source. The caller signs the raw body with
+    the source's shared secret and sends it as 'X-Signature: sha256=<hex>'. An unknown source, a
+    bad signature, or a tampered body is rejected before the event reaches the pipeline, so the
+    push path cannot be used to inject fabricated events."""
+    if WEBHOOK is None:
+        raise HTTPException(503, "webhook receiver unavailable")
+    body = await request.body()
+    r = WEBHOOK.accept(source, body, request.headers.get("x-signature", ""))
+    if not r["accepted"]:
+        detail = {"reason": r["reason"]}
+        if "errors" in r:
+            detail["errors"] = r["errors"]
+        raise HTTPException(r["status"], detail)
+    return r
 
 
 @app.get("/ingest/stats")

@@ -902,6 +902,36 @@ def test_db_connector_refuses_unsafe_identifiers():
     q.close(); cp.close()
 
 
+def test_webhook_signature_verification():
+    from core.webhook import sign, verify_signature
+    secret, body = "whsec_test", b'{"transaction_id":"w1","amount":100}'
+    assert verify_signature(secret, body, sign(secret, body)) is True
+    assert verify_signature("wrong_secret", body, sign(secret, body)) is False   # wrong key
+    assert verify_signature(secret, b'{"transaction_id":"w1","amount":999}', sign(secret, body)) is False  # tampered
+    assert verify_signature(secret, body, "") is False                            # missing sig fails closed
+
+
+def test_webhook_receiver_authenticates_then_publishes():
+    import json as _json
+    from core.stream import DurableQueue
+    from core.webhook import WebhookReceiver, sign
+    q = DurableQueue(_fresh_db())
+    rx = WebhookReceiver(q, {"demo_proc": "whsec_demo"})
+    body = _json.dumps({"transaction_id": "wh1", "amount": 2500, "user_id": "u1"}).encode()
+
+    ok = rx.accept("demo_proc", body, sign("whsec_demo", body))
+    assert ok["accepted"] is True and ok["status"] == 202
+    assert q.stats("ingest")["ready"] == 1                     # authenticated event reached the transport
+
+    assert rx.accept("unknown_src", body, sign("whsec_demo", body))["status"] == 401   # unknown source
+    assert rx.accept("demo_proc", body, "sha256=deadbeef")["status"] == 401            # bad signature
+    assert rx.accept("demo_proc", b"not json", sign("whsec_demo", b"not json"))["status"] == 400  # bad JSON
+    bad = _json.dumps({"transaction_id": "wh2", "amount": "N/A"}).encode()             # schema-invalid
+    assert rx.accept("demo_proc", bad, sign("whsec_demo", bad))["status"] == 422
+    assert q.stats("ingest")["ready"] == 1                     # only the one valid event was published
+    q.close()
+
+
 def test_ingest_schema_normalises_a_valid_event():
     from core.ingest_schema import validate_event
     v = validate_event({"transaction_id": "t1", "amount": "1500.5", "payment_rail": "Faster_Payments",
