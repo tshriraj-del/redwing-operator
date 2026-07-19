@@ -733,6 +733,29 @@ def test_graduation_gates_on_gold_and_agreement():
     s.close()
 
 
+def test_trainer_beats_a_rule_that_ignores_a_feature():
+    from core.seed_substrate import seed_labeled_cohort
+    from core.train import train_target
+    s = Store(_fresh_db())
+    # synthetic cohort: gold depends on two signals, the rule looks at only one
+    seed_labeled_cohort(s, n=300, seed=7)
+    r = train_target(s, "intent", "motive")
+    assert r["trained"] is True
+    assert r["heuristic_accuracy"] is not None and r["heuristic_accuracy"] < 0.95   # the rule has a real gap
+    assert r["model_accuracy"] >= r["heuristic_accuracy"]                            # the model recovers it
+    assert r["beats_heuristic"] is True
+    assert "graduate" in r["verdict"]
+    s.close()
+
+
+def test_trainer_refuses_without_enough_data():
+    from core.train import train_target
+    s = Store(_fresh_db())
+    r = train_target(s, "intent", "motive")
+    assert r["trained"] is False and "not enough" in r["reason"].lower()
+    s.close()
+
+
 def test_graduation_flags_a_rule_that_already_matches_humans():
     from core.loop import record_decision
     from core.graduation import evaluate_target
