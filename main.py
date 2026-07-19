@@ -151,7 +151,7 @@ from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
 from core.ingest_schema import validate_event, contract as ingest_contract
 from core.stream import DurableQueue, BackpressureError
-from core.connectors import FileConnector
+from core.connectors import FileConnector, DBConnector
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -1113,6 +1113,27 @@ def connectors_file_poll():
     if FILE_CONNECTOR is None:
         raise HTTPException(503, "file connector unavailable")
     return FILE_CONNECTOR.poll()
+
+
+@app.post("/connectors/db/poll")
+def connectors_db_poll(body: dict):
+    """Poll a source SQL table for new transactions since its checkpoint. Body:
+    {db_path, table, id_column?, field_map?, connector_id?}. Points at any SQLite transactions
+    table, maps its columns to the canonical schema (field_map: source_col -> canonical_field),
+    validates, and publishes new rows to the durable transport. Incremental by a monotonic
+    watermark (id_column, default rowid), so it only ever ingests what is new."""
+    if TRANSPORT is None or STORE is None:
+        raise HTTPException(503, "transport/store unavailable")
+    db_path = str(body.get("db_path", "")).strip()
+    table = str(body.get("table", "")).strip()
+    if not db_path or not table:
+        raise HTTPException(400, "db_path and table are required")
+    conn = DBConnector(
+        connector_id=str(body.get("connector_id") or f"db:{table}"),
+        transport=TRANSPORT, checkpoints=STORE, db_path=db_path, table=table,
+        id_column=str(body.get("id_column") or "rowid"),
+        field_map=body.get("field_map") if isinstance(body.get("field_map"), dict) else None)
+    return conn.poll()
 
 
 @app.get("/ingest/stats")

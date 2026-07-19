@@ -834,6 +834,74 @@ def test_checkpoint_survives_store_reopen():
     s2.close()
 
 
+def _make_source_table(path, rows):
+    import sqlite3 as _sql
+    c = _sql.connect(path)
+    c.execute("CREATE TABLE IF NOT EXISTS txns (id INTEGER PRIMARY KEY, txn_amt REAL, "
+              "cust_id TEXT, txn_ref TEXT, rail TEXT)")
+    c.executemany("INSERT INTO txns (id, txn_amt, cust_id, txn_ref, rail) VALUES (?,?,?,?,?)", rows)
+    c.commit(); c.close()
+
+
+_FMAP = {"txn_ref": "transaction_id", "txn_amt": "amount", "cust_id": "user_id", "rail": "payment_rail"}
+
+
+def test_db_connector_polls_incrementally_by_watermark():
+    from core.stream import DurableQueue
+    from core.connectors import DBConnector
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "source.db")
+    _make_source_table(src, [(1, 100.0, "c1", "r1", "zelle"), (2, 250.0, "c2", "r2", "ach")])
+    q = DurableQueue(os.path.join(d, "q.db"))
+    cp = Store(os.path.join(d, "cp.db"))
+    c = DBConnector("core_txns", q, cp, src, "txns", id_column="id", field_map=_FMAP)
+
+    r1 = c.poll()
+    assert r1["published"] == 2
+    assert cp.get_checkpoint("core_txns") == 2               # watermark = max id consumed
+    assert q.stats("ingest")["ready"] == 2
+
+    assert c.poll()["consumed"] == 0                          # no new rows: resumable no-op
+
+    _make_source_table(src, [(3, 900.0, "c3", "r3", "wire"), (4, 12.0, "c4", "r4", "card")])
+    r3 = c.poll()
+    assert r3["published"] == 2 and cp.get_checkpoint("core_txns") == 4
+    assert q.stats("ingest")["ready"] == 4
+    q.close(); cp.close()
+
+
+def test_db_connector_maps_source_schema_to_canonical():
+    from core.stream import DurableQueue
+    from core.connectors import DBConnector
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "source.db")
+    _make_source_table(src, [(1, 100.0, "c1", "r1", "faster_payments")])
+    q = DurableQueue(os.path.join(d, "q.db"))
+    cp = Store(os.path.join(d, "cp.db"))
+    DBConnector("core_txns", q, cp, src, "txns", id_column="id", field_map=_FMAP).poll()
+
+    seen = []
+    q.consume_batch("ingest", lambda p: seen.append(p))
+    assert len(seen) == 1
+    ev = seen[0]
+    assert ev["amount"] == 100.0 and ev["user_id"] == "c1"    # source columns mapped to canonical
+    assert ev["transaction_id"] == "r1" and ev["payment_rail"] == "fps"   # + schema-normalised
+    q.close(); cp.close()
+
+
+def test_db_connector_refuses_unsafe_identifiers():
+    from core.stream import DurableQueue
+    from core.connectors import DBConnector
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "source.db")
+    _make_source_table(src, [(1, 100.0, "c1", "r1", "zelle")])
+    q = DurableQueue(os.path.join(d, "q.db"))
+    cp = Store(os.path.join(d, "cp.db"))
+    c = DBConnector("bad", q, cp, src, "txns; DROP TABLE txns", id_column="id")
+    assert c.poll()["consumed"] == 0                          # injection-y identifier -> no read, no crash
+    q.close(); cp.close()
+
+
 def test_ingest_schema_normalises_a_valid_event():
     from core.ingest_schema import validate_event
     v = validate_event({"transaction_id": "t1", "amount": "1500.5", "payment_rail": "Faster_Payments",
