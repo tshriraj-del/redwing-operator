@@ -149,6 +149,7 @@ from core.record import record_scored_event
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
+from core.ingest_schema import validate_event, contract as ingest_contract
 from core.liability import expected_liability
 from core.narrative import scam_narrative
 try:
@@ -914,8 +915,16 @@ async def ingest_transaction(body: dict):
     if not MODEL_OK:
         raise HTTPException(503, "ML models not loaded - run the ML Fraud Engine notebook first.")
 
-    event = build_event(body)   # drift_monitor.record() already called inside build_event
+    # Schema gate: reject broken input instead of scoring a silently-defaulted 0.
+    v = validate_event(body, source="ingest")
+    if not v["valid"]:
+        raise HTTPException(422, {"error": "schema_validation_failed",
+                                  "errors": v["errors"], "warnings": v["warnings"]})
+
+    event = build_event(v["event"])   # drift_monitor.record() already called inside build_event
     event["source"] = "injected"
+    if v["warnings"]:
+        event["ingest_warnings"] = v["warnings"]
 
     _ingest_buffer.appendleft(event)
     _fan_out(event)
@@ -943,9 +952,13 @@ async def ingest_batch(body: dict):
     if len(transactions) > 1000:
         raise HTTPException(400, "Batch limit is 1 000 transactions per call.")
 
-    results, alerts = [], 0
+    results, alerts, rejected = [], 0, []
     for tx in transactions:
-        event = build_event(tx)
+        v = validate_event(tx, source="ingest_batch")
+        if not v["valid"]:
+            rejected.append({"input": tx, "errors": v["errors"]})   # dead-letter seed
+            continue
+        event = build_event(v["event"])
         event["source"] = "injected"
         _ingest_buffer.appendleft(event)
         _fan_out(event)
@@ -958,10 +971,19 @@ async def ingest_batch(body: dict):
 
     return {
         "processed":   len(results),
+        "rejected":    len(rejected),
+        "dead_letter": rejected,               # the events a real pipeline would route to a DLQ
         "alerts":      alerts,
-        "alert_rate":  round(alerts / len(results), 4),
+        "alert_rate":  round(alerts / len(results), 4) if results else 0.0,
         "results":     results,
     }
+
+
+@app.get("/ingest/schema")
+def ingest_schema():
+    """The ingestion contract: required / recommended fields, rail normalisation, and the
+    label-only fields that must never be used as model features (leakage)."""
+    return ingest_contract()
 
 
 @app.get("/ingest/stats")
