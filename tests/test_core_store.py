@@ -678,6 +678,26 @@ def test_substrate_gold_vs_silver_by_source_and_confidence():
     s.close()
 
 
+def test_substrate_separates_observed_from_censored_outcomes():
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+    # an ALLOWED case (outcome actually observed) and a BLOCKED case (label is an inference)
+    record_decision(s, "obs1", action="ALLOW", module="model", features={"amount": 100.0})
+    record_decision(s, "cen1", action="HOLD", module="model", features={"amount": 100.0})
+    s.add_label("outcome", "is_fraud", 0, source="chargeback", confidence=0.9, subject_ref="obs1")
+    s.add_label("outcome", "is_fraud", 1, source="analyst", confidence=0.9, subject_ref="cen1")
+
+    stats = s.labeling_stats()
+    assert stats["decisions_observed"] == 1 and stats["decisions_censored"] == 1
+
+    allrows = s.training_rows("outcome", "is_fraud")
+    obs = s.training_rows("outcome", "is_fraud", observed_only=True)
+    assert len(allrows) == 2 and len(obs) == 1                       # reject inference drops the block
+    assert obs[0]["subject_ref"] == "obs1" and obs[0]["observed"] is True
+    assert all(r["subject_ref"] != "cen1" for r in obs)             # censored block excluded
+    s.close()
+
+
 def test_holdout_respects_ceiling_cap_and_determinism():
     from core.holdout import holdout_decision
     # protective / allow-like actions are never diverted, even at rate=1.0

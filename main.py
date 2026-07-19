@@ -261,6 +261,11 @@ def build_event(row) -> dict:
             tid = event["transaction_id"]
             proposed = "HOLD" if event["is_alert"] else "ALLOW"
             ho = holdout_decision(tid, proposed, event["expected_liability"])
+            # Honour the release: a held-out case is actually let through (monitored), not just
+            # logged, so its true outcome becomes observable (uncensored) ground truth.
+            if ho["release"]:
+                event["is_alert"] = False
+                event["monitored"] = True
             event["holdout"] = ho["holdout"]
             record_decision(
                 STORE, subject_ref=tid,

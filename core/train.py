@@ -94,11 +94,15 @@ def _split(subject_ref: str, test_frac: float, seed: str) -> bool:
 
 
 def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOURCES,
-                 test_frac: float = 0.3, min_rows: int = 40, seed: str = "redwing-train") -> dict:
+                 test_frac: float = 0.3, min_rows: int = 40, seed: str = "redwing-train",
+                 observed_only: bool = False) -> dict:
     """Train a model on gold labels for one target and compare it to the heuristic on a held-out
-    test split. Returns model vs heuristic accuracy and whether the model beats the rule."""
+    test split. Returns model vs heuristic accuracy and whether the model beats the rule. Set
+    `observed_only=True` for OUTCOME targets to train on uncensored (allowed) decisions only,
+    so the model is not fit on labels the analyst inferred for cases we blocked."""
     rows = [r for r in store.training_rows(label_space, label_key,
-                                           sources=list(gold_sources), limit=1_000_000)
+                                           sources=list(gold_sources),
+                                           observed_only=observed_only, limit=1_000_000)
             if r["features"]]
     rows = list({r["subject_ref"]: r for r in rows}.values())    # one row per subject
     if len(rows) < min_rows:
