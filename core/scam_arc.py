@@ -32,7 +32,7 @@ payment. Pure Python, deterministic, unit-testable.
 
 from __future__ import annotations
 
-# ── The universal grooming arc (all manipulation scams walk it) ────────────────
+# -- The universal grooming arc (all manipulation scams walk it) ----------------
 SCAM_ARC = [
     {"stage": 0, "key": "contact",         "label": "Contact",                    "money_moving": False},
     {"stage": 1, "key": "grooming",        "label": "Grooming / trust-building",  "money_moving": False},
@@ -42,7 +42,7 @@ SCAM_ARC = [
     {"stage": 5, "key": "revictimization", "label": "Re-victimization (recovery scam)", "money_moving": True},
 ]
 
-# ── Scam playbooks (the recognisable manipulation scripts) ─────────────────────
+# -- Scam playbooks (the recognisable manipulation scripts) ---------------------
 SCAM_PLAYBOOKS = {
     "romance_pig_butchering": "Romance / pig-butchering (grooming into a fake investment)",
     "investment_crypto":      "Investment / crypto 'too good to be true' scam",
@@ -52,7 +52,7 @@ SCAM_PLAYBOOKS = {
     "recovery_scam":          "Recovery / refund scam (re-victimizing a prior victim)",
 }
 
-# ── Victim-side tells: distinct from offender tells and onboarding tells ───────
+# -- Victim-side tells: distinct from offender tells and onboarding tells -------
 # tell -> {stage it evidences, {playbook: weight}, w: strength weight, live: fires at the
 # moment of payment}. `signals` passed in is a dict of tell -> strength (0-1).
 VICTIM_TELLS = {
@@ -189,7 +189,7 @@ def coercion_in_flight(signals: dict) -> dict:
     }
 
 
-# ── Stage-appropriate protective intervention ─────────────────────────────────
+# -- Stage-appropriate protective intervention ---------------------------------
 def protect(arc: dict, live: dict) -> dict:
     """Map (stage x playbook x live-coercion) to a proportionate, PROTECTIVE response.
     Early: educate. Middle: warn + friction. Extraction / live coercion: hard-stop the
@@ -197,7 +197,7 @@ def protect(arc: dict, live: dict) -> dict:
     stage = arc.get("stage", 0)
     playbook = arc.get("playbook")
 
-    # ── Break-glass: live coercion at the moment of payment overrides the stage ──
+    # -- Break-glass: live coercion at the moment of payment overrides the stage --
     if live.get("coached") or live.get("duress"):
         steps = [
             "Hard-stop this payment now; do not release it despite valid authentication",
@@ -218,7 +218,7 @@ def protect(arc: dict, live: dict) -> dict:
             "reportable_as_scam": True,
         }
 
-    # ── Re-victimization: the second-loss guard ──
+    # -- Re-victimization: the second-loss guard --
     if stage == 5 or playbook == "recovery_scam":
         return {
             "posture": "VICTIM-PROTECT (second-loss guard)",
@@ -234,7 +234,7 @@ def protect(arc: dict, live: dict) -> dict:
             "reportable_as_scam": True,
         }
 
-    # ── Extraction: the drain, hard friction + named-scam warning ──
+    # -- Extraction: the drain, hard friction + named-scam warning --
     if stage == 4:
         return {
             "posture": "HARD-FRICTION + WARN",
@@ -250,7 +250,7 @@ def protect(arc: dict, live: dict) -> dict:
             "reportable_as_scam": True,
         }
 
-    # ── Escalation: friction + effective warning, invite a trusted second opinion ──
+    # -- Escalation: friction + effective warning, invite a trusted second opinion --
     if stage == 3:
         return {
             "posture": "FRICTION + WARN",
@@ -266,7 +266,7 @@ def protect(arc: dict, live: dict) -> dict:
             "reportable_as_scam": True,
         }
 
-    # ── Hook: gentle friction + education at the first commitment ──
+    # -- Hook: gentle friction + education at the first commitment --
     if stage == 2:
         return {
             "posture": "EDUCATE + LIGHT-FRICTION",
@@ -281,7 +281,7 @@ def protect(arc: dict, live: dict) -> dict:
             "reportable_as_scam": False,
         }
 
-    # ── Contact / grooming: no money is moving yet, so educate, do not gate ──
+    # -- Contact / grooming: no money is moving yet, so educate, do not gate --
     if arc.get("on_arc"):
         return {
             "posture": "EDUCATE",

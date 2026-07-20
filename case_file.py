@@ -26,7 +26,7 @@ import hashlib
 import random
 from datetime import datetime, timedelta
 
-# ── Reference tables ─────────────────────────────────────────────────────────
+# -- Reference tables ---------------------------------------------------------
 
 # MCC → (label, base card-risk 0-1). Keyed on the integer part of mcc_code.
 MCC_RISK = {
@@ -68,7 +68,7 @@ SAR_REPORTABLE = {
 }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 def _rng(*parts) -> random.Random:
     """Deterministic RNG seeded by the given id parts (stable across reloads)."""
@@ -98,7 +98,7 @@ def _is_card(row) -> bool:
     return str(row.get("payment_rail", row.get("rail", "card"))).lower() == "card"
 
 
-# ── Customer 360 / CDD / risk profile ────────────────────────────────────────
+# -- Customer 360 / CDD / risk profile ----------------------------------------
 
 def build_customer(row, graph_ctx) -> dict:
     """Customer due-diligence view + behavioural baseline + risk rating.
@@ -109,7 +109,7 @@ def build_customer(row, graph_ctx) -> dict:
 
     account_age = r.randint(20, 3200)          # days
     tenure_band = ("New (<90d)" if account_age < 90 else
-                   "Established (90d–2y)" if account_age < 730 else
+                   "Established (90d-2y)" if account_age < 730 else
                    "Tenured (2y+)")
 
     kyc_full = r.random() > 0.08
@@ -175,7 +175,7 @@ def build_customer(row, graph_ctx) -> dict:
     }
 
 
-# ── Card / payment-instrument detail ─────────────────────────────────────────
+# -- Card / payment-instrument detail -----------------------------------------
 
 def build_instrument(row) -> dict:
     """Card-usage detail (entry mode, AVS/CVV/3DS) when the rail is card; a
@@ -232,7 +232,7 @@ def build_instrument(row) -> dict:
     }
 
 
-# ── Card-fraud typology signals - "does this ring a bell?" ────────────────────
+# -- Card-fraud typology signals - "does this ring a bell?" --------------------
 
 def card_fraud_signals(row, instrument, graph_ctx) -> list:
     """Pattern-match card usage against known card-fraud playbooks.
@@ -306,7 +306,7 @@ def card_fraud_signals(row, instrument, graph_ctx) -> list:
     return out
 
 
-# ── Dispute / chargeback evidence study ──────────────────────────────────────
+# -- Dispute / chargeback evidence study --------------------------------------
 
 def dispute_analysis(row, instrument, customer) -> dict:
     """Study the dispute proof: build the evidence matrix and separate genuine
@@ -389,7 +389,7 @@ def dispute_analysis(row, instrument, customer) -> dict:
     }
 
 
-# ── Activity timeline ────────────────────────────────────────────────────────
+# -- Activity timeline --------------------------------------------------------
 
 def build_timeline(row, instrument) -> list:
     """Chronological account-activity log leading up to the flagged transaction."""
@@ -420,7 +420,7 @@ def build_timeline(row, instrument) -> list:
             for (m, t, d, lvl) in sorted(events, key=lambda e: -e[0])]
 
 
-# ── Disposition recommendation ───────────────────────────────────────────────
+# -- Disposition recommendation -----------------------------------------------
 
 def recommend(row, scored, signals, dispute, customer) -> dict:
     """Recommend the analyst action. Mirrors how a real queue would pre-triage."""
@@ -448,7 +448,7 @@ def recommend(row, scored, signals, dispute, customer) -> dict:
     return {"action": action, "confidence": conf, "rationale": rationale}
 
 
-# ── Top-level assembly ───────────────────────────────────────────────────────
+# -- Top-level assembly -------------------------------------------------------
 
 DISPOSITION_OPTIONS = [
     {"id": "confirm_fraud",            "label": "Confirm fraud",          "tone": "danger"},

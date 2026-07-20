@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# -- Config --------------------------------------------------------------------
 
 CONFIG_PATH = Path.home() / "pulseml_models" / "agent_config.json"
 
@@ -94,7 +94,7 @@ def validate_config(cfg: dict) -> dict:
 # picks up changes on the next tick without restart.
 agent_config: dict = load_config()
 
-# ── Threat metadata ───────────────────────────────────────────────────────────
+# -- Threat metadata -----------------------------------------------------------
 
 THREAT_META: dict = {
     "card_testing_bot":        {"label": "Card Testing Bot",       "color": "#22c55e"},
@@ -106,7 +106,7 @@ THREAT_META: dict = {
     "clean":                   {"label": "Clean",                  "color": "#22c55e"},
 }
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# -- State ---------------------------------------------------------------------
 
 @dataclass
 class AgentState:
@@ -124,11 +124,11 @@ agent_state: AgentState      = AgentState()
 _event_subscribers: set      = set()     # one asyncio.Queue per SSE client
 novel_attack_buffer: list    = []
 
-# ── AI signature detection ────────────────────────────────────────────────────
+# -- AI signature detection ----------------------------------------------------
 
 AI_SIGNATURES: dict = {
     "timing_regularity":     {"weight": 0.30, "desc": "Sub-100ms velocity → automated timing"},
-    "micro_amount_sequence": {"weight": 0.25, "desc": "Micro-amounts ($0.01–$1.99) → card testing"},
+    "micro_amount_sequence": {"weight": 0.25, "desc": "Micro-amounts ($0.01-$1.99) → card testing"},
     "headless_device":       {"weight": 0.20, "desc": "Unknown/synthetic device fingerprint"},
     "ip_reputation":         {"weight": 0.15, "desc": "High-risk rail + elevated ML score"},
     "identity_clone":        {"weight": 0.10, "desc": "Card testing / synthetic identity pattern hit"},
@@ -289,7 +289,7 @@ def autonomous_decision(
     }
 
 
-# ── Case queue helpers ────────────────────────────────────────────────────────
+# -- Case queue helpers --------------------------------------------------------
 
 def _should_create_case(action: str, escalate: bool, config: dict) -> bool:
     if action == "flag":
@@ -330,7 +330,7 @@ def _make_case(tx: dict, ai_sig: dict, decision: dict, threat_type: str) -> dict
     }
 
 
-# ── Self-learning ─────────────────────────────────────────────────────────────
+# -- Self-learning -------------------------------------------------------------
 
 async def trigger_learning() -> None:
     """
@@ -373,7 +373,7 @@ async def trigger_learning() -> None:
         pass   # learning failures are non-fatal; agent keeps running
 
 
-# ── Fan-out helper ────────────────────────────────────────────────────────────
+# -- Fan-out helper ------------------------------------------------------------
 
 def _broadcast(event: dict) -> None:
     """Push an event to all registered SSE subscriber queues."""
@@ -388,7 +388,7 @@ def _broadcast(event: dict) -> None:
     _event_subscribers.difference_update(dead)
 
 
-# ── Main agent loop ───────────────────────────────────────────────────────────
+# -- Main agent loop -----------------------------------------------------------
 
 async def run_agent(build_event_fn, df_all, features) -> None:
     """
@@ -425,23 +425,23 @@ async def run_agent(build_event_fn, df_all, features) -> None:
             row = sample.iloc[idx % len(sample)]
             idx += 1
 
-            # ── Real XGBoost ML inference via build_event ─────────────────
+            # -- Real XGBoost ML inference via build_event -----------------
             tx = build_event_fn(row)
 
             ml_score    = tx.get("ml_score", 0.0)
             c_score     = tx.get("combined_score", 0.0)
             top_pattern = tx.get("top_pattern") or ""
 
-            # ── AI behavioral signature detection ─────────────────────────
+            # -- AI behavioral signature detection -------------------------
             ai_sig      = detect_ai_signature(tx)
             threat_type = classify_threat(tx, ml_score, ai_sig)
             ai_sig["threat_type"] = threat_type
 
-            # ── Autonomous decision (graph risk feeds the 60/25/15 blend) ─
+            # -- Autonomous decision (graph risk feeds the 60/25/15 blend) -
             graph_risk = tx.get("graph_risk_score", 0.0)
             decision   = autonomous_decision(threat_type, c_score, ai_sig, agent_config, graph_risk)
 
-            # ── Update counters ───────────────────────────────────────────
+            # -- Update counters -------------------------------------------
             action = decision["action"]
             if action == "block":
                 agent_state.blocked_count += 1
@@ -450,7 +450,7 @@ async def run_agent(build_event_fn, df_all, features) -> None:
             else:
                 agent_state.allowed_count += 1
 
-            # ── Build SSE event ───────────────────────────────────────────
+            # -- Build SSE event -------------------------------------------
             meta  = THREAT_META.get(threat_type, {"label": threat_type, "color": "#64748b"})
             event = {
                 "transaction_id":   tx.get("transaction_id", ""),
@@ -474,12 +474,12 @@ async def run_agent(build_event_fn, df_all, features) -> None:
                 "timestamp":        datetime.utcnow().isoformat() + "Z",
             }
 
-            # ── Case queue ────────────────────────────────────────────────
+            # -- Case queue ------------------------------------------------
             if action != "allow" and _should_create_case(action, decision.get("escalate_human", False), agent_config):
                 case = _make_case(tx, ai_sig, decision, threat_type)
                 agent_state.case_queue.appendleft(case)
 
-            # ── Novel pattern buffer ──────────────────────────────────────
+            # -- Novel pattern buffer --------------------------------------
             is_novel = (
                 c_score   >= 0.65
                 and ml_score  >= 0.70
@@ -490,7 +490,7 @@ async def run_agent(build_event_fn, df_all, features) -> None:
                 if len(novel_attack_buffer) >= agent_config.get("novel_buffer_size", 10):
                     asyncio.create_task(trigger_learning())
 
-            # ── Broadcast to SSE clients ──────────────────────────────────
+            # -- Broadcast to SSE clients ----------------------------------
             agent_state.recent_events.appendleft(event)
             _broadcast(event)
 

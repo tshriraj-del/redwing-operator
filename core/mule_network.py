@@ -36,7 +36,7 @@ scam_arc.py so the whole actor layer speaks one language.
 
 from __future__ import annotations
 
-# ── The witting-ness spectrum ──────────────────────────────────────────────────
+# -- The witting-ness spectrum --------------------------------------------------
 MULE_ROLES = {
     "unwitting":       "Unwitting mule (tricked; believes it is a legitimate job)",
     "naive_complicit": "Naive / willfully-blind mule (suspects, looks away, keeps a cut)",
@@ -60,7 +60,7 @@ ROLE_TELLS = {
     "controls_multiple_accounts": {"herder": 0.8},
 }
 
-# ── Recruitment funnels ─────────────────────────────────────────────────────────
+# -- Recruitment funnels ---------------------------------------------------------
 RECRUITMENT_CHANNELS = {
     "job_scam":       {"label": "Money-mule 'job' (fake payment-processing agent)",
                        "tells": {"job_ad_referral": 0.8, "believes_legitimate_job": 0.4}},
@@ -76,7 +76,7 @@ RECRUITMENT_CHANNELS = {
                        "tells": {"keeps_consistent_cut": 0.4, "launder_language": 0.4, "recruits_others": 0.3}},
 }
 
-# ── The account lifecycle (a mule account walks it) ─────────────────────────────
+# -- The account lifecycle (a mule account walks it) -----------------------------
 MULE_LIFECYCLE = [
     {"phase": 0, "key": "dormant",    "label": "Dormant / pre-positioned"},
     {"phase": 1, "key": "activation", "label": "Activation"},
@@ -102,7 +102,7 @@ LIFECYCLE_TELLS = {
     "account_flagged_abandoned":   5,
 }
 
-# ── Herding / control signals (mule layer meets the fraud graph) ────────────────
+# -- Herding / control signals (mule layer meets the fraud graph) ----------------
 CONTROL_TELLS = {
     "shared_device_across_accounts": 0.8,
     "herder_ip_control":             0.7,   # a controlling login IP/ASN across the herd
@@ -225,7 +225,7 @@ def herding_signal(signals: dict) -> dict:
     }
 
 
-# ── The two-track response: protect the money, treat the person by culpability ──
+# -- The two-track response: protect the money, treat the person by culpability --
 def recommend_mule_action(role: dict, lifecycle: dict, herd: dict,
                           recruitment: dict) -> dict:
     """Two decisions, deliberately separated:

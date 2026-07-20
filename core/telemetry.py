@@ -58,7 +58,7 @@ def derive_signals(raw: dict) -> dict:
         if strength and strength > 0:
             sig[tell] = round(max(sig.get(tell, 0.0), min(1.0, strength)), 3)
 
-    # ── coercion / live-coaching (the strongest, most humane signals) ──
+    # -- coercion / live-coaching (the strongest, most humane signals) --
     call = _b(raw, "call_active")
     put("coaching_copresence", call * 0.85)
     put("coaching_pauses", call * 0.7)
@@ -69,7 +69,7 @@ def derive_signals(raw: dict) -> dict:
     put("remote_access_active", _b(raw, "remote_access_tool_active") * 0.9)
     put("duress", _f(raw, "duress_detected") or _b(raw, "duress_detected") * 0.9)
 
-    # ── automation / professional execution (device + session) ──
+    # -- automation / professional execution (device + session) --
     auto = max(_b(raw, "automation_framework"), _b(raw, "headless"))
     put("automation_scalable", auto * 0.8)
     put("scripted_timing", _f(raw, "action_cadence_regularity"))
@@ -83,14 +83,14 @@ def derive_signals(raw: dict) -> dict:
     put("professional_execution", speedrun if speedrun >= 0.5 else 0.0)
     put("too_fast_entry", fast * 0.7)
 
-    # ── biometrics: pasting and hesitation on one's own identity ──
+    # -- biometrics: pasting and hesitation on one's own identity --
     put("pii_pasted", _f(raw, "paste_rate"))
     hes = max(_f(raw, "typing_hesitation"), _f(raw, "keystroke_cadence_cv"))
     put("pii_hesitation", hes)
     put("hesitation_entropy", hes * 0.8)
     put("reverse_familiarity", _f(raw, "typing_hesitation") * 0.6)
 
-    # ── stated purpose / relationship (from a purpose-of-payment step) ──
+    # -- stated purpose / relationship (from a purpose-of-payment step) --
     if _b(raw, "new_payee") and str(raw.get("payee_type", "")).lower() == "crypto":
         put("first_payee_new_crypto", 0.8)
     put("online_only_relationship", _b(raw, "relationship_online_only") * 0.8)

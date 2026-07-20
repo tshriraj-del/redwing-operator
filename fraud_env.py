@@ -25,7 +25,7 @@ action), or run a reference policy end-to-end via run_episode(). Cases are synth
 
 from __future__ import annotations
 
-# ── Action space ──────────────────────────────────────────────────────────────
+# -- Action space --------------------------------------------------------------
 INSPECT_ACTIONS = {
     "inspect_customer":       "customer",          # Customer 360 / CDD + risk profile
     "inspect_instrument":     "instrument",        # card / payment-instrument detail
@@ -70,7 +70,7 @@ def env_spec() -> dict:
     }
 
 
-# ── Ground truth & verifiers ──────────────────────────────────────────────────
+# -- Ground truth & verifiers --------------------------------------------------
 
 def _is_fraud(case: dict) -> bool:
     return case.get("alert", {}).get("ground_truth_label") == "fraud"
@@ -141,7 +141,7 @@ def process_reward(actions: list, case: dict) -> dict:
     }
 
 
-# ── Stateless step (any agent can drive it) ───────────────────────────────────
+# -- Stateless step (any agent can drive it) -----------------------------------
 
 def _observation(case: dict, revealed: list) -> dict:
     a = case.get("alert", {})
@@ -190,7 +190,7 @@ def step(case: dict, history: list, action: str) -> dict:
             "reward": -0.1, "done": False, "info": {"type": "invalid", "action": action}}
 
 
-# ── Reference policies (deterministic - the env works with no LLM) ─────────────
+# -- Reference policies (deterministic - the env works with no LLM) -------------
 
 def _policy_investigator(case, inspected):
     """Disciplined: gather the decisive evidence, then decide from what it sees."""

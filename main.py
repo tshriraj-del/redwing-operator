@@ -51,7 +51,7 @@ import fraud_env
 import adversary
 import feedback
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# -- Bootstrap -----------------------------------------------------------------
 
 # Path to the ML backend (pulseml_models / redwing-ml): its trained models AND its
 # shared feature foundation (features.py, graph_layer.py) are loaded from here, so the
@@ -113,7 +113,7 @@ except Exception as e:
     FEATURE_ENGINE = None
     print(f"⚠ Model load failed: {e}")
 
-# ── Real-data payment model (ULB Credit Card Fraud) - engine-validation anchor ──
+# -- Real-data payment model (ULB Credit Card Fraud) - engine-validation anchor --
 # Independent of the synthetic pipeline above: this is the ONE model trained and
 # validated on REAL labels. A missing artifact must not break the main operator.
 import xgboost as xgblib  # noqa: E402
@@ -136,7 +136,7 @@ try:
 except Exception as _pe:
     print(f"⚠ Real-data payment model unavailable ({_pe}) - run payment_real_model.py")
 
-# ── Phase 1 backbone: durable entity/event store ──────────────────────────────
+# -- Phase 1 backbone: durable entity/event store ------------------------------
 # The platform's shared nervous system (core/store.py). build_event() writes every
 # scored transaction here as entities + events, so scoring leaves a durable trail
 # instead of an ephemeral dict - the substrate the closed loop (WS2) and the
@@ -201,13 +201,13 @@ WEBHOOK = WebhookReceiver(TRANSPORT, _wh_secrets) if TRANSPORT is not None else 
 if WEBHOOK is not None:
     print(f"✓ Webhook receiver online; authenticated sources: {WEBHOOK.sources()}")
 
-# ── Injection pipeline state ───────────────────────────────────────────────────
+# -- Injection pipeline state ---------------------------------------------------
 
 _ingest_buffer:   deque = deque(maxlen=500)   # ring buffer - latest injected events
 _ingest_log_path: Path  = MODELS_DIR / "ingest_log.jsonl"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
 def compute_features(raw: dict) -> dict:
     """Compute the model's features through the shared foundation (the same transform
@@ -219,7 +219,7 @@ def compute_features(raw: dict) -> dict:
 
 
 def ml_score_row(features: dict) -> float:
-    """Run XGBoost on a feature dict; returns fraud probability 0–1."""
+    """Run XGBoost on a feature dict; returns fraud probability 0-1."""
     if not MODEL_OK or not FEATURES:
         return 0.0
     X = np.array([[float(features.get(f, 0.0)) for f in FEATURES]])
@@ -239,7 +239,7 @@ def build_event(row) -> dict:
 
     c_score = combined_score(ml, top["confidence"]) if top else ml
 
-    # ── Tier 2: GNN cascade (borderline transactions only) ────────────────────
+    # -- Tier 2: GNN cascade (borderline transactions only) --------------------
     gnn_result = None
     if gnn_lite.should_invoke(c_score):
         gnn_result = gnn_lite.score(
@@ -251,14 +251,14 @@ def build_event(row) -> dict:
 
     alert = is_alert(cascade_score) or bool(row.get("is_fraud", False))
 
-    # ── Tier 3: offline graph context (O(1) lookup) ───────────────────────────
+    # -- Tier 3: offline graph context (O(1) lookup) ---------------------------
     graph_ctx = graph_features.get_features(
         user_id      = row.get("user_id"),
         device_id    = row.get("device_id"),
         recipient_id = row.get("recipient_id"),
     )
 
-    # ── Drift monitoring - non-blocking, appends to rolling buffer ────────────
+    # -- Drift monitoring - non-blocking, appends to rolling buffer ------------
     drift_monitor.record(ml, features)
 
     event = {
@@ -344,7 +344,7 @@ def build_event(row) -> dict:
     return event
 
 
-# ── Autonomous Agent Startup ──────────────────────────────────────────────────
+# -- Autonomous Agent Startup --------------------------------------------------
 
 @app.on_event("startup")
 async def start_autonomous_agent():
@@ -373,7 +373,7 @@ async def _graph_refresh_loop() -> None:
         await loop.run_in_executor(None, gnn_lite.refresh_from_disk, MODELS_DIR)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# -- Routes --------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -519,7 +519,7 @@ def score(body: dict):
     }
 
 
-# ── XAI / Explainability Endpoints ───────────────────────────────────────────
+# -- XAI / Explainability Endpoints -------------------------------------------
 
 @app.get("/xai/explanations")
 def xai_list_explanations(
@@ -534,7 +534,7 @@ def xai_list_explanations(
     Query params:
       limit          max records to return (default 100)
       verdict        filter by verdict: LOW | MEDIUM | HIGH | CRITICAL
-      min_score      filter by minimum combined score (0.0–1.0)
+      min_score      filter by minimum combined score (0.0-1.0)
       transaction_id filter by transaction ID substring
     """
     return _xai_list(
@@ -662,7 +662,7 @@ def get_alerts(limit: int = 30):
     return alerts[:limit]
 
 
-# ── Investigator Case File ────────────────────────────────────────────────────
+# -- Investigator Case File ----------------------------------------------------
 
 def _assemble_case(row) -> dict:
     """Score a transaction row and assemble the full investigator case file."""
@@ -743,7 +743,7 @@ def post_case(body: dict):
     return _assemble_case(body)
 
 
-# ── Agent-Evaluation Environment ──────────────────────────────────────────────
+# -- Agent-Evaluation Environment ----------------------------------------------
 # The investigator case workbench, exposed as a resettable environment an agent can
 # be evaluated against: known case state → bounded action space → trajectory →
 # process + outcome verifiers. See fraud_env.py.
@@ -794,7 +794,7 @@ def env_step(body: dict):
     return fraud_env.step(case, body.get("history", []), str(body.get("action", "")))
 
 
-# ── Adversary Simulator ───────────────────────────────────────────────────────
+# -- Adversary Simulator -------------------------------------------------------
 # Mutates a seed fraud with cost-tagged evasions and re-scores against the live
 # model to measure detection decay. See adversary.py.
 
@@ -825,7 +825,7 @@ def adversary_simulate(body: dict):
     return result
 
 
-# ── Closed Feedback Loop ──────────────────────────────────────────────────────
+# -- Closed Feedback Loop ------------------------------------------------------
 # Analyst dispositions become labeled feedback that online-updates the reputation
 # layer (immediate) and queues for retrain (logged). See feedback.py.
 
@@ -917,7 +917,7 @@ def actor_read(subject_ref: str):
     return assess_subject(STORE, subject_ref)
 
 
-# ── Injection Pipeline ────────────────────────────────────────────────────────
+# -- Injection Pipeline --------------------------------------------------------
 
 def _write_ingest_log(events: list[dict]) -> None:
     """Append scored events to the JSONL ingest log (blocking - run in executor)."""
@@ -1028,7 +1028,7 @@ def ingest_schema():
     return ingest_contract()
 
 
-# ── Streaming transport: decoupled intake -> durable queue -> background scorer ──
+# -- Streaming transport: decoupled intake -> durable queue -> background scorer --
 
 def _stream_handler(payload: dict) -> None:
     """Score one dequeued event. A raised exception here is what the transport retries and,
@@ -1094,7 +1094,7 @@ def stream_replay():
     return {"replayed": TRANSPORT.replay("ingest")}
 
 
-# ── Source connectors: pull ingestion (checkpointed, resumable, idempotent) ──
+# -- Source connectors: pull ingestion (checkpointed, resumable, idempotent) --
 
 async def _connector_poll_loop() -> None:
     """Poll the source connector on an interval so a file drop is auto-ingested. The connector
@@ -1194,7 +1194,7 @@ def ingest_stats():
     }
 
 
-# ── Rule Factory Endpoints ────────────────────────────────────────────────────
+# -- Rule Factory Endpoints ----------------------------------------------------
 
 @app.get("/rule-factory/gaps")
 def get_rule_gaps(limit: int = 50):
@@ -1307,7 +1307,7 @@ def test_candidate_rule(body: dict):
     return result
 
 
-# ── Network Graph ─────────────────────────────────────────────────────────────
+# -- Network Graph -------------------------------------------------------------
 
 @app.get("/network/graph")
 def get_network_graph(
@@ -1450,7 +1450,7 @@ def get_typologies():
     return sorted(typos)
 
 
-# ── Drift Monitor ────────────────────────────────────────────────────────────
+# -- Drift Monitor ------------------------------------------------------------
 
 @app.get("/drift/status")
 def get_drift_status():
@@ -1460,7 +1460,7 @@ def get_drift_status():
       state: warming_up | stable | warning | drift
       score_psi / feature_psi - Population Stability Index values
       drift_events - history of state transitions into warning/drift
-    PSI < 0.10: stable · 0.10–0.20: warning · > 0.20: retrain recommended
+    PSI < 0.10: stable · 0.10-0.20: warning · > 0.20: retrain recommended
     """
     return drift_monitor.get_status()
 
@@ -1493,7 +1493,7 @@ def get_gnn_stats():
     return gnn_lite.get_stats()
 
 
-# ── Backbone (entity/event store) ─────────────────────────────────────────────
+# -- Backbone (entity/event store) ---------------------------------------------
 # The Phase 1 substrate: every scored transaction leaves a durable entity+event
 # trail here. These endpoints expose it for the loop receipt (WS2) and the UI.
 
@@ -1601,7 +1601,7 @@ def backbone_graph(refresh: bool = False):
         return _fraud_graph_cache
 
 
-# ── Consortium: privacy-preserving cross-institution network (WS3) ────────────
+# -- Consortium: privacy-preserving cross-institution network (WS3) ------------
 # The n=2 moat. A payee's fraud reputation combined across institutions via
 # differential privacy, so a victim's bank can flag a mule it cannot see alone
 # without any institution sharing raw data. Fictional tenants (see core/consortium).
@@ -1689,7 +1689,7 @@ def consortium_mules(epsilon: float = 1.0, limit: int = 20):
             "found": len(mules), "mules": mules, "index_recipients": len(idx)}
 
 
-# ── SyntheticID Ingest ────────────────────────────────────────────────────────
+# -- SyntheticID Ingest --------------------------------------------------------
 
 _TYPOLOGY_MAP = {
     "synthetic": "synthetic_identity",
@@ -1789,7 +1789,7 @@ def ingest_syntheticid(body: dict):
     }
 
 
-# ── LLM Proxy ─────────────────────────────────────────────────────────────────
+# -- LLM Proxy -----------------------------------------------------------------
 # Provider-agnostic proxy: anthropic | openai | groq | mistral
 # API key never touches the browser - stored in operator/.env only.
 #
@@ -1831,7 +1831,7 @@ async def llm_proxy(body: dict):
     if not api_key:
         raise HTTPException(400, "LLM_API_KEY not set in operator/.env")
 
-    # ── Anthropic path ────────────────────────────────────────────────────────
+    # -- Anthropic path --------------------------------------------------------
     if provider == "anthropic":
         endpoint = "https://api.anthropic.com/v1/messages"
         payload  = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": stream}
@@ -1859,7 +1859,7 @@ async def llm_proxy(body: dict):
             content = data["content"][0]["text"] if data.get("content") else ""
             return {"content": content}
 
-    # ── OpenAI-compatible path (openai / groq / mistral) ─────────────────────
+    # -- OpenAI-compatible path (openai / groq / mistral) ---------------------
     endpoint = _LLM_OAI_ENDPOINTS.get(provider)
     if not endpoint:
         raise HTTPException(400, f"Unsupported provider '{provider}'. Supported: anthropic, openai, groq, mistral")
@@ -1885,7 +1885,7 @@ async def llm_proxy(body: dict):
         return {"content": content}
 
 
-# ── Autonomous Agent Endpoints ────────────────────────────────────────────────
+# -- Autonomous Agent Endpoints ------------------------------------------------
 
 @app.get("/agent/status")
 def get_agent_status():
@@ -2058,7 +2058,7 @@ async def override_agent_decision(tx_id: str, body: dict = {}):
     return {"status": "override_recorded", **override_record}
 
 
-# ── Integration Hub ───────────────────────────────────────────────────────────
+# -- Integration Hub -----------------------------------------------------------
 
 from integrations import hub as _hub
 from integrations.base import EnrichRequest, ReportRequest, ConnectorCategory
@@ -2152,7 +2152,7 @@ def report_fraud(body: dict):
     return _hub.report(req, connectors=body["connectors"], timeout=timeout)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

@@ -91,7 +91,7 @@ def validate_event(raw: dict, source: str = "") -> dict:
     raw = raw if isinstance(raw, dict) else {}
     ev = dict(raw)                                        # normalise onto a copy; preserve passthrough
 
-    # ── transaction id (idempotency key) ──
+    # -- transaction id (idempotency key) --
     tid = str(raw.get("transaction_id") or raw.get("txn_id") or "").strip()
     if not tid:
         tid = "txn_" + uuid.uuid4().hex[:12]
@@ -99,7 +99,7 @@ def validate_event(raw: dict, source: str = "") -> dict:
                               "missing; generated a synthetic id (replay/idempotency will be weaker)"))
     ev["transaction_id"] = tid
 
-    # ── amount: the field that used to default to 0 and kill signal ──
+    # -- amount: the field that used to default to 0 and kill signal --
     has_features = isinstance(raw.get("features"), dict) and bool(raw.get("features"))
     amt_raw = raw.get("amount", None)
     if amt_raw is None or amt_raw == "":
@@ -117,16 +117,16 @@ def validate_event(raw: dict, source: str = "") -> dict:
             errors.append(_err("amount", "invalid",
                                f"amount is not numeric: {amt_raw!r} (refusing to default to 0)"))
 
-    # ── currency ──
+    # -- currency --
     cur = str(raw.get("currency", "USD") or "USD").upper()
     if len(cur) != 3 or not cur.isalpha():
         warnings.append(_warn("currency", f"unusual currency code {cur!r}"))
     ev["currency"] = cur
 
-    # ── timestamp ──
+    # -- timestamp --
     ev["timestamp"] = _norm_timestamp(raw.get("timestamp"), warnings)
 
-    # ── payment rail (keep the key the feature engine reads) ──
+    # -- payment rail (keep the key the feature engine reads) --
     rail_raw = raw.get("payment_rail") or raw.get("rail")
     if rail_raw:
         canon, known = normalize_rail(rail_raw)
@@ -136,11 +136,11 @@ def validate_event(raw: dict, source: str = "") -> dict:
     else:
         warnings.append(_warn("payment_rail", "missing; rail-specific liability pricing will be generic"))
 
-    # ── subject ids ──
+    # -- subject ids --
     if not any(str(raw.get(k) or "").strip() for k in SUBJECT_FIELDS):
         warnings.append(_warn("user_id", "no subject id (user_id/account_id); entity linkage and reputation will be weak"))
 
-    # ── precomputed features must be numeric ──
+    # -- precomputed features must be numeric --
     if has_features:
         clean = {}
         for k, v in raw["features"].items():
@@ -150,7 +150,7 @@ def validate_event(raw: dict, source: str = "") -> dict:
                 warnings.append(_warn(f"features.{k}", f"non-numeric feature dropped: {v!r}"))
         ev["features"] = clean
 
-    # ── leakage guard: flag label-only fields (kept, but never to be used as features) ──
+    # -- leakage guard: flag label-only fields (kept, but never to be used as features) --
     present_labels = [k for k in LABEL_FIELDS if raw.get(k) not in (None, "")]
     if present_labels:
         ev["_label_fields"] = present_labels

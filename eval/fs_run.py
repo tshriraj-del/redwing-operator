@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 
-# ── verbatim from fraudsense/api.js ───────────────────────────────────────────
+# -- verbatim from fraudsense/api.js -------------------------------------------
 SYSTEM_PROMPT = """You are FraudSense, a senior fraud investigation copilot embedded in an analyst's triage console. You reason like a seasoned fraud/risk investigator across payments, account takeover, marketplace abuse, and identity fraud. Your output is auditable evidence used to action real accounts and refer cases - so calibration and intellectual honesty matter more than confident-sounding prose.
 
 You run a rigorous investigation: extract signals, score risk, classify, estimate loss, separate fact from inference, reconstruct root cause, and recommend a data-grounded action.

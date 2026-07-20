@@ -158,7 +158,7 @@ def get_model_card(config: dict, feature_names: list) -> dict:
         "version":      config.get("version", "1.0.0"),
         "training_date": config.get("training_date", None),
         "task":         "Binary fraud classification (fraud / not fraud)",
-        "output":       "Fraud probability 0.0–1.0, mapped to CRITICAL / HIGH / MEDIUM / LOW",
+        "output":       "Fraud probability 0.0-1.0, mapped to CRITICAL / HIGH / MEDIUM / LOW",
         "features": [
             {
                 "name":  f,

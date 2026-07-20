@@ -39,7 +39,7 @@ from .base import (
     derived_signals,
 )
 
-# ── Import all connectors ──────────────────────────────────────────────────
+# -- Import all connectors --------------------------------------------------
 from .connectors.credit_bureaus    import EquifaxConnector, ExperianConnector, TransUnionConnector
 from .connectors.financial_intel   import FinCENConnector, OFACConnector, FCAConnector
 from .connectors.fraud_consortiums import EarlyWarningConnector, ThreatMetrixConnector, ActimizeConnector
@@ -80,7 +80,7 @@ class IntegrationHub:
             self._registry[c.id] = c
         logger.info(f"Integration Hub: {len(self._registry)} connectors registered")
 
-    # ── Public API ─────────────────────────────────────────────────────────
+    # -- Public API ---------------------------------------------------------
 
     def list_connectors(self) -> list[dict]:
         """Return all connectors with their current configuration status."""
@@ -197,7 +197,7 @@ class IntegrationHub:
             for c in self._registry.values()
         }
 
-    # ── Internal helpers ───────────────────────────────────────────────────
+    # -- Internal helpers ---------------------------------------------------
 
     def _resolve_targets(
         self,

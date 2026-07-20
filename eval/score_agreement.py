@@ -69,7 +69,7 @@ def report_rater(rid, labels, truth):
     agree_fraud = sum(1 for hh, gt in bin_pairs if hh == gt) / len(bin_pairs) if bin_pairs else 0
 
     secs = [labels[cid].get("seconds", 0) for cid in ids]
-    print(f"\n── rater '{rid}'  ({n} cases labeled, {n_hold} marked escalate/hold) ──")
+    print(f"\n-- rater '{rid}'  ({n} cases labeled, {n_hold} marked escalate/hold) --")
     print(f"  Human vs GOLD disposition .... {pct(agree_gold)}  (kappa {kappa_gold:.2f})  on {nd} decisive cases")
     print(f"  Human vs AGENT disposition ... {pct(agree_agent)}")
     print(f"  Human vs ground-truth fraud .. {pct(agree_fraud)}  (binary fraud / not-fraud)")
@@ -108,7 +108,7 @@ def main():
             la = [raters[a][cid]["disposition"] for cid in common]
             lb = [raters[b][cid]["disposition"] for cid in common]
             ag = sum(1 for x, y in zip(la, lb) if x == y) / len(common)
-            print(f"\n── inter-rater '{a}' vs '{b}'  ({len(common)} shared cases) ──")
+            print(f"\n-- inter-rater '{a}' vs '{b}'  ({len(common)} shared cases) --")
             print(f"  Agreement {pct(ag)}   ·   Cohen's kappa {cohen_kappa(la, lb):.2f}")
 
     print("\n" + "=" * 74)

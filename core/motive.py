@@ -172,7 +172,7 @@ def offender_profile(signals: dict, motive: str) -> dict:
     }
 
 
-# ── Intervention matrix ───────────────────────────────────────────────────────
+# -- Intervention matrix -------------------------------------------------------
 # The centrepiece: (motive x severity x victim-status) -> a proportionate response,
 # including the rehabilitative and victim-protective pathways platforms omit.
 

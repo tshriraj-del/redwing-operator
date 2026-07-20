@@ -21,7 +21,7 @@ measures the model exactly as it serves. Score is P(fraud)*100.
 
 from __future__ import annotations
 
-# ── Strategy registry ─────────────────────────────────────────────────────────
+# -- Strategy registry ---------------------------------------------------------
 # Each move sets the features it would change to their evaded (low-risk) values.
 STRATEGIES = [
     # CHEAP - the adversary controls these for free, per transaction.

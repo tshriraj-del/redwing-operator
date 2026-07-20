@@ -127,7 +127,7 @@ class BaseConnector(ABC):
         return result, int((time.time() - start) * 1000)
 
 
-# ── Derived enrichment ─────────────────────────────────────────────────────────
+# -- Derived enrichment ---------------------------------------------------------
 # When a connector has no live credentials, the hub still returns *something* useful:
 # deterministic, coherent signals keyed by the connector's category, seeded by the
 # user (stable per user) and nudged by the known fraud typology so they agree with
