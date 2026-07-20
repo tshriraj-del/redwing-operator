@@ -2,6 +2,14 @@
 
 FastAPI backend for the RedWing fraud prevention platform. Runs on port 8000 and serves the ML scoring engine, autonomous AI fraud agent, rule factory pipeline, LLM proxy, network graph API, and XAI engine.
 
+It also carries three layers built on top of that scorer:
+
+- an **ingestion pipeline**: a validating schema contract, a durable streaming transport with backpressure and a dead-letter queue, and three source connectors (JSONL file drop, SQL table polled by watermark, and an HMAC-authenticated webhook),
+- an **Actor Intelligence layer** that answers who is acting and why (motive, offender lifecycle, victim scam-arc, mule witting-ness, first-party intent, vulnerability, loophole exploitation) and maps that to a proportionate response rather than a binary block,
+- a **labeling substrate** that records every decision with its point-in-time features, keeps a monitored holdout so outcomes stay observable, captures adjudicated intent labels, and reports when a heuristic has enough ground truth to graduate into a trained model.
+
+The actor layer runs on expert-set deterministic rules, not trained models. That is deliberate: the historical ledger never labelled intent, so the heuristics bootstrap the data that would train their replacement. See `core/graduation.py` for the gate that decides when that is worthwhile.
+
 ---
 
 ## Requirements
@@ -73,6 +81,47 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/score` | Score a single transaction (XGBoost + rule engine) |
 | GET | `/monitor/stream` | SSE stream of live transaction scoring |
 | GET | `/alerts` | Recent high-confidence fraud alerts |
+
+### Ingestion Pipeline
+
+Schema contract, durable transport, and source connectors. Every entry point validates before
+anything reaches the scorer: a non-numeric or negative amount is a `422`, never a silent zero.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/ingest` | Score one transaction through the full cascade (schema-validated) |
+| POST | `/ingest/batch` | Batch inject up to 1 000; rejects routed to a dead-letter list |
+| GET | `/ingest/stats` | Injection health: ring buffer occupancy, log size |
+| GET | `/ingest/schema` | The ingestion contract: required/recommended fields, rails, label-only fields |
+| POST | `/stream/publish` | Validate and enqueue onto the durable transport (`429` under backpressure) |
+| GET | `/stream/stats` | Transport health: ready backlog, processed, dead-letter, capacity |
+| GET | `/stream/dead_letter` | Events that failed scoring past the retry limit |
+| POST | `/stream/replay` | Replay dead-lettered events back to ready |
+| GET | `/connectors` | Source connectors, durable checkpoints, authenticated webhook sources |
+| POST | `/connectors/file/poll` | Poll the JSONL drop file (resumable, checkpointed) |
+| POST | `/connectors/db/poll` | Incrementally poll a SQL table by watermark, with field mapping |
+| POST | `/connectors/webhook/{source}` | Real-time push, HMAC-authenticated per source (`X-Signature`) |
+
+### Actor Intelligence
+
+Who is acting and why, and therefore the proportionate response. Runs on reported behavioural
+telemetry only, never on the case typology (that would be leakage). With no telemetry the layer
+stays silent, because motive cannot be inferred from an amount and a rail.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/telemetry` | Ingest behavioural telemetry for a subject (what a client SDK reports) |
+| GET | `/actor/{subject}` | Offender read (motive, lifecycle, intervention) + victim read (scam arc, coercion-in-flight) |
+
+### Training Substrate
+
+Records every decision with its point-in-time features so the heuristics can eventually be
+replaced by trained models, and reports when that is worthwhile.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/substrate/stats` | Decisions logged, enforced vs shadow, observed vs censored, label provenance |
+| GET | `/substrate/readiness` | Per-target graduation verdict (heuristic-vs-gold agreement, Cohen's kappa) |
 
 ### Autonomous Agent (SyntheticID)
 
@@ -166,6 +215,20 @@ The hub connects to external agencies and bureaus for transaction enrichment and
 **Open Banking** - Plaid, Finicity, TrueLayer  
 
 ---
+
+## Core modules
+
+Everything in `core/` is pure Python over the store, deliberately free of the ML stack so it is
+testable without loading models. 93 tests (`python3 tests/test_core_store.py`, `tests/test_redwing.py`).
+
+| Layer | Modules | What it does |
+|-------|---------|--------------|
+| Substrate | `store.py`, `record.py`, `loop.py` | Entity/event backbone, decisions + labels, checkpoints, the closed loop |
+| Ingestion | `ingest_schema.py`, `stream.py`, `connectors.py`, `webhook.py` | Schema contract, durable transport, file/SQL/webhook sources |
+| Signals | `attributes.py`, `telemetry.py` | Device and identity attribute fabric; behavioural telemetry to actor tells |
+| Actor Intelligence | `motive.py`, `scam_arc.py`, `mule_network.py`, `first_party.py`, `vulnerability.py`, `loophole.py`, `onboarding.py` | Who and why: offender motive, victim grooming arc, mule witting-ness, first-party intent, victimization risk, policy exploitation, onboarding gauntlet |
+| Learning | `holdout.py`, `graduation.py`, `train.py`, `seed_substrate.py` | Monitored holdout, graduation gate, stdlib trainer, synthetic cohort |
+| Decisioning | `liability.py`, `narrative.py`, `graph.py`, `consortium.py` | Liability pricing, scam narrative, fraud graph, DP consortium |
 
 ## Part of the RedWing Platform
 
