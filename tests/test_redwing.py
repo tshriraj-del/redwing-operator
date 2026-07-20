@@ -213,6 +213,60 @@ def test_payment_model_artifacts_and_honest_metrics():
     assert any("FALSE" in l for l in labels)
 
 
+# -- API surface protection ----------------------------------------------------
+
+def _client_and_main():
+    try:
+        from fastapi.testclient import TestClient
+        import main
+        return TestClient(main.app, raise_server_exceptions=False), main
+    except Exception:
+        return None, None
+
+
+def test_cors_is_an_allowlist_not_a_wildcard():
+    """A wildcard origin lets any page in the operator's browser read customer case data."""
+    _, main = _client_and_main()
+    if main is None:
+        return
+    assert "*" not in main._ALLOWED_ORIGINS
+    assert any("localhost" in o for o in main._ALLOWED_ORIGINS)
+
+
+def test_api_key_gates_every_route_but_health():
+    """With REDWING_API_KEY set, an unauthenticated caller gets 401 - except on /health,
+    which stays open so a liveness probe does not need the secret."""
+    client, main = _client_and_main()
+    if main is None:
+        return
+    original = main._API_KEY
+    main._API_KEY = "test-secret-key"
+    try:
+        assert client.get("/health").status_code == 200        # probe stays open
+
+        assert client.get("/patterns").status_code == 401      # no key
+        assert client.get("/patterns", headers={"X-API-Key": "wrong"}).status_code == 401
+        assert client.get("/patterns", headers={"X-API-Key": "test-secret-key"}).status_code == 200
+
+        # the endpoint that spends real Anthropic credit must not be reachable unauthenticated
+        assert client.post("/rule-factory/run", json={}).status_code == 401
+    finally:
+        main._API_KEY = original
+
+
+def test_unset_api_key_leaves_the_api_open_for_local_dev():
+    """Default stays open so a laptop demo needs no configuration."""
+    client, main = _client_and_main()
+    if main is None:
+        return
+    original = main._API_KEY
+    main._API_KEY = ""
+    try:
+        assert client.get("/patterns").status_code == 200
+    finally:
+        main._API_KEY = original
+
+
 # -- standalone runner (no pytest needed) --------------------------------------
 
 if __name__ == "__main__":
