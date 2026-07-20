@@ -14,6 +14,7 @@ Loads the trained ML models from ~/pulseml_models and exposes:
 
 import asyncio
 import json
+import hmac
 import os
 import pickle
 import random
@@ -28,7 +29,7 @@ import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from match_engine import combined_score, is_alert, score_transaction
 from patterns import PATTERNS
@@ -60,12 +61,44 @@ MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_mo
 
 app = FastAPI(title="SyntheticID Operator", version="1.0.0")
 
+# -- API surface protection ----------------------------------------------------
+# This process serves 75 endpoints over customer case data, an endpoint that spends real
+# Anthropic credit (/rule-factory/run), and live rule deploy/retire controls. None of that
+# should be reachable by an unauthenticated caller the moment it has a routable address.
+
+# CORS is an allowlist, not "*". A wildcard lets any page open in the operator's browser
+# read every response this API returns. Defaults to the local dev origins, so nothing
+# changes on a laptop; set REDWING_ALLOWED_ORIGINS (comma-separated) for a real deploy.
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "REDWING_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:5179,http://localhost:3000,"
+    "http://127.0.0.1:5173,http://127.0.0.1:5179,http://127.0.0.1:3000",
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Auth is opt-in via REDWING_API_KEY. Set it and every request except /health (and CORS
+# preflight) must carry a matching X-API-Key. Leave it unset and the API stays open, which
+# is the right default for a laptop demo and is warned about loudly at startup, because it
+# is only safe while the socket is bound to localhost.
+_API_KEY = os.environ.get("REDWING_API_KEY", "").strip()
+_OPEN_PATHS = {"/health"}
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    # OPTIONS is skipped explicitly rather than relying on middleware ordering, so CORS
+    # preflight still succeeds when a key is set.
+    if _API_KEY and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
+        # compare_digest, not ==, so a wrong key cannot be recovered by timing the response
+        if not hmac.compare_digest(request.headers.get("X-API-Key", ""), _API_KEY):
+            return JSONResponse({"detail": "invalid or missing X-API-Key"}, status_code=401)
+    return await call_next(request)
 
 # Load models once at startup
 import sys
@@ -86,6 +119,12 @@ try:
     FEATURES = config["features"]
     MODEL_OK = True
     print(f"✓ Models loaded ({MODEL_TAG}) - {len(df_all):,} transactions available")
+    if _API_KEY:
+        print("✓ API key required (X-API-Key) on every route except /health")
+    else:
+        print("⚠ API is UNAUTHENTICATED - safe only while bound to localhost. "
+              "Set REDWING_API_KEY before exposing this process.")
+    print(f"✓ CORS allowlist: {', '.join(_ALLOWED_ORIGINS)}")
     # Shared feature foundation - the SAME transform used to train the model, so the
     # operator computes features identically to training (no training-serving skew).
     try:
