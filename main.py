@@ -552,11 +552,38 @@ def score(body: dict):
         transaction_id = transaction_id,
     )
 
+    alert = is_alert(c_score)
+
+    # Training substrate: this endpoint is the what-if / sandbox path (the UI scores ad-hoc
+    # transactions through it), so nothing here is enforced against a real customer. It is
+    # still recorded, as a SHADOW decision: the point-in-time feature snapshot is exactly what
+    # makes a scoring trainable later, and dropping it silently was leaving the ledger blind to
+    # every score the UI produced. shadow=1 keeps these out of the enforced counts and out of
+    # the holdout/liability accounting, where a counterfactual does not belong.
+    #
+    # No stable decision_id on purpose: log_decision is INSERT OR REPLACE, and reusing the
+    # enforced `dec:{tid}` key would let a sandbox re-score overwrite a real enforced decision.
+    # Each what-if is its own immutable row.
+    if STORE is not None:
+        try:
+            record_decision(
+                STORE, subject_ref=transaction_id,
+                entity_id=eid("user", str(body.get("user_id", "unknown"))),
+                action=("HOLD" if alert else "ALLOW"), module="model",
+                score=c_score, features=features,
+                rationale={"pattern": top, "path": "score_endpoint", "enforced": False},
+                shadow=True,
+                institution_id=str(body.get("institution_id", "") or ""),
+                model_version=str(config.get("version", "")),
+            )
+        except Exception:
+            pass          # a substrate failure must never fail scoring
+
     return {
         "transaction_id": transaction_id,
         "ml_score":       round(ml, 4),
         "combined_score": round(c_score, 4),
-        "is_alert":       is_alert(c_score),
+        "is_alert":       alert,
         "top_pattern":    top,
         "all_patterns":   matches,
         "explanation":    explanation,

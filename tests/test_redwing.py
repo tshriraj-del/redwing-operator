@@ -266,6 +266,45 @@ def test_unset_api_key_leaves_the_api_open_for_local_dev():
     finally:
         main._API_KEY = original
 
+# -- the /score path must reach the training substrate -------------------------
+
+def test_score_endpoint_records_a_shadow_decision():
+    """/score is the what-if path the UI calls. It must still write a point-in-time decision,
+    or every score the UI produces is invisible to the substrate and untrainable later. It must
+    write it as SHADOW, so a sandbox score never inflates the enforced counts.
+
+    Regression: /score used to return a score and touch the ledger not at all."""
+    client, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False):
+        return                                            # deps or model artifacts absent here
+    from core.store import Store
+
+    tmp = Store(os.path.join(tempfile.mkdtemp(), "substrate.db"))
+    original_store, original_key = main.STORE, main._API_KEY
+    main.STORE = tmp                                      # keep the real redwing.db clean
+    main._API_KEY = ""                                    # this test is about scoring, not auth
+    try:
+        before = tmp.labeling_stats()
+        assert before["decisions_total"] == 0
+
+        r = client.post("/score", json={
+            "transaction_id": "test_shadow_1", "user_id": "u_test",
+            "amount": 9400.0, "rail": "wire", "recipient_id": "r_new",
+        })
+        assert r.status_code == 200, r.text
+
+        after = tmp.labeling_stats()
+        assert after["decisions_total"] == 1              # it reached the substrate
+        assert after["decisions_shadow"] == 1             # ...as a counterfactual
+        assert after["decisions_enforced"] == 0           # ...and not as an enforced action
+
+        # the point-in-time feature snapshot is the whole reason to log it
+        dec = tmp.latest_decision_for_subject("test_shadow_1")
+        assert dec is not None
+        assert dec.features, "decision recorded without its feature snapshot"
+    finally:
+        main.STORE, main._API_KEY = original_store, original_key
+
 
 # -- standalone runner (no pytest needed) --------------------------------------
 
