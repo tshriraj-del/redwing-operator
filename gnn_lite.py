@@ -33,7 +33,7 @@ from typing import NamedTuple
 
 import pandas as pd
 
-# ── Cascade thresholds ────────────────────────────────────────────────────────
+# -- Cascade thresholds --------------------------------------------------------
 
 _BASE_FRAUD_RATE = 0.018   # dataset-level prior: 880K txns, 1.84% fraud
 _TIER2_LO   = 0.35         # below this: Tier 1 confident clean → skip GNN
@@ -45,7 +45,7 @@ _GNN_WEIGHT = 0.35
 _W     = [0.35, 0.30, 0.15, 0.15, 0.05]
 _SCALE = 3.5   # amplify so 5% fraud-rate entity scores ~0.18, not near-zero
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+# -- Shared state --------------------------------------------------------------
 
 _lock = threading.RLock()
 
@@ -59,7 +59,7 @@ _initialized = False
 _stats: dict = {}
 
 
-# ── Result type ───────────────────────────────────────────────────────────────
+# -- Result type ---------------------------------------------------------------
 
 class GNNResult(NamedTuple):
     score:     float
@@ -67,7 +67,7 @@ class GNNResult(NamedTuple):
     hops:      int     # 1 = GNN ran; 0 = tables not ready (fallback)
 
 
-# ── Init / Precompute ─────────────────────────────────────────────────────────
+# -- Init / Precompute ---------------------------------------------------------
 
 def init(df: pd.DataFrame) -> None:
     """
@@ -96,12 +96,12 @@ def init(df: pd.DataFrame) -> None:
     if "recipient_id" in df.columns:
         df["recipient_id"] = df["recipient_id"].astype(str)
 
-    # ── Round 0: per-entity fraud rates ──────────────────────────────────────
+    # -- Round 0: per-entity fraud rates --------------------------------------
     ufr = df.groupby("user_id")["is_fraud"].mean().to_dict()
     dfr = df.groupby("device_id")["is_fraud"].mean().to_dict() if "device_id" in df.columns else {}
     rfr = df.groupby("recipient_id")["is_fraud"].mean().to_dict() if "recipient_id" in df.columns else {}
 
-    # ── Round 1: precomputed 1-hop neighborhood aggregates ───────────────────
+    # -- Round 1: precomputed 1-hop neighborhood aggregates -------------------
     # user_recipient_mean: for each user, mean fraud rate across their recipients
     if "recipient_id" in df.columns and rfr:
         rfr_series = pd.Series(rfr)
@@ -120,7 +120,7 @@ def init(df: pd.DataFrame) -> None:
     else:
         dcmf = {}
 
-    # ── Atomic swap ───────────────────────────────────────────────────────────
+    # -- Atomic swap -----------------------------------------------------------
     with _lock:
         _user_fraud_rate.clear();      _user_fraud_rate.update(ufr)
         _device_fraud_rate.clear();    _device_fraud_rate.update(dfr)
@@ -144,7 +144,7 @@ def refresh_from_disk(models_dir: Path) -> None:
         init(pd.read_csv(csv, low_memory=False))
 
 
-# ── Inference (O(1)) ──────────────────────────────────────────────────────────
+# -- Inference (O(1)) ----------------------------------------------------------
 
 def score(user_id, device_id, recipient_id) -> GNNResult:
     """

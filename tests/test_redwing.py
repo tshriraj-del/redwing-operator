@@ -31,7 +31,7 @@ import feedback
 from integrations.base import derived_signals, EnrichRequest, ConnectorCategory
 
 
-# ── fixtures (plain helpers) ──────────────────────────────────────────────────
+# -- fixtures (plain helpers) --------------------------------------------------
 
 def _fraud_row():
     return {
@@ -62,7 +62,7 @@ def _legit_scored():
             "graph_context": {"graph_risk_score": 0.01}}
 
 
-# ── case_file ─────────────────────────────────────────────────────────────────
+# -- case_file -----------------------------------------------------------------
 
 def test_case_file_fraud_is_coherent():
     c = case_file.assemble(_fraud_row(), _fraud_scored())
@@ -81,7 +81,7 @@ def test_case_file_legit_is_clean():
     assert c["sar_eligible"] is False
 
 
-# ── fraud_env verifiers ───────────────────────────────────────────────────────
+# -- fraud_env verifiers -------------------------------------------------------
 
 def test_env_gold_disposition_tracks_truth():
     fc = case_file.assemble(_fraud_row(), _fraud_scored())
@@ -106,7 +106,7 @@ def test_env_false_positive_is_penalised_on_legit():
     assert trigger["scorecard"]["outcome_reward"] < 0
 
 
-# ── adversary simulator ───────────────────────────────────────────────────────
+# -- adversary simulator -------------------------------------------------------
 
 def _seed_features():
     # a "caught" seed: every signal is hot
@@ -140,7 +140,7 @@ def test_adversary_strategies_are_cost_tagged():
     assert costs == {"cheap", "costly"}
 
 
-# ── feedback loop ─────────────────────────────────────────────────────────────
+# -- feedback loop -------------------------------------------------------------
 
 class _FakeRep:
     """Minimal empirical-Bayes reputation to test the online update path."""
@@ -174,7 +174,7 @@ def test_feedback_loop_closes_online():
     os.unlink(tf.name)
 
 
-# ── derived enrichment ────────────────────────────────────────────────────────
+# -- derived enrichment --------------------------------------------------------
 
 class _FakeConn:
     def __init__(self, cid, cat):
@@ -198,7 +198,7 @@ def test_enrichment_deterministic():
     assert a == b                                     # seeded -> stable
 
 
-# ── real-data payment model ───────────────────────────────────────────────────
+# -- real-data payment model ---------------------------------------------------
 
 def test_payment_model_artifacts_and_honest_metrics():
     meta_path = os.path.join(ML, "payment_real_meta.json")
@@ -213,7 +213,7 @@ def test_payment_model_artifacts_and_honest_metrics():
     assert any("FALSE" in l for l in labels)
 
 
-# ── standalone runner (no pytest needed) ──────────────────────────────────────
+# -- standalone runner (no pytest needed) --------------------------------------
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -43,7 +43,7 @@ def render(case, n, total):
     a = case.get("alert", {}); cust = case.get("customer", {}); b = cust.get("baseline", {})
     txn = case.get("transaction", {}); disp = case.get("dispute", {}) or {}
     dev = case.get("device_network", {}) or {}; cfs = case.get("card_fraud_signals", []) or []
-    line = "─" * 74
+    line = "-" * 74
     print("\n" + "=" * 74)
     print(f"CASE {n}/{total}   ·   {case.get('case_id')}   ·   priority {case.get('priority')}")
     print("=" * 74)

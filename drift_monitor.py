@@ -8,7 +8,7 @@ an adversarial probing campaign.
 
 PSI interpretation (industry standard):
   < 0.10  - stable
-  0.10–0.20 - warning (monitor closely)
+  0.10-0.20 - warning (monitor closely)
   > 0.20  - drift (consider retraining)
 
 Reference: ADWIN (Bifet & Gavalda, 2007); PSI as used in SR 11-7 / Fed guidance.
@@ -20,7 +20,7 @@ from collections import deque
 from datetime import datetime
 from threading import Lock
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# -- Configuration -------------------------------------------------------------
 
 BUFFER_SIZE = 2000   # rolling window size (transactions)
 WARMUP_MIN  = 200    # samples needed before drift checks begin
@@ -38,7 +38,7 @@ TRACKED_FEATURES = [
     "device_familiarity",
 ]
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# -- State ---------------------------------------------------------------------
 
 _lock = Lock()
 _score_buf: deque               = deque(maxlen=BUFFER_SIZE)
@@ -57,7 +57,7 @@ _status: dict = {
     "current_size":  0,
 }
 
-# ── PSI core ──────────────────────────────────────────────────────────────────
+# -- PSI core ------------------------------------------------------------------
 
 def _compute_psi(reference: list, current: list) -> float:
     if len(reference) < 30 or len(current) < 30:
@@ -146,7 +146,7 @@ def _check() -> None:
         "drift_events":  list(_drift_events[-10:]),
     })
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# -- Public API ----------------------------------------------------------------
 
 def record(score: float, features: dict | None = None) -> None:
     """Record a scored transaction. Called from build_event() in main.py."""

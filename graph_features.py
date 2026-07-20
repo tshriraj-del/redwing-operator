@@ -26,7 +26,7 @@ from typing import Optional
 
 import pandas as pd
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# -- State ---------------------------------------------------------------------
 
 _lock = threading.Lock()
 
@@ -40,7 +40,7 @@ _user_fraud_neighbors: dict = {}  # user_id → int (ring membership proxy)
 _stats: dict = {"entities": 0, "transactions": 0, "last_refresh": None}
 
 
-# ── Precomputation ─────────────────────────────────────────────────────────────
+# -- Precomputation -------------------------------------------------------------
 
 def precompute(df: pd.DataFrame) -> None:
     """
@@ -53,7 +53,7 @@ def precompute(df: pd.DataFrame) -> None:
 
     has_fraud = "is_fraud" in df.columns
 
-    # ── Collect per-entity fraud tallies in one pass ──────────────────────────
+    # -- Collect per-entity fraud tallies in one pass --------------------------
     device_users: dict  = defaultdict(set)
     device_fraud: dict  = defaultdict(list)
     recip_fraud:  dict  = defaultdict(list)
@@ -75,7 +75,7 @@ def precompute(df: pd.DataFrame) -> None:
         if uid:
             user_fraud[uid].append(is_f)
 
-    # ── Derived tables ────────────────────────────────────────────────────────
+    # -- Derived tables --------------------------------------------------------
     new_duc = {d: len(u) for d, u in device_users.items()}
 
     new_dfr = {
@@ -94,7 +94,7 @@ def precompute(df: pd.DataFrame) -> None:
         for u, v in user_fraud.items() if v
     }
 
-    # ── 1-hop fraud neighbor count (ring membership proxy) ────────────────────
+    # -- 1-hop fraud neighbor count (ring membership proxy) --------------------
     # For each device shared by multiple users, count how many users on that
     # device have a non-zero fraud rate. Clean users on a "dirty" device are
     # flagged with the count of those dirty co-users - a simplified GNN
@@ -107,7 +107,7 @@ def precompute(df: pd.DataFrame) -> None:
                 if new_ufr.get(u, 0.0) == 0.0:
                     new_ufn[u] += len(fraud_users)
 
-    # ── Atomic swap ──────────────────────────────────────────────────────────
+    # -- Atomic swap ----------------------------------------------------------
     now = datetime.utcnow()
     with _lock:
         _device_user_count.clear();   _device_user_count.update(new_duc)
@@ -133,7 +133,7 @@ def refresh_from_disk(models_dir: Path) -> None:
         pass
 
 
-# ── Feature lookup ─────────────────────────────────────────────────────────────
+# -- Feature lookup -------------------------------------------------------------
 
 def get_features(
     user_id:      Optional[str],
@@ -175,7 +175,7 @@ def _aggregate(
     user_fraud_neighbors: int,
 ) -> float:
     """
-    Aggregate per-entity graph stats into a single 0–1 risk score.
+    Aggregate per-entity graph stats into a single 0-1 risk score.
 
     Weights match the information value of each signal for fraud ring detection:
       30% recipient fraud rate  - who is this money going to?

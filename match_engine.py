@@ -1,5 +1,5 @@
 # Match Engine - scores a transaction against the pattern library.
-# Returns soft confidence scores (0.0–1.0) per pattern using weighted signal matching.
+# Returns soft confidence scores (0.0-1.0) per pattern using weighted signal matching.
 # Supports partial credit for near-miss thresholds so borderline cases surface.
 
 from patterns import PATTERNS
@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 def _signal_match(value: float, op: str, threshold: float) -> float:
     """
-    Returns 0.0–1.0 match strength for a single signal.
+    Returns 0.0-1.0 match strength for a single signal.
     Hard match at threshold; linear decay for near-misses up to 2x the gap.
     """
     if op == "lt":

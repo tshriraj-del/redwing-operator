@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import random
 
-# ── Schema: families -> base attributes, and how many derived leaves each expands to ──
+# -- Schema: families -> base attributes, and how many derived leaves each expands to --
 # surface = sum(len(attrs) * derivations) x entity pivots. This is how ~150 base
 # attributes become thousands of evaluable leaves.
 
@@ -64,7 +64,7 @@ def _rng(*parts) -> random.Random:
     return random.Random(int(h[:12], 16))
 
 
-# ── Coherence: how a typology tilts the two surfaces ──────────────────────────
+# -- Coherence: how a typology tilts the two surfaces --------------------------
 # Each entry raises the risk of specific attribute groups so the derived fabric agrees
 # with ground truth. A scam VICTIM (pig_butchering / app_scam) is deliberately NOT here:
 # their device and identity look clean, and the tell lives in the motive layer.
@@ -99,7 +99,7 @@ def evaluate(entity_id: str, typology: str = "", flags=None) -> dict:
         if risk >= 0.6:
             top.append({"attribute": name, "risk": risk, "note": note})
 
-    # ── Device families (representative decision-relevant leaves per family) ──
+    # -- Device families (representative decision-relevant leaves per family) --
     integ = _score(rng, 0.02, 0.12, t.get("integrity", 0.0))
     device["Integrity & tamper"] = {
         "headless_browser": integ >= 0.5,
@@ -135,7 +135,7 @@ def evaluate(entity_id: str, typology: str = "", flags=None) -> dict:
     if bio >= 0.6:
         add_top("device.biometric_deviation", bio, "Interaction rhythm deviates from the account's baseline")
 
-    # ── Identity families ──
+    # -- Identity families --
     thin = _score(rng, 0.05, 0.2, t.get("thin_file", 0.0))
     synth = _score(rng, 0.02, 0.12, t.get("shared_ssn", 0.0) + t.get("thin_file", 0.0) * 0.3)
     identity["Identity linkage"] = {

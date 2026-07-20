@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-# ── Location ──────────────────────────────────────────────────────────────────
+# -- Location ------------------------------------------------------------------
 # Co-located with the ML artifacts so one directory holds the platform's state.
 # Override with REDWING_MODELS_DIR (same knob main.py already uses).
 _MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_models"))
@@ -67,7 +67,7 @@ def _to_text(value) -> str:
     return "" if value is None else str(value)
 
 
-# ── Records ───────────────────────────────────────────────────────────────────
+# -- Records -------------------------------------------------------------------
 
 @dataclass
 class Entity:
@@ -156,7 +156,7 @@ LABEL_SOURCES = (
 )
 
 
-# ── Store ─────────────────────────────────────────────────────────────────────
+# -- Store ---------------------------------------------------------------------
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -282,7 +282,7 @@ class Store:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 
-    # ── Entities ──────────────────────────────────────────────────────────────
+    # -- Entities --------------------------------------------------------------
 
     def upsert_entity(
         self,
@@ -413,7 +413,7 @@ class Store:
             ).fetchall()
         return [self._row_to_entity(r) for r in rows]
 
-    # ── Events ────────────────────────────────────────────────────────────────
+    # -- Events ----------------------------------------------------------------
 
     def append_event(
         self,
@@ -551,7 +551,7 @@ class Store:
             ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
-    # ── Decisions + labels (the training substrate) ─────────────────────────────
+    # -- Decisions + labels (the training substrate) -----------------------------
 
     def log_decision(
         self,
@@ -762,7 +762,7 @@ class Store:
             "outcome_coverage": round(outcome_covered / dec_total, 3) if dec_total else 0.0,
         }
 
-    # ── Telemetry (real client-reported behavioural signals) ────────────────────
+    # -- Telemetry (real client-reported behavioural signals) --------------------
 
     def record_telemetry(self, subject_ref: str, raw: dict, entity_id: str = "",
                          institution_id: str = "", ts: Optional[str] = None,
@@ -790,7 +790,7 @@ class Store:
         ).fetchone()
         return _loads(row["raw"]) if row else {}
 
-    # ── Connector checkpoints (resumable source ingestion) ──────────────────────
+    # -- Connector checkpoints (resumable source ingestion) ----------------------
 
     def get_checkpoint(self, name: str) -> int:
         """The last consumed offset for a named source, or 0 if never seen."""
@@ -812,7 +812,7 @@ class Store:
         return {r["name"]: int(r["offset"]) for r in
                 self._conn.execute("SELECT name, offset FROM checkpoints").fetchall()}
 
-    # ── Introspection ─────────────────────────────────────────────────────────
+    # -- Introspection ---------------------------------------------------------
 
     def stats(self) -> dict:
         c = self._conn
@@ -835,7 +835,7 @@ class Store:
         with self._lock:
             self._conn.close()
 
-    # ── Row mappers ───────────────────────────────────────────────────────────
+    # -- Row mappers -----------------------------------------------------------
 
     @staticmethod
     def _row_to_entity(r: sqlite3.Row) -> Entity:
@@ -878,7 +878,7 @@ class Store:
         )
 
 
-# ── Convenience factory + typed id helpers ────────────────────────────────────
+# -- Convenience factory + typed id helpers ------------------------------------
 
 def open_store(db_path: os.PathLike | str = DEFAULT_DB_PATH) -> Store:
     return Store(db_path)

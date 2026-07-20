@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from .attributes import evaluate as _evaluate_attributes
 
-# ── The gauntlet: escalating tiers of friction ────────────────────────────────
+# -- The gauntlet: escalating tiers of friction --------------------------------
 GAUNTLET = [
     {"tier": 0, "name": "Frictionless",       "gate": "Form validation only"},
     {"tier": 1, "name": "Verify contactables", "gate": "Email + phone one-time-passcode"},
@@ -33,7 +33,7 @@ GAUNTLET = [
     {"tier": 4, "name": "Decline or refer",    "gate": "Decline; SAR if warranted; safeguard if coerced"},
 ]
 
-# ── Onboarding behavioural tells (distinct from transaction tells) ─────────────
+# -- Onboarding behavioural tells (distinct from transaction tells) -------------
 # tell -> {dimension it implicates, weight, whether it is a hard escalation trigger}
 ONBOARDING_TELLS = {
     "pii_pasted":            {"dim": "knowledge",    "w": 0.35, "hard": False},  # SSN/DOB pasted, not typed
@@ -100,7 +100,7 @@ def assess_onboarding(applicant_id: str, typology: str = "", behavior=None,
     coercion = dim["coercion"]
     dubious = round(max(v for k, v in dim.items() if k != "coercion"), 3)
 
-    # ── Coercion off-ramp: a person being made to open a mule account is a victim ──
+    # -- Coercion off-ramp: a person being made to open a mule account is a victim --
     if coercion >= 0.6:
         return {
             "applicant_id": applicant_id, "dubious_score": dubious, "coercion_score": round(coercion, 3),
@@ -115,14 +115,14 @@ def assess_onboarding(applicant_id: str, typology: str = "", behavior=None,
             "attribute_surface": attr["surface"]["total"],
         }
 
-    # ── Targeted challenges for the weak dimensions ──
+    # -- Targeted challenges for the weak dimensions --
     challenges = []
     for d in ("contactable", "document", "device", "knowledge", "coordination"):
         if dim[d] >= 0.5 and d in _CHALLENGE:
             challenge, why = _CHALLENGE[d]
             challenges.append({"dimension": d, "challenge": challenge, "why": why, "weakness": round(dim[d], 3)})
 
-    # ── Adaptive tier: dubious score bands, with a hard-trigger override ──
+    # -- Adaptive tier: dubious score bands, with a hard-trigger override --
     if hard or dubious >= 0.8:
         tier, decision = (3, "MANUAL REVIEW") if not (dubious >= 0.9) else (4, "DECLINE")
     elif dubious >= 0.6:

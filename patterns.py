@@ -11,7 +11,7 @@ PATTERNS = [
         "color": "#ef4444",
         "prevalence": 0.30,
         "description": (
-            "Long grooming phase (14–90 days) builds victim trust through fake relationships "
+            "Long grooming phase (14-90 days) builds victim trust through fake relationships "
             "or investment advice, followed by a large one-way exit via crypto or FedNow. "
             "The recipient appears NEW because the trust was built off-platform."
         ),
@@ -114,7 +114,7 @@ PATTERNS = [
         "color": "#22c55e",
         "prevalence": 0.05,
         "description": (
-            "Automated bot validates stolen card credentials using micro-transactions ($0.01–$1.99) "
+            "Automated bot validates stolen card credentials using micro-transactions ($0.01-$1.99) "
             "at high velocity across subscription or gaming merchants. Successful cards are sold "
             "or used for full-value purchases immediately after."
         ),
