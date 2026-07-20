@@ -35,6 +35,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -239,6 +240,13 @@ CREATE INDEX IF NOT EXISTS idx_lbl_decision ON labels(decision_id);
 CREATE INDEX IF NOT EXISTS idx_lbl_subject  ON labels(subject_ref);
 CREATE INDEX IF NOT EXISTS idx_lbl_space    ON labels(label_space, label_key);
 CREATE INDEX IF NOT EXISTS idx_lbl_current  ON labels(superseded_by);
+-- add_label supersedes the current label for a target before inserting the new one. Without
+-- a composite index matching that exact predicate, SQLite chose idx_lbl_current, whose key is
+-- superseded_by='' and therefore matches nearly every row: each label write scanned the whole
+-- table and label throughput fell quadratically (measured 2,666 -> 146 rows/s over 16K rows).
+-- These two cover the decision-keyed and subject-keyed forms of that UPDATE.
+CREATE INDEX IF NOT EXISTS idx_lbl_supersede_dec ON labels(decision_id, label_space, label_key, superseded_by);
+CREATE INDEX IF NOT EXISTS idx_lbl_supersede_sub ON labels(subject_ref, label_space, label_key, superseded_by);
 
 -- telemetry: REAL behavioural / device / session signals reported by the client for a
 -- subject (a session or transaction). This is what lets the actor modules run on genuine
@@ -278,9 +286,44 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.RLock()
+        self._batch_depth = 0        # >0 while inside batch(): defer commits
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._commit()
+
+    # -- Write batching --------------------------------------------------------
+
+    def _commit(self) -> None:
+        """Commit, unless a batch() is open. Every write path calls this instead of
+        committing directly, so batching is a property of the caller rather than something
+        each method has to know about."""
+        if self._batch_depth == 0:
             self._conn.commit()
+
+    @contextmanager
+    def batch(self):
+        """Defer commits until the block exits, then commit once.
+
+        Every write path commits by default, which is right for request handling (a scoring
+        decision must be durable before the response returns) and ruinous for bulk work: a
+        replay of 60K transactions writes a decision and a label each, so 120K commits, each
+        an fsync. `bulk_append_events` already existed for exactly this reason on the CSV
+        importer; this generalises it to any write.
+
+        Rolls back on exception, so a failed batch leaves no partial substrate. Re-entrant,
+        because callers nest (replay -> record_decision -> log_decision + add_label)."""
+        with self._lock:
+            self._batch_depth += 1
+            try:
+                yield self
+            except Exception:
+                if self._batch_depth == 1:
+                    self._conn.rollback()
+                raise
+            finally:
+                self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self._conn.commit()
 
     # -- Entities --------------------------------------------------------------
 
@@ -321,7 +364,7 @@ class Store:
                     (ts, institution_id, institution_id,
                      json.dumps(merged_attr), json.dumps(merged_rep), entity_id),
                 )
-            self._conn.commit()
+            self._commit()
 
     def bulk_upsert_entities(self, entities: Iterable[Entity], batch: int = 5000) -> int:
         """Fast path for the CSV importer: UPSERT many entities via executemany +
@@ -349,7 +392,7 @@ class Store:
                     self._conn.executemany(sql, rows); n += len(rows); rows = []
             if rows:
                 self._conn.executemany(sql, rows); n += len(rows)
-            self._conn.commit()
+            self._commit()
         return n
 
     def bulk_append_events(self, events: Iterable[Event], batch: int = 5000) -> int:
@@ -366,7 +409,7 @@ class Store:
                     ev_rows, link_rows = [], []
             if ev_rows:
                 self._flush_events(ev_rows, link_rows); n += len(ev_rows)
-            self._conn.commit()
+            self._commit()
         return n
 
     def _flush_events(self, ev_rows: list, link_rows: list) -> None:
@@ -391,7 +434,7 @@ class Store:
                 "UPDATE entities SET reputation=?, last_seen=? WHERE entity_id=?",
                 (json.dumps(merged), _now(), entity_id),
             )
-            self._conn.commit()
+            self._commit()
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id: str) -> Optional[Entity]:
@@ -441,7 +484,7 @@ class Store:
                 "INSERT OR IGNORE INTO event_entities (event_id, entity_id) VALUES (?,?)",
                 [(event_id, e) for e in ents],
             )
-            self._conn.commit()
+            self._commit()
         return event_id
 
     def get_event(self, event_id: str) -> Optional[Event]:
@@ -596,7 +639,7 @@ class Store:
                  json.dumps(features or {}), json.dumps(rationale or {}),
                  model_version, policy_version),
             )
-            self._conn.commit()
+            self._commit()
         return decision_id
 
     def get_decision(self, decision_id: str) -> Optional[Decision]:
@@ -660,7 +703,7 @@ class Store:
                  _to_text(label_value), source, float(confidence or 0.0), ts,
                  effective_ts, "", annotator, notes),
             )
-            self._conn.commit()
+            self._commit()
         return label_id
 
     def current_labels(self, decision_id: str = "", subject_ref: str = "") -> list:
@@ -786,7 +829,7 @@ class Store:
                 (telemetry_id, str(subject_ref or ""), entity_id, ts, institution_id,
                  json.dumps(raw or {})),
             )
-            self._conn.commit()
+            self._commit()
         return telemetry_id
 
     def get_telemetry(self, subject_ref: str) -> dict:
@@ -813,7 +856,7 @@ class Store:
                 "INSERT INTO checkpoints (name, offset, updated_ts) VALUES (?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET offset=excluded.offset, updated_ts=excluded.updated_ts",
                 (str(name), int(offset), _now()))
-            self._conn.commit()
+            self._commit()
 
     def checkpoints(self) -> dict:
         """All connector checkpoints, name -> offset."""
