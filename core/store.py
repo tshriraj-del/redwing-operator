@@ -444,6 +444,14 @@ class Store:
             self._conn.commit()
         return event_id
 
+    def get_event(self, event_id: str) -> Optional[Event]:
+        """One event by id. Transactions are stored with event_id == transaction_id, so this
+        is how a case can be reopened from the backbone for events that never came from the
+        historical dataset (anything the ingestion pipeline brought in)."""
+        row = self._conn.execute(
+            "SELECT * FROM events WHERE event_id=?", (str(event_id),)).fetchone()
+        return self._row_to_event(row) if row else None
+
     def events_for_entity(self, entity_id: str, event_type: Optional[str] = None,
                           limit: int = 200) -> list:
         """Every event touching an entity, newest first. The query WS2 and WS3

@@ -148,6 +148,39 @@ def test_record_scored_event_store_absent_is_noop():
     assert record_scored_event(None, {"transaction_id": "t"}, {"user_id": "u"}) == []
 
 
+def test_row_from_backbone_reopens_a_pipeline_ingested_transaction():
+    """Regression: everything the ingestion pipeline brings in is scored and persisted to the
+    backbone but never enters the historical dataset, so the case file could not open any of
+    it. The row must be reconstructable from the backbone alone."""
+    from core.record import record_scored_event, row_from_backbone
+    s = Store(_fresh_db())
+    event = {"transaction_id": "pipe_tx_1", "amount": 4200.0, "rail": "zelle",
+             "ml_score": 0.81, "combined_score": 0.88, "is_alert": True,
+             "expected_liability": 3500.0}
+    row = {"user_id": "u77", "device_id": "d77", "recipient_id": "r77",
+           "fraud_typology": "pig_butchering", "institution_id": "inst_a", "is_fraud": True}
+    record_scored_event(s, event, row)
+
+    back = row_from_backbone(s, "pipe_tx_1")
+    assert back is not None
+    assert back["transaction_id"] == "pipe_tx_1"
+    assert back["amount"] == 4200.0 and back["payment_rail"] == "zelle"
+    assert back["fraud_typology"] == "pig_butchering"
+    assert back["user_id"] == "u77" and back["recipient_id"] == "r77" and back["device_id"] == "d77"
+
+    assert row_from_backbone(s, "never_seen") is None      # unknown id stays unknown
+    assert row_from_backbone(None, "pipe_tx_1") is None    # no store, no crash
+    s.close()
+
+
+def test_get_event_returns_none_for_missing():
+    s = Store(_fresh_db())
+    s.append_event("transaction", event_id="ev1", payload={"amount": 10})
+    assert s.get_event("ev1").payload["amount"] == 10
+    assert s.get_event("nope") is None
+    s.close()
+
+
 def test_close_loop_moves_reputation_and_returns_receipt():
     from core.record import record_scored_event
     from core.loop import close_loop
