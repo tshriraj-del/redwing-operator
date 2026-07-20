@@ -145,7 +145,7 @@ except Exception as _pe:
 # Pure helpers (stdlib-only) import at module scope so they exist even if the SQLite
 # store fails to open; only the Store() instantiation is guarded.
 from core.store import Store, DEFAULT_DB_PATH, eid
-from core.record import record_scored_event
+from core.record import record_scored_event, row_from_backbone
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
@@ -288,25 +288,30 @@ def build_event(row) -> dict:
         cascade_score, event["amount"],
         typology=str(row.get("fraud_typology", "") or ""), rail=event["rail"])
 
+    # Monitored-holdout policy: a capped, low-liability slice of would-be-holds is released and
+    # observed, giving clean counterfactual ground truth. Decided BEFORE the durable trail is
+    # written, so the backbone records the action actually enforced. (Deciding it after meant a
+    # released case was still logged as an alert, and liability_at_risk counted it.)
+    ho = None
+    if STORE is not None:
+        try:
+            proposed = "HOLD" if event["is_alert"] else "ALLOW"
+            ho = holdout_decision(event["transaction_id"], proposed, event["expected_liability"])
+            if ho["release"]:
+                event["is_alert"] = False          # actually let through, and monitored
+                event["monitored"] = True
+            event["holdout"] = ho["holdout"]
+        except Exception:
+            ho = None
+
     # Durable trail on the backbone (best-effort; never changes the score above).
     record_scored_event(STORE, event, row)
 
     # Training substrate: log this scoring as a POINT-IN-TIME decision (the feature snapshot
-    # as it was used), and apply the monitored-holdout policy so a capped, low-liability slice
-    # of would-be-holds is released and observed as clean counterfactual ground truth. This is
-    # additive and best-effort: it records what the policy decides, and never alters the score
-    # or alert returned above (a production enforcer would honour the release downstream).
-    if STORE is not None:
+    # as it was used). Additive and best-effort; a failure here must never fail scoring.
+    if STORE is not None and ho is not None:
         try:
             tid = event["transaction_id"]
-            proposed = "HOLD" if event["is_alert"] else "ALLOW"
-            ho = holdout_decision(tid, proposed, event["expected_liability"])
-            # Honour the release: a held-out case is actually let through (monitored), not just
-            # logged, so its true outcome becomes observable (uncensored) ground truth.
-            if ho["release"]:
-                event["is_alert"] = False
-                event["monitored"] = True
-            event["holdout"] = ho["holdout"]
             did = f"dec:{tid}" if tid else None
             record_decision(
                 STORE, subject_ref=tid,
@@ -725,13 +730,20 @@ def get_case(transaction_id: str):
     recommended disposition. SAR is a downstream action, not the entry point."""
     if not MODEL_OK:
         raise HTTPException(503, "ML models not loaded.")
-    if df_all.empty or "transaction_id" not in df_all.columns:
-        raise HTTPException(404, "No transaction dataset loaded.")
 
-    match = df_all[df_all["transaction_id"].astype(str) == str(transaction_id)]
-    if match.empty:
-        raise HTTPException(404, f"transaction_id '{transaction_id}' not found.")
-    return _assemble_case(match.iloc[0].to_dict())
+    if not df_all.empty and "transaction_id" in df_all.columns:
+        match = df_all[df_all["transaction_id"].astype(str) == str(transaction_id)]
+        if not match.empty:
+            return _assemble_case(match.iloc[0].to_dict())
+
+    # Not in the historical dataset. Everything the ingestion pipeline brings in (a file drop,
+    # a webhook push, a polled source table, /ingest, /stream/publish) is scored and persisted
+    # to the backbone but never enters that dataset, so fall back to it. Without this the
+    # analyst can open historical rows but nothing that actually flowed through the pipeline.
+    row = row_from_backbone(STORE, transaction_id)
+    if row is not None:
+        return _assemble_case(row)
+    raise HTTPException(404, f"transaction_id '{transaction_id}' not found.")
 
 
 @app.post("/case")

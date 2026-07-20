@@ -104,7 +104,13 @@ class DurableQueue:
     def consume_batch(self, topic: str, handler, batch: int = 50) -> dict:
         """Process up to `batch` ready messages oldest-first. `handler(payload)` runs each; on
         success the message is 'done', on exception its attempts increment and it either stays
-        'ready' (retry) or, at max_attempts, becomes 'dead'. At-least-once by construction."""
+        'ready' (retry) or, at max_attempts, becomes 'dead'. At-least-once by construction.
+
+        SINGLE-CONSUMER PER TOPIC. Messages are selected as 'ready' and only marked terminal
+        after the handler returns; there is no in-flight lease, so two consumers running the
+        same topic concurrently would both pick up the same rows and double-process them. The
+        operator runs exactly one consumer loop per topic, which is what makes this safe. A
+        multi-consumer deployment needs a lease/visibility-timeout first."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT seq, payload, attempts FROM stream_log WHERE topic=? AND status='ready' "

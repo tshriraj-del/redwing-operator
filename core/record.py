@@ -59,3 +59,36 @@ def record_scored_event(store, event: dict, row: dict) -> list:
         return ids
     except Exception:
         return []   # backbone is a non-critical side-effect; scoring must never break on it
+
+
+def row_from_backbone(store, transaction_id: str):
+    """Rebuild a transaction row from the backbone, or None if it was never recorded.
+
+    Everything the ingestion pipeline brings in (a file drop, a webhook push, a polled
+    source table, /ingest, /stream/publish) is scored and persisted here, but it never
+    enters the historical dataset. Without this, an analyst cannot open any of it as a
+    case: the case file would only ever resolve rows that shipped with the CSV. This
+    reconstructs enough of the original row (amount, rail, typology, and the party ids
+    from the linked entities) for the case assembler to re-score and build the file."""
+    if store is None or not transaction_id:
+        return None
+    try:
+        ev = store.get_event(str(transaction_id))
+        if ev is None or ev.event_type != "transaction":
+            return None
+        row = {
+            "transaction_id": str(transaction_id),
+            "amount": ev.payload.get("amount"),
+            "payment_rail": ev.payload.get("rail"),
+            "fraud_typology": ev.payload.get("typology") or "",
+            "institution_id": ev.institution_id or "",
+            "is_fraud": bool(ev.derived.get("is_fraud")),
+        }
+        for ent in ev.entities or []:
+            kind, _, raw = str(ent).partition(":")
+            for k, col in _ENTITY_COLS:
+                if kind == k and raw:
+                    row[col] = raw
+        return row
+    except Exception:
+        return None
