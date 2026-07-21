@@ -193,7 +193,7 @@ from core.ingest_schema import validate_event, contract as ingest_contract
 from core.stream import DurableQueue, BackpressureError
 from core.connectors import FileConnector, DBConnector
 from core.webhook import WebhookReceiver
-from core.liability import expected_liability
+from core.liability import expected_liability, price_decision
 from core.narrative import scam_narrative
 try:
     STORE = Store(DEFAULT_DB_PATH)
@@ -331,9 +331,34 @@ def build_event(row) -> dict:
     # 200K rows the distortion was -2.1%, small but the wrong KIND of number: it is right for a
     # reason production cannot reproduce, and it would silently change the day this ran on live
     # traffic. The predicted pattern is what a real deployment actually has.
+    #
+    # One variable, used by BOTH sides of the price below, so the two can never drift onto
+    # different notions of what this transaction is.
+    _pred_typology = str(event.get("top_pattern_id") or "")
+
     event["expected_liability"] = expected_liability(
-        cascade_score, event["amount"],
-        typology=str(event.get("top_pattern_id") or ""), rail=event["rail"])
+        cascade_score, event["amount"], typology=_pred_typology, rail=event["rail"])
+
+    # WS10: price the OTHER side too. Expected liability alone is one-sided, and a one-sided
+    # objective always over-blocks, because the fraud loss lands on this team's P&L and the
+    # wrongly-declined customer lands on someone else's. Measured at this platform's own
+    # operating point that bias runs 2.6 false positives per real fraud caught.
+    #
+    # LTV band is proxied from the customer's own average spend, because this dataset carries
+    # no CRM value band. That is a stand-in for a real retention model and is labelled as such
+    # in the payload rather than presented as measured.
+    try:
+        _avg = float(row.get("user_avg", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        _avg = 0.0
+    _band = "high" if _avg >= 500 else "medium" if _avg >= 100 else "low"
+
+    event["decision_economics"] = price_decision(
+        cascade_score, event["amount"], typology=_pred_typology, rail=event["rail"],
+        action=("HOLD" if alert else "ALLOW"), ltv_band=_band,
+        account_age_days=row.get("account_age_days", 365))
+    event["decision_economics"]["ltv_band_source"] = "proxied from user_avg spend, not a CRM value band"
+    event["decision_economics"]["typology_source"] = "predicted pattern (serving-time available)"
 
     # Monitored-holdout policy: a capped, low-liability slice of would-be-holds is released and
     # observed, giving clean counterfactual ground truth. Decided BEFORE the durable trail is
