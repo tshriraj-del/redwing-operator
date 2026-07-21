@@ -220,6 +220,51 @@ def test_close_loop_clear_label_queues_no_retrain_label():
     s.close()
 
 
+def test_gate_counts_an_adjudication_even_without_a_scored_decision():
+    """Regression. readiness derived its gold count from training_rows(), which INNER JOINs
+    decisions because training needs a feature snapshot. Readiness asks a different question -
+    does a human judgement exist, and does it agree with the rule - and neither needs features.
+
+    The effect was that an adjudication on a case this instance had not scored was stored,
+    counted in labels_current, and invisible to the gate. An analyst could adjudicate all day
+    and watch readiness never move. `trainable_gold` now reports the feature-carrying subset
+    separately, which is the number that actually gates training."""
+    from core.graduation import evaluate_target
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+
+    # (a) an adjudication with NO decision behind it: the analyst opened a case whose
+    #     transaction was scored somewhere else, or before this instance existed
+    s.add_label("intent", "motive", "coerced_victim", source="analyst",
+                confidence=0.9, subject_ref="unscored_case")
+
+    # (b) an adjudication WITH a decision, so it also carries features
+    record_decision(s, "scored_case", module="motive", features={"x": 1},
+                    decision_id="dec:scored_case")
+    s.add_label("intent", "motive", "survival", source="analyst", confidence=0.9,
+                decision_id="dec:scored_case", subject_ref="scored_case")
+
+    r = evaluate_target(s, "intent", "motive")
+    assert r["gold_labels"] == 2, "an adjudication without a decision was dropped by the gate"
+    assert r["trainable_gold"] == 1, "only the feature-carrying label can train a model"
+    s.close()
+
+
+def test_labels_for_target_does_not_require_a_decision():
+    s = Store(_fresh_db())
+    s.add_label("intent", "motive", "survival", source="analyst", confidence=0.9,
+                subject_ref="no_decision")
+    rows = s.labels_for_target("intent", "motive", sources=["analyst"])
+    assert len(rows) == 1
+    assert rows[0]["subject_ref"] == "no_decision"
+    assert rows[0]["trainable"] is False        # flagged, not hidden
+    # heuristic labels are excluded when filtering to gold sources
+    s.add_label("intent", "motive", "opportunistic", source="heuristic", confidence=0.3,
+                subject_ref="no_decision_2")
+    assert len(s.labels_for_target("intent", "motive", sources=["analyst"])) == 1
+    s.close()
+
+
 def test_liability_prices_irrevocable_rails_higher_than_card():
     from core.liability import expected_liability, reimbursement_rate
     # same probability and amount: a Zelle pig-butchering scam should price far above
