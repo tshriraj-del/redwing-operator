@@ -231,6 +231,86 @@ def test_liability_prices_irrevocable_rails_higher_than_card():
     assert expected_liability("bad", None, "x", "y") == 0.0     # never raises
 
 
+def test_false_positive_cost_is_dominated_by_attrition_not_the_payment():
+    """The reason fraud orgs over-block is that they price the fraud loss and not the customer.
+    The attrition term must be the big one, or the model is just a rounding error on margin."""
+    from core.liability import false_positive_cost
+    fp = false_positive_cost(200.0, action="BLOCK", ltv_band="high", account_age_days=2000)
+    assert fp["attrition"] > fp["lost_margin"] * 10
+    assert fp["total"] > 200.0                      # costs more than the payment is worth
+    assert fp["assumptions"]["ltv"] > 0             # never quote a number without its inputs
+
+
+def test_false_positive_cost_scales_with_how_hard_the_action_is():
+    """A step-up is cheap friction; a hard decline can end the relationship."""
+    from core.liability import false_positive_cost
+    block = false_positive_cost(500, action="BLOCK", ltv_band="medium")["total"]
+    hold = false_positive_cost(500, action="HOLD", ltv_band="medium")["total"]
+    step = false_positive_cost(500, action="STEP_UP", ltv_band="medium")["total"]
+    assert block > hold > step
+    assert false_positive_cost(500, action="ALLOW")["attrition"] == 0.0
+
+
+def test_breakeven_threshold_moves_the_right_way():
+    """The whole point of WS10: the bar is derived per transaction, not tuned globally."""
+    from core.liability import breakeven_p
+    # more exposure -> block on weaker suspicion
+    assert breakeven_p(9000, rail="wire") < breakeven_p(40, rail="wire")
+    # irrevocable rail -> block on weaker suspicion than chargeback-protected card
+    assert breakeven_p(1000, rail="crypto") < breakeven_p(1000, rail="card")
+    # more valuable customer -> demand more certainty before blocking them
+    assert breakeven_p(1000, rail="wire", ltv_band="high") > breakeven_p(1000, rail="wire", ltv_band="low")
+    # cheaper action -> lower bar to use it
+    assert breakeven_p(1000, rail="wire", action="STEP_UP") < breakeven_p(1000, rail="wire", action="BLOCK")
+
+
+def test_price_decision_refuses_a_block_that_destroys_more_value_than_it_saves():
+    """A small card payment from a long-tenured, high-value customer should not be blocked on
+    a coin-flip score. Preventing $10 of loss by risking $380 of customer damage is a bad
+    trade even though it 'stopped fraud', and a one-sided objective would take it."""
+    from core.liability import price_decision
+    d = price_decision(0.55, 120, rail="card", ltv_band="high", account_age_days=2000)
+    assert d["recommended_action"] == "ALLOW"
+    assert d["cost_of_blocking"] > d["cost_of_allowing"]
+    assert d["net_benefit_of_blocking"] < 0
+
+
+def test_price_decision_blocks_a_large_irrevocable_payment_from_a_new_account():
+    from core.liability import price_decision
+    d = price_decision(0.55, 9000, rail="crypto", ltv_band="low", account_age_days=20)
+    assert d["recommended_action"] == "BLOCK"
+    assert d["cost_of_allowing"] > d["cost_of_blocking"]
+    assert d["p_fraud"] > d["breakeven_p"]          # above the derived bar
+
+
+def test_pricing_withdraws_its_recommendation_on_reconnaissance():
+    """A card-testing probe is deliberately tiny. Pricing the decision on its own amount says
+    'never block a $0.31 payment', which is exactly backwards: what blocking buys is stopping
+    the card being confirmed for a later, larger hit. The economics are still reported, but the
+    recommendation is withdrawn rather than being confidently wrong."""
+    from core.liability import price_decision
+    probe = price_decision(0.85, 0.31, typology="card_testing_bot", rail="card",
+                           ltv_band="high", account_age_days=2000)
+    assert probe["recommended_action"] == "DEFER_TO_DETECTION"
+    assert "reconnaissance" in probe["caveat"]
+    assert probe["cost_of_allowing"] >= 0            # still priced, just not acted on
+
+    # an ordinary small card payment keeps its normal two-sided recommendation
+    normal = price_decision(0.85, 0.31, typology="app_scam", rail="card",
+                            ltv_band="high", account_age_days=2000)
+    assert normal["recommended_action"] == "ALLOW"
+    assert "caveat" not in normal
+
+
+def test_pricing_never_raises_on_bad_input():
+    """It sits in the hot decision path; a malformed row must not take scoring down."""
+    from core.liability import breakeven_p, false_positive_cost, price_decision
+    assert false_positive_cost("x", action="???", ltv_band="nope", account_age_days="y")["total"] >= 0
+    assert 0.0 <= breakeven_p(None, rail="???") <= 1.0
+    d = price_decision("bad", None, rail="")
+    assert d["recommended_action"] in ("ALLOW", "BLOCK")
+
+
 def test_liability_flows_into_receipt_and_portfolio():
     from core.record import record_scored_event
     from core.loop import close_loop
