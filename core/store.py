@@ -779,6 +779,40 @@ class Store:
             })
         return out
 
+    def labels_for_target(
+        self,
+        label_space: str,
+        label_key: str,
+        sources: Optional[Iterable[str]] = None,
+        min_confidence: float = 0.0,
+        limit: int = 100000,
+    ) -> list:
+        """Current labels for one target, WITHOUT requiring a linked decision.
+
+        `training_rows()` inner-joins decisions because training needs the point-in-time
+        feature snapshot. Readiness asks a different question - does a human judgement exist,
+        and does it agree with the rule - and neither needs features. Using the training query
+        for both silently discarded every adjudication made on a case this instance had not
+        scored, so an analyst's work could never move the gate."""
+        q = ("SELECT label_id, decision_id, subject_ref, entity_id, label_value, source, "
+             "confidence, ts, effective_ts FROM labels "
+             "WHERE label_space=? AND label_key=? AND superseded_by='' AND confidence>=?")
+        args: list = [label_space, label_key, float(min_confidence)]
+        srcs = list(sources or [])
+        if srcs:
+            q += " AND source IN (%s)" % ",".join("?" * len(srcs))
+            args.extend(srcs)
+        q += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        return [{
+            "label_id": r["label_id"], "decision_id": r["decision_id"],
+            "subject_ref": r["subject_ref"], "entity_id": r["entity_id"],
+            "label": r["label_value"], "source": r["source"],
+            "confidence": round(float(r["confidence"]), 3),
+            "labeled_ts": r["ts"], "effective_ts": r["effective_ts"],
+            "trainable": bool(r["decision_id"]),
+        } for r in self._conn.execute(q, args).fetchall()]
+
     def labeling_stats(self) -> dict:
         """Health of the labeling substrate: how much data, how much is enforced vs shadow,
         and what fraction of decisions have a confirmed OUTCOME label yet (label coverage)."""

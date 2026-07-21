@@ -306,6 +306,82 @@ def test_score_endpoint_records_a_shadow_decision():
         main.STORE, main._API_KEY = original_store, original_key
 
 
+# -- adjudication capture: the only path to intent gold labels ------------------
+
+def test_adjudication_vocabularies_come_from_the_heuristic_modules():
+    """The analyst picks from exactly the classes the heuristic can emit. If the two lists
+    drifted, agreement would be unmeasurable for reasons unrelated to the heuristic's quality."""
+    from core.adjudication import schema
+    from core.motive import MOTIVES
+    from core.mule_network import MULE_ROLES
+    from core.scam_arc import SCAM_ARC
+
+    fields = {f["key"]: f for f in schema()["fields"]}
+    assert {o["value"] for o in fields["motive"]["options"]} == set(MOTIVES)
+    assert {o["value"] for o in fields["witting_role"]["options"]} == set(MULE_ROLES)
+    assert {o["value"] for o in fields["scam_stage"]["options"]} == {s["key"] for s in SCAM_ARC}
+
+
+def test_adjudication_schema_forbids_pre_selecting_the_heuristic_guess():
+    """The load-bearing honesty property. The gate measures heuristic-versus-human agreement;
+    a UI that pre-fills the human's answer with the machine's manufactures that agreement and
+    turns the readiness number into an artefact of the interface."""
+    from core.adjudication import schema
+    s = schema()
+    assert s["no_default_selected"] is True
+    assert "manufacture" in s["no_default_reason"].lower()
+    for f in s["fields"]:
+        for o in f["options"]:
+            assert "selected" not in o and "default" not in o
+
+
+def test_adjudication_rejects_out_of_vocabulary_gold():
+    """A gold label the gate cannot compare against is worse than no label: it inflates the
+    gold count while contributing nothing, which is how a readiness metric starts lying."""
+    from core.adjudication import validate
+    ok, bad = validate({"motive": "survival", "witting_role": "unwitting",
+                        "scam_stage": "extraction"})
+    assert ok == {"motive": "survival", "witting_role": "unwitting", "scam_stage": "extraction"}
+    assert bad == []
+
+    ok2, bad2 = validate({"motive": "made_up_motive", "not_a_target": "x", "scam_stage": ""})
+    assert ok2 == {}                                   # nothing invalid gets stored
+    assert {b["field"] for b in bad2} == {"motive", "not_a_target"}
+    assert validate(None) == ({}, [])                  # no adjudication is not an error
+
+
+def test_analyst_adjudication_becomes_gold_the_gate_can_use():
+    """End to end: an analyst closes a case with an intent read, and the graduation gate can
+    now see a human label for a target that previously had none."""
+    try:
+        from core.store import Store
+        from core.loop import close_loop, record_decision
+        from core.adjudication import validate
+        from core.graduation import evaluate_target
+    except Exception:
+        return
+    s = Store(os.path.join(tempfile.mkdtemp(), "adj.db"))
+
+    # the heuristic guessed, at low confidence, as the actor layer does today
+    record_decision(s, "case_1", module="motive", features={"x": 1},
+                    heuristic_labels=[{"space": "intent", "key": "motive",
+                                       "value": "opportunistic", "confidence": 0.3}],
+                    decision_id="dec:case_1")
+
+    # the analyst disagrees, and says so
+    intent, rejected = validate({"motive": "coerced_victim"})
+    assert not rejected
+    close_loop(s, "case_1", "r1", "confirm_fraud", is_fraud=True, intent=intent)
+
+    gold = [l for l in s.current_labels(subject_ref="case_1")
+            if l.label_key == "motive" and l.source == "analyst"]
+    assert len(gold) == 1 and gold[0].label_value == "coerced_victim"
+
+    # and the gate can now measure the heuristic against a human on this target
+    rep = evaluate_target(s, "intent", "motive")
+    assert rep["gold_labels"] >= 1
+
+
 # -- standalone runner (no pytest needed) --------------------------------------
 
 if __name__ == "__main__":

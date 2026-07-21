@@ -39,13 +39,27 @@ KAPPA_CEILING = 0.9     # at/above this the rule already matches humans: little 
 
 
 def _subjects_with_gold(store, label_space: str, label_key: str, gold_sources) -> dict:
-    """subject_ref -> gold label_value, taking the most recent CURRENT gold label per subject."""
-    rows = store.training_rows(label_space, label_key, sources=list(gold_sources), limit=1_000_000)
-    out = {}
-    for r in rows:
-        if r["subject_ref"]:
-            out[r["subject_ref"]] = r["label"]
-    return out
+    """subject_ref -> gold label_value, taking the most recent CURRENT gold label per subject.
+
+    Reads labels directly rather than through training_rows(). That helper inner-joins
+    decisions, because TRAINING needs the point-in-time feature snapshot. Readiness asks a
+    different question: does a human judgement exist, and does it agree with the rule. Neither
+    needs features.
+
+    Conflating the two silently discarded real analyst work. An adjudication on a case whose
+    transaction was not scored by this instance has no decision row, so the join dropped it:
+    the label was stored, counted in labels_current, and invisible to the gate. An analyst
+    could adjudicate all day and watch readiness never move. `trainable_gold()` below reports
+    the feature-carrying subset separately, which is the number that actually gates training."""
+    rows = store.labels_for_target(label_space, label_key, sources=list(gold_sources))
+    return {r["subject_ref"]: r["label"] for r in rows if r["subject_ref"]}
+
+
+def _trainable_gold(store, label_space: str, label_key: str, gold_sources) -> int:
+    """How many gold labels carry a feature snapshot, i.e. how many could train a model."""
+    rows = store.training_rows(label_space, label_key, sources=list(gold_sources),
+                               limit=1_000_000)
+    return len({r["subject_ref"] for r in rows if r["subject_ref"] and r["features"]})
 
 
 def _heuristic_by_subject(store, subjects, label_space: str, label_key: str) -> dict:
@@ -96,6 +110,7 @@ def evaluate_target(store, label_space: str, label_key: str,
     """Graduation readiness for one (label_space, label_key) target."""
     gold = _subjects_with_gold(store, label_space, label_key, gold_sources)
     heur = _heuristic_by_subject(store, gold.keys(), label_space, label_key)
+    n_trainable = _trainable_gold(store, label_space, label_key, gold_sources)
 
     pairs = [(heur[s], gold[s]) for s in gold if s in heur]
     n_gold = len(gold)
@@ -123,6 +138,7 @@ def evaluate_target(store, label_space: str, label_key: str,
     return {
         "target": f"{label_space}.{label_key}",
         "gold_labels": n_gold,
+        "trainable_gold": n_trainable,          # the subset carrying a feature snapshot
         "paired_with_heuristic": n_paired,
         "heuristic_accuracy_vs_gold": accuracy,
         "cohen_kappa": kappa,

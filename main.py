@@ -185,6 +185,7 @@ except Exception as _pe:
 # store fails to open; only the Store() instantiation is guarded.
 from core.store import Store, DEFAULT_DB_PATH, eid
 from core.record import record_scored_event, row_from_backbone
+from core.adjudication import schema as adjudication_schema, validate as adjudication_validate
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
@@ -931,10 +932,20 @@ def post_feedback(body: dict):
             rep_rate = online.get("recipient_global_fraud_rate") if online else None
             lc       = result.get("label_class")
             is_fraud = True if lc == "fraud" else (False if lc == "legit" else None)
-            intent = body.get("intent") if isinstance(body.get("intent"), dict) else None
+
+            # Intent is the analyst's adjudication and becomes GOLD in the label store, so it
+            # is validated against the vocabularies the heuristics actually emit. An
+            # out-of-vocabulary gold label is worse than none: the gate would count it toward
+            # readiness while being unable to compare it to anything.
+            raw_intent = body.get("intent") if isinstance(body.get("intent"), dict) else None
+            intent, rejected = adjudication_validate(raw_intent)
+            if rejected:
+                result["intent_rejected"] = rejected
+
             result["receipt"] = close_loop(
                 STORE, transaction_id, recipient_id, label, is_fraud, rep_rate, source,
-                intent=intent)
+                intent=intent or None)
+            result["intent_recorded"] = sorted(intent.keys())
         except Exception:
             pass   # receipt is additive; a backbone failure must not fail the disposition
 
@@ -956,6 +967,18 @@ def substrate_stats():
     if STORE is None:
         return {"substrate": "unavailable"}
     return STORE.labeling_stats()
+
+
+@app.get("/adjudication/schema")
+def get_adjudication_schema():
+    """What an analyst can be asked to adjudicate when closing a case, and why each answer
+    matters. Served from the modules that produce the competing heuristic, so the options an
+    analyst picks from are exactly the classes the heuristic can emit.
+
+    Carries `no_default_selected`: the UI must not pre-select the heuristic's guess. The
+    graduation gate measures heuristic-versus-human agreement, and pre-filling the human's
+    answer with the machine's would manufacture that agreement."""
+    return adjudication_schema()
 
 
 @app.get("/substrate/readiness")
