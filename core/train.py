@@ -93,13 +93,31 @@ def _split(subject_ref: str, test_frac: float, seed: str) -> bool:
     return h < test_frac
 
 
+def _prf(pairs, positive: str) -> dict:
+    """Precision / recall / F1 for one class. `pairs` is [(predicted, gold), ...]."""
+    tp = sum(1 for p, g in pairs if p == positive and g == positive)
+    fp = sum(1 for p, g in pairs if p == positive and g != positive)
+    fn = sum(1 for p, g in pairs if p != positive and g == positive)
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    return {"precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4),
+            "tp": tp, "fp": fp, "fn": fn}
+
+
 def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOURCES,
                  test_frac: float = 0.3, min_rows: int = 40, seed: str = "redwing-train",
-                 observed_only: bool = False) -> dict:
+                 observed_only: bool = False, positive_label: str = "") -> dict:
     """Train a model on gold labels for one target and compare it to the heuristic on a held-out
     test split. Returns model vs heuristic accuracy and whether the model beats the rule. Set
     `observed_only=True` for OUTCOME targets to train on uncensored (allowed) decisions only,
-    so the model is not fit on labels the analyst inferred for cases we blocked."""
+    so the model is not fit on labels the analyst inferred for cases we blocked.
+
+    `positive_label` matters when the target is rare. Accuracy is the right comparison for a
+    roughly balanced target like intent.motive, and a useless one for outcome.is_fraud at a
+    0.65% base rate, where predicting "never fraud" scores 99.35%. Pass the positive class
+    (e.g. "True") and the verdict is decided on F1 for that class instead, with precision and
+    recall reported for both model and rule. Left empty, behaviour is unchanged."""
     rows = [r for r in store.training_rows(label_space, label_key,
                                            sources=list(gold_sources),
                                            observed_only=observed_only, limit=1_000_000)
@@ -122,23 +140,23 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
                       [r["label"] for r in train])
 
     m_correct = h_correct = h_evaluable = 0
+    m_pairs, h_pairs = [], []
     for r in test:
         gold = r["label"]
-        if _nb_predict(model, _vec(r["features"], keys, medians)) == gold:
+        pred = _nb_predict(model, _vec(r["features"], keys, medians))
+        m_pairs.append((pred, gold))
+        if pred == gold:
             m_correct += 1
         hl = heur.get(r["subject_ref"])
         if hl is not None:
             h_evaluable += 1
             h_correct += int(hl == gold)
+            h_pairs.append((hl, gold))
 
     m_acc = round(m_correct / len(test), 3)
     h_acc = round(h_correct / h_evaluable, 3) if h_evaluable else None
-    beats = h_acc is not None and m_acc > h_acc
-    verdict = ("model_beats_rule: graduate this target to the trained model" if beats
-               else "model_does_not_beat_rule: keep the heuristic for now" if h_acc is not None
-               else "no heuristic baseline on the test split to compare against")
 
-    return {
+    out = {
         "target": f"{label_space}.{label_key}",
         "trained": True,
         "n_train": len(train),
@@ -146,6 +164,33 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
         "classes": model["classes"],
         "model_accuracy": m_acc,
         "heuristic_accuracy": h_acc,
-        "beats_heuristic": beats,
-        "verdict": verdict,
     }
+
+    if positive_label:
+        # Rare-target mode: judge on F1 for the positive class, because accuracy here is
+        # dominated by the negative class and would call a do-nothing model excellent.
+        mp, hp = _prf(m_pairs, positive_label), _prf(h_pairs, positive_label)
+        base = sum(1 for _, g in m_pairs if g == positive_label) / max(len(m_pairs), 1)
+        beats = bool(h_pairs) and mp["f1"] > hp["f1"]
+        out.update({
+            "positive_label": positive_label,
+            "test_base_rate": round(base, 5),
+            "model": mp,
+            "heuristic": hp,
+            "decided_on": "f1",
+            "beats_heuristic": beats,
+            "verdict": (f"model_beats_rule on f1 ({mp['f1']} vs {hp['f1']}): graduate" if beats
+                        else f"model_does_not_beat_rule on f1 ({mp['f1']} vs {hp['f1']}): keep the rule"
+                        if h_pairs else "no heuristic baseline on the test split"),
+        })
+        return out
+
+    beats = h_acc is not None and m_acc > h_acc
+    out.update({
+        "decided_on": "accuracy",
+        "beats_heuristic": beats,
+        "verdict": ("model_beats_rule: graduate this target to the trained model" if beats
+                    else "model_does_not_beat_rule: keep the heuristic for now" if h_acc is not None
+                    else "no heuristic baseline on the test split to compare against"),
+    })
+    return out
