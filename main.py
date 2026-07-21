@@ -982,6 +982,42 @@ def substrate_readiness():
     return readiness_report(STORE)
 
 
+@app.get("/substrate/graduation")
+def substrate_graduation():
+    """The full evidence chain behind a rule being retired by a model that beat it.
+
+    Two sections, deliberately separate, because conflating them would be the dishonest move:
+
+      live       what THIS instance's substrate supports right now. On a fresh instance that
+                 is "not enough data", and the gate saying no is a correct answer, not a bug.
+      experiment a RECORDED run over 300K real labeled transactions, served with its
+                 provenance (row counts, the rule, the labelling policy). This is where the
+                 numbers come from; it is not recomputed per request and does not pretend to be.
+    """
+    out = {"live": {"substrate": "unavailable"}, "experiment": None}
+
+    if STORE is not None:
+        from core.graduation import readiness_report
+        from core.train import train_target
+        try:
+            out["live"] = {
+                "substrate": STORE.labeling_stats(),
+                "readiness": readiness_report(STORE, targets=[("outcome", "is_fraud")]),
+                "trained": train_target(STORE, "outcome", "is_fraud",
+                                        observed_only=True, positive_label="True"),
+            }
+        except Exception as e:                                    # never take the page down
+            out["live"] = {"substrate": "error", "detail": str(e)[:200]}
+
+    art = MODELS_DIR / "phase2_experiment.json"
+    if art.exists():
+        try:
+            out["experiment"] = json.load(open(art))
+        except Exception:
+            out["experiment"] = None
+    return out
+
+
 @app.post("/telemetry")
 def post_telemetry(body: dict):
     """Ingest REAL behavioural telemetry a client SDK reports for a subject (session /
