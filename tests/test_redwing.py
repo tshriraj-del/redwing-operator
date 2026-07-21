@@ -266,6 +266,59 @@ def test_unset_api_key_leaves_the_api_open_for_local_dev():
     finally:
         main._API_KEY = original
 
+# -- no serving path may read the adjudicated typology --------------------------
+
+def test_serving_path_never_prices_or_narrates_from_ground_truth():
+    """`fraud_typology` is the dataset's adjudicated label. It exists in replay and does NOT
+    exist at decision time, so anything on the serving path that reads it is right for a reason
+    production cannot reproduce, and will silently change behaviour on live traffic.
+
+    This feeds a row whose adjudicated typology CONTRADICTS what the detector will predict. If
+    any output moves with the label rather than the prediction, the leak is back."""
+    client, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False):
+        return
+
+    row = {
+        "transaction_id": "leak_probe_1", "user_id": "u_leak", "amount": 9000.0,
+        "payment_rail": "zelle", "recipient_id": "r_leak", "device_id": "d_leak",
+        # adjudicated label says the cheapest typology (0.35 multiplier); the detector,
+        # looking only at features, will not conclude card testing on a $9,000 Zelle push
+        "fraud_typology": "card_testing_bot",
+    }
+    event = main.build_event(dict(row))
+
+    # liability must follow the PREDICTED pattern, so it must not collapse to the
+    # card-testing multiplier just because the label said so
+    from core.liability import expected_liability
+    leaked = expected_liability(event["combined_score"], event["amount"],
+                                typology="card_testing_bot", rail=event["rail"])
+    assert event["expected_liability"] != leaked or event.get("top_pattern_id") == "card_testing_bot", (
+        "expected_liability moved with the adjudicated label, not the prediction")
+
+    # and the case file must narrate from the prediction too
+    case = main._assemble_case(dict(row))
+    narrative = str(case.get("scam_narrative") or "")
+    assert "card_testing" not in narrative.lower() or event.get("top_pattern_id") == "card_testing_bot", (
+        "scam_narrative was written from the adjudicated label")
+
+
+def test_no_serving_function_reads_the_adjudicated_typology_column():
+    """A source-level guard: the three serving functions must not mention the column at all.
+    Analysis and display endpoints legitimately group historical data by it; these three
+    produce operator-facing decisions and must not."""
+    import inspect
+    _, main = _client_and_main()
+    if main is None:
+        return
+    for fn in (main.build_event, main._assemble_case):
+        src = inspect.getsource(fn)
+        code = "\n".join(l for l in src.split("\n")
+                         if not l.strip().startswith("#") and '"""' not in l)
+        assert 'row.get("fraud_typology"' not in code, (
+            f"{fn.__name__} reads the adjudicated typology on the serving path")
+
+
 # -- the /score path must reach the training substrate -------------------------
 
 def test_score_endpoint_records_a_shadow_decision():
