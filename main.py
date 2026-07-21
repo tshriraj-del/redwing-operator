@@ -323,9 +323,16 @@ def build_event(row) -> dict:
 
     # WS4: price the decision in dollars of expected reimbursement liability, not just
     # probability - the number the buyer's P&L actually cares about post-regulation.
+    #
+    # Typology is the PREDICTED pattern, never row["fraud_typology"]. That column is the
+    # dataset's adjudicated label: it exists in replay and does not exist at decision time, so
+    # reading it here made the liability book quietly depend on knowing the answer. Measured on
+    # 200K rows the distortion was -2.1%, small but the wrong KIND of number: it is right for a
+    # reason production cannot reproduce, and it would silently change the day this ran on live
+    # traffic. The predicted pattern is what a real deployment actually has.
     event["expected_liability"] = expected_liability(
         cascade_score, event["amount"],
-        typology=str(row.get("fraud_typology", "") or ""), rail=event["rail"])
+        typology=str(event.get("top_pattern_id") or ""), rail=event["rail"])
 
     # Monitored-holdout policy: a capped, low-liability slice of would-be-holds is released and
     # observed, giving clean counterfactual ground truth. Decided BEFORE the durable trail is
@@ -760,8 +767,13 @@ def _assemble_case(row) -> dict:
     case = case_file.assemble(row, scored, graph_ctx=graph_ctx, explanation=explanation)
 
     # WS4: a plain-language read of the con (deterministic; the copilot can enrich it).
+    #
+    # Same leak, and qualitatively the worse one: written from the PREDICTED pattern, not the
+    # adjudicated label. Narrating the con from ground truth made the copilot look like it had
+    # inferred the scam type when it had simply been told, and that flattery would evaporate in
+    # production, where the column is absent and the narrative falls back to generic.
     case["scam_narrative"] = scam_narrative(
-        typology=str(row.get("fraud_typology", "") or ""),
+        typology=str(scored.get("top_pattern_id") or ""),
         signals={"amount": scored.get("amount", row.get("amount", 0.0)),
                  "rail": scored.get("rail", row.get("payment_rail", "")),
                  "is_new_recipient": row.get("is_new_recipient"),
@@ -778,7 +790,9 @@ def _assemble_case(row) -> dict:
             amount=float(row.get("amount", 0.0) or 0.0),
             payment_rail=str(row.get("payment_rail", row.get("rail", ""))),
             recipient_id=str(row.get("recipient_id", "")),
-            fraud_typology=str(row.get("fraud_typology", "")),
+            # predicted, not adjudicated: enrichment signals derived from the true typology
+            # are coherent for a reason no live connector could reproduce
+            fraud_typology=str(scored.get("top_pattern_id") or ""),
             raw=row,
         ))
         case["enrichment"] = er
