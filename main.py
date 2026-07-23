@@ -1030,6 +1030,27 @@ def substrate_readiness():
     return readiness_report(STORE)
 
 
+@app.get("/substrate/next-questions")
+def substrate_next_questions(limit: int = 10):
+    """Which cases should the analyst adjudicate NEXT, and why.
+
+    Adjudication is the scarcest resource here: the gate needs 50 gold labels and 30
+    heuristic/gold pairs per target, and a human labels a handful of cases a day. Working the
+    queue in arrival order spends most of that on cases that teach the system nothing.
+
+    Only cases the heuristic has already scored are queued, because a gold label without a
+    heuristic prediction cannot form the pair the verdict rests on. A fixed share of the queue
+    is drawn representatively rather than by model uncertainty, so the labelled set does not
+    collapse onto the decision boundary."""
+    if STORE is None:
+        return {"substrate": "unavailable", "queue": []}
+    from core.active_learning import next_questions
+    try:
+        return next_questions(STORE, limit=max(1, min(50, limit)))
+    except Exception as e:
+        return {"substrate": "error", "detail": str(e)[:200], "queue": []}
+
+
 @app.get("/substrate/graduation")
 def substrate_graduation():
     """The full evidence chain behind a rule being retired by a model that beat it.

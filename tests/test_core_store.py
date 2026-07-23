@@ -1355,6 +1355,157 @@ def test_graduation_flags_a_rule_that_already_matches_humans():
     s.close()
 
 
+
+
+# -- active learning: which case should the analyst adjudicate next -------------
+
+def _seed_al_cohort(s, n=120, gold=0, seed=11):
+    """n cases the heuristic has scored; `gold` of them already adjudicated."""
+    import random
+    from core.loop import record_decision
+    rng = random.Random(seed)
+    classes = ["survival", "opportunistic", "organized_malicious"]
+    with s.batch():
+        for i in range(n):
+            h = classes[i % len(classes)]
+            record_decision(s, f"al{i}", module="motive",
+                            features={"a": rng.random(), "b": rng.random()},
+                            heuristic_labels=[{"space": "intent", "key": "motive",
+                                               "value": h, "confidence": 0.3}],
+                            decision_id=f"dec:al{i}")
+            if i < gold:
+                s.add_label("intent", "motive", rng.choice(classes), source="analyst",
+                            confidence=0.9, decision_id=f"dec:al{i}", subject_ref=f"al{i}")
+
+
+def test_active_learning_only_queues_cases_that_can_form_a_pair():
+    """The gate needs heuristic/gold PAIRS. A gold label on a case the heuristic never scored
+    raises gold_labels and leaves paired untouched, so it cannot move the verdict. Candidates
+    must therefore come only from cases carrying a heuristic prediction."""
+    from core.active_learning import candidates
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+    # has a heuristic prediction -> queueable
+    record_decision(s, "with_h", module="motive", features={"a": 1},
+                    heuristic_labels=[{"space": "intent", "key": "motive",
+                                       "value": "survival", "confidence": 0.3}],
+                    decision_id="dec:with_h")
+    # scored but the heuristic said nothing about motive -> not queueable
+    record_decision(s, "no_h", module="model", features={"a": 1}, decision_id="dec:no_h")
+
+    subs = {c["subject_ref"] for c in candidates(s, "intent", "motive")}
+    assert subs == {"with_h"}
+    s.close()
+
+
+def test_active_learning_excludes_already_adjudicated_cases():
+    """Re-asking a question a human has answered is the one purely wasted click.
+
+    Usually add_label supersedes the heuristic label, so an adjudicated case drops out of the
+    candidate pool on its own. That is NOT guaranteed: a subject can carry two decisions (this
+    codebase uses both `dec:` and `replay:` id namespaces), and gold attached to the second does
+    not supersede the heuristic on the first. This test builds exactly that case, so it exercises
+    the explicit subject-level exclusion rather than passing for free on supersession.
+
+    Verified by mutation: removing the `sr in gold` guard makes this fail."""
+    from core.active_learning import candidates
+    from core.loop import record_decision
+    s = Store(_fresh_db())
+
+    # heuristic on decision A
+    record_decision(s, "sub1", module="motive", features={"a": 1},
+                    heuristic_labels=[{"space": "intent", "key": "motive",
+                                       "value": "survival", "confidence": 0.3}],
+                    decision_id="dec:sub1")
+    # a second decision for the SAME subject, and gold attaches to that one
+    record_decision(s, "sub1", module="model", features={"a": 1}, decision_id="replay:sub1")
+    s.add_label("intent", "motive", "organized_malicious", source="analyst", confidence=0.9,
+                decision_id="replay:sub1", subject_ref="sub1")
+
+    # the heuristic label is still CURRENT (supersession missed it) ...
+    assert len(s.labels_for_target("intent", "motive", sources=["heuristic"])) == 1
+    # ... but the subject must not be queued, because a human already answered
+    assert [c["subject_ref"] for c in candidates(s, "intent", "motive")] == []
+
+    # and the ordinary path (supersession) still drops adjudicated cases too
+    s2 = Store(_fresh_db())
+    _seed_al_cohort(s2, n=10, gold=4)
+    subs = {c["subject_ref"] for c in candidates(s2, "intent", "motive")}
+    assert len(subs) == 6 and not any(x in subs for x in ("al0", "al1", "al2", "al3"))
+    s2.close()
+    s.close()
+
+
+def test_active_learning_cold_start_spreads_across_classes():
+    """With too little gold to train, ranking by 'uncertainty' would rank noise. Breadth first:
+    you cannot measure agreement on a class you have no examples of."""
+    from core.active_learning import rank
+    s = Store(_fresh_db())
+    _seed_al_cohort(s, n=60, gold=0)
+    r = rank(s, "intent", "motive", limit=6)
+    assert r["phase"] == "cold_start"
+    exploit = [q for q in r["queue"] if q["selection"] == "exploit"]
+    # the first few exploit picks should cover distinct classes, not repeat one
+    assert len({q["heuristic"] for q in exploit[:3]}) == 3
+    assert "class coverage" in exploit[0]["why"]
+    s.close()
+
+
+def test_active_learning_switches_to_uncertainty_once_trainable():
+    """With enough gold, rank by the model's entropy: the cases it is least sure about are the
+    ones a human answer most changes."""
+    from core.active_learning import rank
+    s = Store(_fresh_db())
+    _seed_al_cohort(s, n=120, gold=40)
+    r = rank(s, "intent", "motive", limit=10)
+    assert r["phase"] == "uncertainty"
+    exploit = [q for q in r["queue"] if q["selection"] == "exploit"]
+    assert len(exploit) >= 2
+    scores = [q["uncertainty"] for q in exploit]
+    assert scores == sorted(scores, reverse=True)          # most uncertain first
+    assert all(0.0 <= x <= 1.0 for x in scores)            # normalised entropy
+    s.close()
+
+
+def test_active_learning_reserves_a_representative_slice():
+    """Pure uncertainty sampling collapses the labelled set onto the decision boundary, which is
+    the same censoring failure the holdout exists to prevent. A fixed share of the queue is
+    drawn independently of the model."""
+    from core.active_learning import rank
+    s = Store(_fresh_db())
+    _seed_al_cohort(s, n=120, gold=40)
+    r = rank(s, "intent", "motive", limit=12, explore_frac=0.25)
+    kinds = {q["selection"] for q in r["queue"]}
+    assert "explore" in kinds and "exploit" in kinds
+    ex = [q for q in r["queue"] if q["selection"] == "explore"]
+    assert all(q["uncertainty"] is None for q in ex)       # not model-selected
+    assert "representative" in ex[0]["why"]
+    s.close()
+
+
+def test_active_learning_stops_asking_once_the_gate_is_satisfied():
+    from core.active_learning import rank
+    s = Store(_fresh_db())
+    _seed_al_cohort(s, n=200, gold=120)                    # well past MIN_GOLD / MIN_PAIRED
+    r = rank(s, "intent", "motive", limit=5)
+    assert r["phase"] == "satisfied"
+    assert r["queue"] == []
+    assert "cleared the gate" in r["reading"]
+    s.close()
+
+
+def test_next_questions_focuses_the_target_furthest_from_the_line():
+    """Partial progress on four targets is worth less than one target actually crossing."""
+    from core.active_learning import next_questions
+    s = Store(_fresh_db())
+    _seed_al_cohort(s, n=60, gold=0)                       # only motive has candidates
+    r = next_questions(s, limit=5)
+    assert r["focus"] == "intent.motive"
+    assert r["queue"]
+    assert "furthest" in r["reading"]
+    s.close()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
