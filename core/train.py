@@ -7,11 +7,25 @@ itself and answers the decisive question: does a model trained on the point-in-t
 actually BEAT the heuristic on held-out gold labels? A rule should only be replaced once the
 answer is yes.
 
-Deliberately dependency-free: a compact categorical Naive-Bayes classifier with Laplace
-smoothing, features median-binned from the decision snapshots. It runs under any Python, stays
-inside the concept's self-contained substrate, and (unlike a single-signal rule) uses every
-feature, so it can recover a subpopulation a hand-rule systematically misses. Reads
-(features, label) rows from store.training_rows and the heuristic baseline from label history.
+Two classifiers, both dependency-free, both over the same median-binned features:
+
+  naive_bayes  a compact categorical NB with Laplace smoothing. Simple and fast, but it assumes
+               the features are conditionally independent given the class. REDWING's features
+               are not: the velocity family (velocity_1h / 4h / 24h / 7d / 30d) moves together
+               almost by construction, so a single burst is counted as several independent
+               pieces of evidence and NB is driven to overconfident probabilities. Its accuracy
+               can look fine while its calibration is bad, which is dangerous for a model whose
+               whole job is a graduation verdict.
+
+  logreg       multinomial logistic regression, gradient descent, L2-regularised. It learns the
+               feature weights JOINTLY, so it splits the credit across correlated features
+               instead of multiplying it. On this feature set that makes it better calibrated,
+               which is the property that matters here. Still pure Python, still no ML deps.
+
+The default is logreg for exactly that reason. `train_target(..., model="naive_bayes")` keeps
+the old classifier, and `compare_calibration()` measures the difference rather than asserting
+it: on a cohort with duplicated (correlated) signals NB's log-loss blows up while its accuracy
+barely moves, which is the overconfidence made visible.
 
 HONESTY: the numbers this returns are only as real as the labels in the store. On a synthetic
 seeded cohort (core/seed_substrate.py) they are SYNTHETIC and demonstrate the mechanism only; a
@@ -86,6 +100,123 @@ def _nb_predict(model: dict, xi: dict):
     return best
 
 
+# -- Logistic regression (multinomial, gradient descent, pure Python) ----------
+#
+# The discretised feature dicts (key -> "hi"/"lo"/category) are one-hot encoded into a sparse
+# index. Multinomial LR then learns one weight per (feature, class) plus a bias, jointly, so
+# two correlated features share the credit for their common signal instead of each claiming it
+# in full the way NB does. That joint fit is the whole reason it stays calibrated where NB does
+# not. No numpy: the substrate is small (hundreds of rows) and staying stdlib is the point.
+
+def _feature_index(vecs) -> dict:
+    """Map each (key, value) seen in training to a column. Values unseen at train time are
+    simply absent at predict time, which is the correct behaviour: an unknown category carries
+    no learned weight rather than a guessed one."""
+    idx = {}
+    for v in vecs:
+        for k, val in v.items():
+            key = (k, val)
+            if key not in idx:
+                idx[key] = len(idx)
+    return idx
+
+
+def _sparse(vec: dict, index: dict) -> list:
+    """Column indices this example activates (one-hot; absent keys contribute nothing)."""
+    out = []
+    for k, val in vec.items():
+        j = index.get((k, val))
+        if j is not None:
+            out.append(j)
+    return out
+
+
+def _softmax(scores) -> list:
+    m = max(scores)
+    exps = [math.exp(s - m) for s in scores]
+    z = sum(exps) or 1.0
+    return [e / z for e in exps]
+
+
+def _lr_train(vecs, y, classes, *, epochs: int = 300, lr: float = 0.5,
+              l2: float = 1.0) -> dict:
+    """Multinomial logistic regression by full-batch gradient descent with L2.
+
+    L2 matters here beyond the usual overfitting story: on perfectly correlated features it
+    spreads the weight evenly across the duplicates instead of letting one absorb it all, which
+    is exactly the joint behaviour NB lacks."""
+    index = _feature_index(vecs)
+    n_feat, n_cls = len(index), len(classes)
+    cidx = {c: i for i, c in enumerate(classes)}
+    rows = [(_sparse(v, index), cidx[t]) for v, t in zip(vecs, y)]
+
+    # weights[class][feature], bias[class]
+    W = [[0.0] * n_feat for _ in range(n_cls)]
+    b = [0.0] * n_cls
+    n = len(rows) or 1
+
+    for _ in range(epochs):
+        gW = [[0.0] * n_feat for _ in range(n_cls)]
+        gb = [0.0] * n_cls
+        for cols, ti in rows:
+            scores = [b[c] + sum(W[c][j] for j in cols) for c in range(n_cls)]
+            probs = _softmax(scores)
+            for c in range(n_cls):
+                err = probs[c] - (1.0 if c == ti else 0.0)
+                gb[c] += err
+                for j in cols:
+                    gW[c][j] += err
+        for c in range(n_cls):
+            b[c] -= lr * gb[c] / n
+            for j in range(n_feat):
+                # L2 gradient (bias is not regularised, by convention)
+                W[c][j] -= lr * (gW[c][j] / n + l2 * W[c][j] / n)
+
+    return {"classes": classes, "index": index, "W": W, "b": b, "cidx": cidx}
+
+
+def _lr_proba(model: dict, vec: dict) -> dict:
+    cols = _sparse(vec, model["index"])
+    scores = [model["b"][i] + sum(model["W"][i][j] for j in cols)
+              for i in range(len(model["classes"]))]
+    probs = _softmax(scores)
+    return {c: probs[i] for i, c in enumerate(model["classes"])}
+
+
+def _lr_predict(model: dict, vec: dict):
+    proba = _lr_proba(model, vec)
+    return max(proba, key=proba.get)
+
+
+def _nb_proba(model: dict, xi: dict) -> dict:
+    """NB class posteriors, normalised. Used to measure calibration, not just the argmax."""
+    classes, n = model["classes"], model["n"]
+    logp = {}
+    for c in classes:
+        lp = math.log((model["class_count"][c] + 1) / (n + len(classes)))
+        total = model["class_count"][c]
+        for k, val in xi.items():
+            card = len(model["feat_vals"].get(k, [val])) or 1
+            cnt = model["feat_count"][c][k].get(val, 0)
+            lp += math.log((cnt + 1) / (total + card))
+        logp[c] = lp
+    m = max(logp.values())
+    exps = {c: math.exp(lp - m) for c, lp in logp.items()}
+    z = sum(exps.values()) or 1.0
+    return {c: e / z for c, e in exps.items()}
+
+
+def _log_loss(proba_fn, vecs, y, classes) -> float:
+    """Mean cross-entropy of the predicted class distribution against the truth. This is the
+    number that exposes overconfidence: a model that is confidently wrong is punished far
+    harder than one that is uncertainly wrong, which accuracy cannot see."""
+    eps, total = 1e-15, 0.0
+    for v, t in zip(vecs, y):
+        p = proba_fn(v).get(t, 0.0)
+        total += -math.log(min(1.0, max(eps, p)))
+    return round(total / (len(y) or 1), 4)
+
+
 def _split(subject_ref: str, test_frac: float, seed: str) -> bool:
     """Deterministic train/test assignment: True = test. Hash-based so the split is stable and
     reproducible across runs and cannot drift between train and evaluate."""
@@ -107,11 +238,16 @@ def _prf(pairs, positive: str) -> dict:
 
 def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOURCES,
                  test_frac: float = 0.3, min_rows: int = 40, seed: str = "redwing-train",
-                 observed_only: bool = False, positive_label: str = "") -> dict:
+                 observed_only: bool = False, positive_label: str = "",
+                 model: str = "logreg") -> dict:
     """Train a model on gold labels for one target and compare it to the heuristic on a held-out
     test split. Returns model vs heuristic accuracy and whether the model beats the rule. Set
     `observed_only=True` for OUTCOME targets to train on uncensored (allowed) decisions only,
     so the model is not fit on labels the analyst inferred for cases we blocked.
+
+    `model` is "logreg" (default) or "naive_bayes". Logreg fits feature weights jointly and so
+    stays calibrated on REDWING's correlated features (the velocity family); NB assumes
+    independence and grows overconfident on them. Both are pure Python.
 
     `positive_label` matters when the target is rare. Accuracy is the right comparison for a
     roughly balanced target like intent.motive, and a useless one for outcome.is_fraud at a
@@ -136,14 +272,29 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
                 "reason": f"split too small (train {len(train)}, test {len(test)})"}
 
     keys, medians = _prepare(train)
-    model = _nb_train([_vec(r["features"], keys, medians) for r in train],
-                      [r["label"] for r in train])
+    tr_vecs = [_vec(r["features"], keys, medians) for r in train]
+    tr_y = [r["label"] for r in train]
+    classes = sorted(set(tr_y))
+
+    if model == "naive_bayes":
+        nb = _nb_train(tr_vecs, tr_y)
+        predict = lambda v: _nb_predict(nb, v)
+        proba = lambda v: _nb_proba(nb, v)
+    else:
+        model = "logreg"
+        lr = _lr_train(tr_vecs, tr_y, classes)
+        predict = lambda v: _lr_predict(lr, v)
+        proba = lambda v: _lr_proba(lr, v)
+
+    te_vecs = [_vec(r["features"], keys, medians) for r in test]
+    te_y = [r["label"] for r in test]
+    log_loss = _log_loss(proba, te_vecs, te_y, classes)
 
     m_correct = h_correct = h_evaluable = 0
     m_pairs, h_pairs = [], []
-    for r in test:
+    for r, v in zip(test, te_vecs):
         gold = r["label"]
-        pred = _nb_predict(model, _vec(r["features"], keys, medians))
+        pred = predict(v)
         m_pairs.append((pred, gold))
         if pred == gold:
             m_correct += 1
@@ -159,11 +310,13 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
     out = {
         "target": f"{label_space}.{label_key}",
         "trained": True,
+        "classifier": model,               # "logreg" | "naive_bayes"
         "n_train": len(train),
         "n_test": len(test),
-        "classes": model["classes"],
+        "classes": classes,
         "model_accuracy": m_acc,
         "heuristic_accuracy": h_acc,
+        "model_log_loss": log_loss,        # calibration: lower is better, exposes overconfidence
     }
 
     if positive_label:
@@ -194,3 +347,32 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
                     else "no heuristic baseline on the test split to compare against"),
     })
     return out
+
+
+def compare_calibration(store, label_space: str, label_key: str, **kw) -> dict:
+    """Train both classifiers on the same target and split, and report the difference the way
+    it actually shows up: not in accuracy, which can be near-identical, but in calibration.
+
+    On REDWING's correlated features NB's log-loss runs well above logreg's while its accuracy
+    barely moves. That gap is the overconfidence, quantified. Returned as measurement, not
+    assertion; if the gap is small on a given cohort, that is what it will say."""
+    nb = train_target(store, label_space, label_key, model="naive_bayes", **kw)
+    lr = train_target(store, label_space, label_key, model="logreg", **kw)
+    if not (nb.get("trained") and lr.get("trained")):
+        return {"trained": False, "reason": nb.get("reason") or lr.get("reason")}
+
+    nb_ll, lr_ll = nb["model_log_loss"], lr["model_log_loss"]
+    return {
+        "target": f"{label_space}.{label_key}",
+        "naive_bayes": {"accuracy": nb["model_accuracy"], "log_loss": nb_ll},
+        "logreg": {"accuracy": lr["model_accuracy"], "log_loss": lr_ll},
+        "log_loss_improvement": round(nb_ll - lr_ll, 4),
+        "reading": (
+            f"logreg is better calibrated: log-loss {lr_ll} vs {nb_ll} "
+            f"(accuracy {lr['model_accuracy']} vs {nb['model_accuracy']}). NB's independence "
+            f"assumption made it overconfident on the correlated features."
+            if lr_ll < nb_ll - 0.02 else
+            f"no meaningful calibration gap on this cohort: log-loss {lr_ll} vs {nb_ll}. "
+            f"The features here may not be correlated enough for NB's assumption to bite."
+        ),
+    }

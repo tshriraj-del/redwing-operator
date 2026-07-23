@@ -1257,6 +1257,85 @@ def test_trainer_refuses_without_enough_data():
     s.close()
 
 
+def _seed_correlated_cohort(s, n=400, seed=7, per_copy_noise=0.05, signal_strength=0.7):
+    """A cohort where one weakly-predictive signal is exposed as five near-identical copies -
+    a velocity family. The label follows the signal only `signal_strength` of the time, so a
+    calibrated model should be UNCERTAIN; NB, counting five copies as five votes, will not be."""
+    import random
+    from core.loop import record_decision
+    rng = random.Random(seed)
+    with s.batch():
+        for i in range(n):
+            burst = rng.random() < 0.5
+            label = "fraud" if (burst == (rng.random() < signal_strength)) else "legit"
+            feats = {}
+            for v in ("velocity_1h", "velocity_4h", "velocity_24h", "velocity_7d", "velocity_30d"):
+                flip = rng.random() < per_copy_noise
+                feats[v] = 0.9 if (burst ^ flip) else 0.1
+            record_decision(s, f"cc{i}", module="test", features=feats,
+                            heuristic_labels=[{"space": "outcome", "key": "is_fraud",
+                                               "value": label, "confidence": 0.3}],
+                            decision_id=f"dec:cc{i}")
+            s.add_label("outcome", "is_fraud", label, source="analyst", confidence=0.9,
+                        decision_id=f"dec:cc{i}", subject_ref=f"cc{i}")
+
+
+def test_logreg_is_better_calibrated_than_nb_on_correlated_features():
+    """The whole reason for the classifier swap, made measurable. On five redundant copies of a
+    weakly-predictive signal, accuracy is a near-tie but NB's log-loss is far worse: it counts
+    the correlated evidence multiple times and is confidently wrong on the minority outcomes.
+    Log-loss is the metric that sees this; accuracy cannot."""
+    from core.train import compare_calibration
+    s = Store(_fresh_db())
+    _seed_correlated_cohort(s)
+    cmp = compare_calibration(s, "outcome", "is_fraud", min_rows=40)
+    assert cmp.get("naive_bayes") and cmp.get("logreg")
+    # accuracy is a near tie (NB may even edge it), so this is not a story accuracy could tell
+    assert abs(cmp["naive_bayes"]["accuracy"] - cmp["logreg"]["accuracy"]) < 0.1
+    # but logreg's calibration is materially better
+    assert cmp["logreg"]["log_loss"] < cmp["naive_bayes"]["log_loss"]
+    assert cmp["log_loss_improvement"] > 0.1
+    assert "overconfident" in cmp["reading"]
+    s.close()
+
+
+def test_compare_calibration_reports_no_gap_when_features_are_not_correlated():
+    """The honesty guard: the comparison must not manufacture a difference. With an independent
+    single signal, NB's assumption holds and there is no calibration story to tell."""
+    import random
+    from core.loop import record_decision
+    from core.train import compare_calibration
+    s = Store(_fresh_db())
+    rng = random.Random(3)
+    with s.batch():
+        for i in range(300):
+            hot = rng.random() < 0.5
+            label = "fraud" if (hot == (rng.random() < 0.75)) else "legit"
+            record_decision(s, f"ind{i}", module="test", features={"single_signal": 0.9 if hot else 0.1},
+                            heuristic_labels=[{"space": "outcome", "key": "is_fraud",
+                                               "value": label, "confidence": 0.3}],
+                            decision_id=f"dec:ind{i}")
+            s.add_label("outcome", "is_fraud", label, source="analyst", confidence=0.9,
+                        decision_id=f"dec:ind{i}", subject_ref=f"ind{i}")
+    cmp = compare_calibration(s, "outcome", "is_fraud", min_rows=40)
+    assert cmp["log_loss_improvement"] < 0.1            # no meaningful gap to claim
+    assert "no meaningful calibration gap" in cmp["reading"]
+    s.close()
+
+
+def test_train_target_defaults_to_logreg_and_reports_classifier_and_calibration():
+    from core.train import train_target
+    s = Store(_fresh_db())
+    _seed_correlated_cohort(s)
+    default = train_target(s, "outcome", "is_fraud", min_rows=40)
+    assert default["classifier"] == "logreg"           # the new default
+    assert "model_log_loss" in default                 # calibration is now reported
+
+    nb = train_target(s, "outcome", "is_fraud", model="naive_bayes", min_rows=40)
+    assert nb["classifier"] == "naive_bayes"           # opt back in to the old one
+    s.close()
+
+
 def test_graduation_flags_a_rule_that_already_matches_humans():
     from core.loop import record_decision
     from core.graduation import evaluate_target
