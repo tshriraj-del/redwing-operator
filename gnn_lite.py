@@ -35,7 +35,7 @@ import pandas as pd
 
 # -- Cascade thresholds --------------------------------------------------------
 
-_BASE_FRAUD_RATE = 0.018   # dataset-level prior: 880K txns, 1.84% fraud
+_BASE_FRAUD_RATE = 0.0065  # dataset-level prior: 897K txns, 0.65% fraud (campaign ledger, v2)
 _TIER2_LO   = 0.35         # below this: Tier 1 confident clean → skip GNN
 _TIER2_HI   = 0.80         # above this: Tier 1 confident fraud → skip GNN
 _T1_WEIGHT  = 0.65
