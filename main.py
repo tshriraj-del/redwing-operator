@@ -439,6 +439,7 @@ async def start_autonomous_agent():
         loop = asyncio.get_event_loop()
         loop.run_in_executor(None, _get_consortium_index)
         loop.run_in_executor(None, lambda: backbone_graph(refresh=True))
+        loop.run_in_executor(None, _get_aiq_index)          # Authorization IQ network index
 
 
 async def _graph_refresh_loop() -> None:
@@ -1884,6 +1885,88 @@ def consortium_mules(epsilon: float = 1.0, limit: int = 20):
     mules = find_mules_in_index(idx, epsilon=epsilon, limit=limit)
     return {"threshold": ALERT_THRESHOLD, "epsilon": epsilon,
             "found": len(mules), "mules": mules, "index_recipients": len(idx)}
+
+
+# -- Authorization IQ ----------------------------------------------------------
+# The consortium made consumable at AUTHORIZATION TIME: the push-rail analog of Mastercard's
+# Authorization IQ (AQF) fields. Each insight carries its NETWORK DELTA - what the querying bank
+# gains over its own book - and the headline is the reveal: a mule below the local alert line
+# but above the network's. See core/authorization_iq.py.
+#
+# The index adds distinct-sender fan-in and per-rail amount norms to the cached consortium
+# index, all vectorised over the in-memory ledger (the pure core.authorization_iq.build_index is
+# the tested reference; this populates the same AIQIndex fields at ledger scale).
+
+_aiq_index = None
+_aiq_index_lock = _cthreading.Lock()
+
+
+def _get_aiq_index(force: bool = False):
+    global _aiq_index
+    if STORE is None:
+        return None
+    with _aiq_index_lock:
+        if _aiq_index is not None and not force:
+            return _aiq_index
+        from core.authorization_iq import AIQIndex
+        from core.consortium import institution_of
+        idx = AIQIndex()
+        idx.consortium_index = _get_consortium_index()
+        if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
+            d = df_all[["user_id", "recipient_id"]].dropna(subset=["recipient_id"]).copy()
+            d["rid"] = "recipient:" + d["recipient_id"].astype(str)
+            d["inst"] = d["user_id"].astype(str).map(institution_of)
+            idx.fanin = d.groupby("rid")["user_id"].nunique().astype(int).to_dict()
+            fbi: dict = {}
+            for (rid, inst), v in d.groupby(["rid", "inst"])["user_id"].nunique().items():
+                fbi.setdefault(rid, {})[inst] = int(v)
+            idx.fanin_by_inst = fbi
+            idx.recipient_tx = d.groupby("rid").size().astype(int).to_dict()
+            idx.network_tx_total = int(len(d))
+            rail_col = "payment_rail" if "payment_rail" in df_all.columns else "rail"
+            if rail_col in df_all.columns and "amount" in df_all.columns:
+                amt = pd.to_numeric(df_all["amount"], errors="coerce")
+                gg = (df_all.assign(_amt=amt).dropna(subset=["_amt"])
+                      .groupby(rail_col)["_amt"].agg(["count", "mean", "std"]))
+                for rail, r in gg.iterrows():
+                    idx.rail_norm[str(rail)] = {"n": int(r["count"]),
+                                                "mean": round(float(r["mean"]), 2),
+                                                "std": round(float(r["std"] or 0.0), 2)}
+        _aiq_index = idx
+        return _aiq_index
+
+
+@app.post("/authorization-iq")
+def authorization_iq(body: dict):
+    """Authorization-time network intelligence for one PUSH payment.
+
+    Body: {recipient_id, amount, rail, sender_id?, as_institution?, epsilon?}. Returns the
+    AQF-style insight pack: each field with its network delta, the composed network_risk, the
+    reason codes that fired, and whether the network REVEALS a payee the querying bank could not
+    have flagged from its own book. This is the signal a single bank on a push rail cannot
+    produce, delivered before the irrevocable payment settles."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    from core.authorization_iq import authorize
+    from core.consortium import INSTITUTIONS
+    rid = str(body.get("recipient_id") or "").strip()
+    if not rid:
+        raise HTTPException(400, "recipient_id is required")
+    if not rid.startswith("recipient:"):
+        rid = f"recipient:{rid}"
+    as_inst = body.get("as_institution")
+    if as_inst and as_inst not in INSTITUTIONS:
+        raise HTTPException(400, f"as_institution must be one of {list(INSTITUTIONS)}")
+    payment = {
+        "recipient": rid,
+        "sender": body.get("sender_id") or body.get("user_id"),
+        "amount": body.get("amount", 0.0),
+        "rail": body.get("rail") or body.get("payment_rail") or "unknown",
+    }
+    pack = authorize(payment, _get_aiq_index(),
+                     querying_institution=as_inst, epsilon=float(body.get("epsilon", 1.0)))
+    pack["recipient_id"] = rid
+    return pack
 
 
 # -- SyntheticID Ingest --------------------------------------------------------
