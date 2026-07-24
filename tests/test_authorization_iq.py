@@ -206,6 +206,55 @@ def test_clean_payment_adds_no_network_risk():
     assert "adds no risk" in pack["explanation"]
 
 
+# -- the scoring contract: how the network may move a live decision -------------
+#
+# These pin the rules _network_view enforces in main.py. They are expressed against the same
+# authorize() output that helper consumes, so they hold wherever it is wired.
+
+def _apply(local_score, pack):
+    """The escalate-only composition main.py._network_view applies."""
+    if pack.get("sufficient_evidence"):
+        return max(local_score, float(pack.get("network_risk") or 0.0))
+    return local_score
+
+
+def test_network_escalates_a_payment_the_local_model_would_have_missed():
+    """THE point of wiring this into scoring. A payment that looks ordinary to the local model
+    must still be raised when the network knows the payee is a mule - that lift is money the
+    bank would otherwise have sent."""
+    idx = A.build_index(_mule_edges())
+    pack = A.authorize({"sender": _senders_for("inst_neobank", 1, "v2")[0],
+                        "recipient": "recipient:CASH", "amount": 180.0, "rail": "card"}, idx,
+                       querying_institution="inst_neobank")
+    local = 0.20
+    assert _apply(local, pack) > local, "the network must be able to raise a missed payment"
+
+
+def test_network_never_lowers_a_score_the_local_book_earned():
+    """ESCALATE-ONLY. A clean network view must not talk the local model down off a signal it
+    found in its own data: the consortium adds evidence, it does not grant absolution."""
+    edges = [_edge("recipient:GOOD", s, fraud=0) for s in _senders_for("inst_neobank", 40, "g2")]
+    idx = A.build_index(edges)
+    pack = A.authorize({"sender": "user_probe9", "recipient": "recipient:GOOD",
+                        "amount": 100.0, "rail": "Zelle"}, idx,
+                       querying_institution="inst_neobank")
+    local = 0.93
+    assert _apply(local, pack) == local, "a clean network view must never reduce a local score"
+
+
+def test_thin_evidence_cannot_move_a_live_decision():
+    """Below the consortium's evidence floor the combined rate is noise. It may be reported,
+    but it must not move a real decision."""
+    edges = [_edge("recipient:THIN2", _senders_for("inst_neobank", 1, "x1")[0], fraud=1),
+             _edge("recipient:THIN2", _senders_for("inst_crypto", 1, "x2")[0], fraud=1)]
+    idx = A.build_index(edges)
+    pack = A.authorize({"sender": "user_s", "recipient": "recipient:THIN2",
+                        "amount": 5000.0, "rail": "wire"}, idx)
+    assert not pack["sufficient_evidence"]
+    local = 0.10
+    assert _apply(local, pack) == local, "noise must not escalate a live decision"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0

@@ -267,6 +267,36 @@ def ml_score_row(features: dict) -> float:
     return float(xgb.predict_proba(X_scaled)[0][1])
 
 
+def _network_view(row: dict, local_score: float):
+    """Authorization IQ applied to one payment: returns (pack_or_None, score_after_network).
+
+    Shared by every scoring path so the network layer cannot drift between them.
+
+    Two rules, both deliberate:
+      ESCALATE ONLY. The network may raise a score the local book had no reason to raise -
+      that is the entire reveal - but a clean network view must never talk the local model DOWN
+      off a signal it found in its own data. max(), not a blend.
+      EVIDENCE FLOOR. Below the consortium's floor the combined rate is noise, so the network
+      stays silent rather than moving a real decision on it.
+    Returns the local score unchanged if the index is still warming, so scoring never blocks.
+    """
+    if _aiq_index is None or not row.get("recipient_id"):
+        return None, local_score
+    try:
+        from core.authorization_iq import authorize as _aiq_authorize
+        rid = str(row["recipient_id"])
+        pack = _aiq_authorize(
+            {"recipient": rid if rid.startswith("recipient:") else f"recipient:{rid}",
+             "sender": row.get("user_id"), "amount": row.get("amount", 0.0),
+             "rail": row.get("payment_rail", "card")},
+            _aiq_index)
+        if pack.get("sufficient_evidence"):
+            return pack, max(local_score, float(pack.get("network_risk") or 0.0))
+        return pack, local_score
+    except Exception:
+        return None, local_score      # the network layer must never fail a score
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -289,7 +319,20 @@ def build_event(row) -> dict:
     else:
         cascade_score = c_score
 
-    alert = is_alert(cascade_score) or bool(row.get("is_fraud", False))
+    # -- Tier 4: Authorization IQ - the CROSS-INSTITUTION network view ---------
+    # The tiers above are all computed from this institution's own book. On a push rail that is
+    # structurally insufficient: the victim's bank sees an ordinary outgoing payment and the
+    # mule's bank sees an ordinary inbound, so the mule is only visible in the aggregate. This
+    # adds the consortium's view of the payee at authorization time.
+    #
+    # It ESCALATES, never de-escalates: the network can raise a score the local book had no
+    # reason to raise (that is the whole reveal), but a clean network view must never talk the
+    # local model DOWN off a signal it found in its own data. And the contribution is reported
+    # separately rather than silently folded in, so an analyst can always see how much of a
+    # score came from outside their own institution.
+    aiq, network_score = _network_view(row, cascade_score)
+
+    alert = is_alert(network_score) or bool(row.get("is_fraud", False))
 
     # -- Tier 3: offline graph context (O(1) lookup) ---------------------------
     graph_ctx = graph_features.get_features(
@@ -314,7 +357,14 @@ def build_event(row) -> dict:
         "tier1_score":       round(c_score, 4),
         "tier2_gnn_score":   round(gnn_result.score, 4) if gnn_result else None,
         "tier2_invoked":     gnn_result is not None,
-        "combined_score":    round(cascade_score, 4),
+        "local_score":       round(cascade_score, 4),      # this institution's own book alone
+        "combined_score":    round(network_score, 4),      # after the network view
+        # Authorization IQ, reported separately so the network's contribution is never hidden
+        # inside the headline number. network_lift > 0 means the consortium raised this score.
+        "network_risk":      round(float(aiq["network_risk"]), 4) if aiq else None,
+        "network_lift":      round(network_score - cascade_score, 4),
+        "network_reveal":    bool(aiq.get("network_reveal")) if aiq else False,
+        "network_codes":     [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":          alert,
         "matched_signals":   top["matched_signals"] if top else [],
         "graph_context":     graph_ctx,
@@ -573,6 +623,10 @@ def score(body: dict):
     top      = matches[0] if matches else None
     c_score  = combined_score(ml, top["confidence"]) if top else ml
 
+    # Tier 4: the cross-institution network view (see _network_view). Escalate-only, and
+    # reported separately below so the network's contribution is never hidden in the headline.
+    aiq, net_score = _network_view(body, c_score)
+
     transaction_id = str(body.get("transaction_id", f"txn_{uuid.uuid4().hex[:8]}"))
     explanation = _xai_explain(
         features       = features,
@@ -586,7 +640,7 @@ def score(body: dict):
         transaction_id = transaction_id,
     )
 
-    alert = is_alert(c_score)
+    alert = is_alert(net_score)
 
     # Training substrate: this endpoint is the what-if / sandbox path (the UI scores ad-hoc
     # transactions through it), so nothing here is enforced against a real customer. It is
@@ -616,7 +670,14 @@ def score(body: dict):
     return {
         "transaction_id": transaction_id,
         "ml_score":       round(ml, 4),
-        "combined_score": round(c_score, 4),
+        "local_score":    round(c_score, 4),        # this institution's own book alone
+        "combined_score": round(net_score, 4),      # after the cross-institution network view
+        # Authorization IQ, reported separately: network_lift > 0 means the consortium raised
+        # this score above anything the local book could justify on its own.
+        "network_risk":   round(float(aiq["network_risk"]), 4) if aiq else None,
+        "network_lift":   round(net_score - c_score, 4),
+        "network_reveal": bool(aiq.get("network_reveal")) if aiq else False,
+        "network_codes":  [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":       alert,
         "top_pattern":    top,
         "all_patterns":   matches,
@@ -1838,16 +1899,27 @@ def _get_consortium_index(force: bool = False):
             g = d.groupby(["rid", "inst"])["is_fraud"].agg(cnt="count", frd="sum")
             for (rid, inst), r in g.iterrows():
                 idx.setdefault(rid, {k: [0, 0] for k in INSTITUTIONS})[inst] = [int(r.cnt), int(r.frd)]
-        # overlay: store-only recipients not present in the ledger (injected/demo)
+        # overlay: store-only recipients not present in the ledger (injected/demo).
+        #
+        # ONE streaming pass over all transaction edges, not a per-recipient JOIN. Measured on
+        # the real backbone the per-recipient JOIN costs ~25ms cold, and there are ~6.1k
+        # recipient entities, so the N+1 version spent ~150s building this index - which is the
+        # whole reason the first request after boot took a minute. The single pass does the same
+        # work in ~35s and, more importantly, is O(edges) instead of O(recipients x JOIN).
+        #
+        # Only recipients the ledger did NOT already cover are written, so the vectorised
+        # groupby above stays authoritative and this cannot change an existing count.
         try:
-            for ent in STORE.entities_by_type("recipient", limit=100000):
-                if ent.entity_id in idx:
-                    continue
-                counts = {k: [0, 0] for k in INSTITUTIONS}
-                for uid, fr in STORE.recipient_sender_labels(ent.entity_id):
-                    c = counts[institution_of(uid)]; c[0] += 1; c[1] += int(fr)
+            overlay: dict = {}
+            for recip, usr, fr in STORE.all_transaction_edges():
+                if recip in idx:
+                    continue                      # the ledger already has this payee
+                c = overlay.setdefault(recip, {k: [0, 0] for k in INSTITUTIONS})[institution_of(usr)]
+                c[0] += 1
+                c[1] += int(fr)
+            for rid, counts in overlay.items():
                 if any(c[0] for c in counts.values()):
-                    idx[ent.entity_id] = counts
+                    idx[rid] = counts
         except Exception:
             pass
         _consortium_index = idx
@@ -1962,6 +2034,13 @@ def authorization_iq(body: dict):
         raise HTTPException(400, "recipient_id is required")
     if not rid.startswith("recipient:"):
         rid = f"recipient:{rid}"
+    # The network index is warmed in the background at startup and takes ~35s over 881k edges.
+    # A request that arrives during the warm must NOT block on the lock for half a minute: say
+    # so immediately and let the caller retry or fall back. 503 + Retry-After is the honest
+    # answer to "not ready yet"; silently waiting looks like a hung endpoint.
+    if _aiq_index is None:
+        raise HTTPException(503, "Authorization IQ network index is still warming; retry shortly.",
+                            headers={"Retry-After": "20"})
     as_inst = body.get("as_institution")
     if as_inst and as_inst not in INSTITUTIONS:
         raise HTTPException(400, f"as_institution must be one of {list(INSTITUTIONS)}")
