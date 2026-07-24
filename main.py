@@ -1830,7 +1830,10 @@ def _get_consortium_index(force: bool = False):
         if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
             d = df_all[["user_id", "recipient_id", "is_fraud"]].dropna(subset=["recipient_id"]).copy()
             d["is_fraud"] = pd.to_numeric(d["is_fraud"], errors="coerce").fillna(0).astype(int)
-            d["inst"] = d["user_id"].astype(str).map(institution_of)
+            # hash each of the ~1.4k users once, not once per row (see _get_aiq_index)
+            _u = d["user_id"].astype(str)
+            _im = {u: institution_of(u) for u in _u.unique()}
+            d["inst"] = _u.map(_im)
             d["rid"]  = "recipient:" + d["recipient_id"].astype(str)
             g = d.groupby(["rid", "inst"])["is_fraud"].agg(cnt="count", frd="sum")
             for (rid, inst), r in g.iterrows():
@@ -1915,7 +1918,12 @@ def _get_aiq_index(force: bool = False):
         if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
             d = df_all[["user_id", "recipient_id"]].dropna(subset=["recipient_id"]).copy()
             d["rid"] = "recipient:" + d["recipient_id"].astype(str)
-            d["inst"] = d["user_id"].astype(str).map(institution_of)
+            # institution depends ONLY on user_id and there are ~1.4k users, so hash each user
+            # ONCE, not per row: .map(institution_of) over 897k rows is 897k sha256 calls (~50s);
+            # mapping the unique users first makes it ~1.4k.
+            uids = d["user_id"].astype(str)
+            inst_map = {u: institution_of(u) for u in uids.unique()}
+            d["inst"] = uids.map(inst_map)
             idx.fanin = d.groupby("rid")["user_id"].nunique().astype(int).to_dict()
             fbi: dict = {}
             for (rid, inst), v in d.groupby(["rid", "inst"])["user_id"].nunique().items():
