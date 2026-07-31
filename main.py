@@ -267,6 +267,36 @@ def ml_score_row(features: dict) -> float:
     return float(xgb.predict_proba(X_scaled)[0][1])
 
 
+def _network_view(row: dict, local_score: float):
+    """Authorization IQ applied to one payment: returns (pack_or_None, score_after_network).
+
+    Shared by every scoring path so the network layer cannot drift between them.
+
+    Two rules, both deliberate:
+      ESCALATE ONLY. The network may raise a score the local book had no reason to raise -
+      that is the entire reveal - but a clean network view must never talk the local model DOWN
+      off a signal it found in its own data. max(), not a blend.
+      EVIDENCE FLOOR. Below the consortium's floor the combined rate is noise, so the network
+      stays silent rather than moving a real decision on it.
+    Returns the local score unchanged if the index is still warming, so scoring never blocks.
+    """
+    if _aiq_index is None or not row.get("recipient_id"):
+        return None, local_score
+    try:
+        from core.authorization_iq import authorize as _aiq_authorize
+        rid = str(row["recipient_id"])
+        pack = _aiq_authorize(
+            {"recipient": rid if rid.startswith("recipient:") else f"recipient:{rid}",
+             "sender": row.get("user_id"), "amount": row.get("amount", 0.0),
+             "rail": row.get("payment_rail", "card")},
+            _aiq_index)
+        if pack.get("sufficient_evidence"):
+            return pack, max(local_score, float(pack.get("network_risk") or 0.0))
+        return pack, local_score
+    except Exception:
+        return None, local_score      # the network layer must never fail a score
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -289,7 +319,20 @@ def build_event(row) -> dict:
     else:
         cascade_score = c_score
 
-    alert = is_alert(cascade_score) or bool(row.get("is_fraud", False))
+    # -- Tier 4: Authorization IQ - the CROSS-INSTITUTION network view ---------
+    # The tiers above are all computed from this institution's own book. On a push rail that is
+    # structurally insufficient: the victim's bank sees an ordinary outgoing payment and the
+    # mule's bank sees an ordinary inbound, so the mule is only visible in the aggregate. This
+    # adds the consortium's view of the payee at authorization time.
+    #
+    # It ESCALATES, never de-escalates: the network can raise a score the local book had no
+    # reason to raise (that is the whole reveal), but a clean network view must never talk the
+    # local model DOWN off a signal it found in its own data. And the contribution is reported
+    # separately rather than silently folded in, so an analyst can always see how much of a
+    # score came from outside their own institution.
+    aiq, network_score = _network_view(row, cascade_score)
+
+    alert = is_alert(network_score) or bool(row.get("is_fraud", False))
 
     # -- Tier 3: offline graph context (O(1) lookup) ---------------------------
     graph_ctx = graph_features.get_features(
@@ -314,7 +357,14 @@ def build_event(row) -> dict:
         "tier1_score":       round(c_score, 4),
         "tier2_gnn_score":   round(gnn_result.score, 4) if gnn_result else None,
         "tier2_invoked":     gnn_result is not None,
-        "combined_score":    round(cascade_score, 4),
+        "local_score":       round(cascade_score, 4),      # this institution's own book alone
+        "combined_score":    round(network_score, 4),      # after the network view
+        # Authorization IQ, reported separately so the network's contribution is never hidden
+        # inside the headline number. network_lift > 0 means the consortium raised this score.
+        "network_risk":      round(float(aiq["network_risk"]), 4) if aiq else None,
+        "network_lift":      round(network_score - cascade_score, 4),
+        "network_reveal":    bool(aiq.get("network_reveal")) if aiq else False,
+        "network_codes":     [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":          alert,
         "matched_signals":   top["matched_signals"] if top else [],
         "graph_context":     graph_ctx,
@@ -439,6 +489,7 @@ async def start_autonomous_agent():
         loop = asyncio.get_event_loop()
         loop.run_in_executor(None, _get_consortium_index)
         loop.run_in_executor(None, lambda: backbone_graph(refresh=True))
+        loop.run_in_executor(None, _get_aiq_index)          # Authorization IQ network index
 
 
 async def _graph_refresh_loop() -> None:
@@ -572,6 +623,10 @@ def score(body: dict):
     top      = matches[0] if matches else None
     c_score  = combined_score(ml, top["confidence"]) if top else ml
 
+    # Tier 4: the cross-institution network view (see _network_view). Escalate-only, and
+    # reported separately below so the network's contribution is never hidden in the headline.
+    aiq, net_score = _network_view(body, c_score)
+
     transaction_id = str(body.get("transaction_id", f"txn_{uuid.uuid4().hex[:8]}"))
     explanation = _xai_explain(
         features       = features,
@@ -585,7 +640,7 @@ def score(body: dict):
         transaction_id = transaction_id,
     )
 
-    alert = is_alert(c_score)
+    alert = is_alert(net_score)
 
     # Training substrate: this endpoint is the what-if / sandbox path (the UI scores ad-hoc
     # transactions through it), so nothing here is enforced against a real customer. It is
@@ -615,7 +670,14 @@ def score(body: dict):
     return {
         "transaction_id": transaction_id,
         "ml_score":       round(ml, 4),
-        "combined_score": round(c_score, 4),
+        "local_score":    round(c_score, 4),        # this institution's own book alone
+        "combined_score": round(net_score, 4),      # after the cross-institution network view
+        # Authorization IQ, reported separately: network_lift > 0 means the consortium raised
+        # this score above anything the local book could justify on its own.
+        "network_risk":   round(float(aiq["network_risk"]), 4) if aiq else None,
+        "network_lift":   round(net_score - c_score, 4),
+        "network_reveal": bool(aiq.get("network_reveal")) if aiq else False,
+        "network_codes":  [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":       alert,
         "top_pattern":    top,
         "all_patterns":   matches,
@@ -1829,21 +1891,35 @@ def _get_consortium_index(force: bool = False):
         if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
             d = df_all[["user_id", "recipient_id", "is_fraud"]].dropna(subset=["recipient_id"]).copy()
             d["is_fraud"] = pd.to_numeric(d["is_fraud"], errors="coerce").fillna(0).astype(int)
-            d["inst"] = d["user_id"].astype(str).map(institution_of)
+            # hash each of the ~1.4k users once, not once per row (see _get_aiq_index)
+            _u = d["user_id"].astype(str)
+            _im = {u: institution_of(u) for u in _u.unique()}
+            d["inst"] = _u.map(_im)
             d["rid"]  = "recipient:" + d["recipient_id"].astype(str)
             g = d.groupby(["rid", "inst"])["is_fraud"].agg(cnt="count", frd="sum")
             for (rid, inst), r in g.iterrows():
                 idx.setdefault(rid, {k: [0, 0] for k in INSTITUTIONS})[inst] = [int(r.cnt), int(r.frd)]
-        # overlay: store-only recipients not present in the ledger (injected/demo)
+        # overlay: store-only recipients not present in the ledger (injected/demo).
+        #
+        # ONE streaming pass over all transaction edges, not a per-recipient JOIN. Measured on
+        # the real backbone the per-recipient JOIN costs ~25ms cold, and there are ~6.1k
+        # recipient entities, so the N+1 version spent ~150s building this index - which is the
+        # whole reason the first request after boot took a minute. The single pass does the same
+        # work in ~35s and, more importantly, is O(edges) instead of O(recipients x JOIN).
+        #
+        # Only recipients the ledger did NOT already cover are written, so the vectorised
+        # groupby above stays authoritative and this cannot change an existing count.
         try:
-            for ent in STORE.entities_by_type("recipient", limit=100000):
-                if ent.entity_id in idx:
-                    continue
-                counts = {k: [0, 0] for k in INSTITUTIONS}
-                for uid, fr in STORE.recipient_sender_labels(ent.entity_id):
-                    c = counts[institution_of(uid)]; c[0] += 1; c[1] += int(fr)
+            overlay: dict = {}
+            for recip, usr, fr in STORE.all_transaction_edges():
+                if recip in idx:
+                    continue                      # the ledger already has this payee
+                c = overlay.setdefault(recip, {k: [0, 0] for k in INSTITUTIONS})[institution_of(usr)]
+                c[0] += 1
+                c[1] += int(fr)
+            for rid, counts in overlay.items():
                 if any(c[0] for c in counts.values()):
-                    idx[ent.entity_id] = counts
+                    idx[rid] = counts
         except Exception:
             pass
         _consortium_index = idx
@@ -1884,6 +1960,100 @@ def consortium_mules(epsilon: float = 1.0, limit: int = 20):
     mules = find_mules_in_index(idx, epsilon=epsilon, limit=limit)
     return {"threshold": ALERT_THRESHOLD, "epsilon": epsilon,
             "found": len(mules), "mules": mules, "index_recipients": len(idx)}
+
+
+# -- Authorization IQ ----------------------------------------------------------
+# The consortium made consumable at AUTHORIZATION TIME: the push-rail analog of Mastercard's
+# Authorization IQ (AQF) fields. Each insight carries its NETWORK DELTA - what the querying bank
+# gains over its own book - and the headline is the reveal: a mule below the local alert line
+# but above the network's. See core/authorization_iq.py.
+#
+# The index adds distinct-sender fan-in and per-rail amount norms to the cached consortium
+# index, all vectorised over the in-memory ledger (the pure core.authorization_iq.build_index is
+# the tested reference; this populates the same AIQIndex fields at ledger scale).
+
+_aiq_index = None
+_aiq_index_lock = _cthreading.Lock()
+
+
+def _get_aiq_index(force: bool = False):
+    global _aiq_index
+    if STORE is None:
+        return None
+    with _aiq_index_lock:
+        if _aiq_index is not None and not force:
+            return _aiq_index
+        from core.authorization_iq import AIQIndex
+        from core.consortium import institution_of
+        idx = AIQIndex()
+        idx.consortium_index = _get_consortium_index()
+        if not df_all.empty and {"user_id", "recipient_id"}.issubset(df_all.columns):
+            d = df_all[["user_id", "recipient_id"]].dropna(subset=["recipient_id"]).copy()
+            d["rid"] = "recipient:" + d["recipient_id"].astype(str)
+            # institution depends ONLY on user_id and there are ~1.4k users, so hash each user
+            # ONCE, not per row: .map(institution_of) over 897k rows is 897k sha256 calls (~50s);
+            # mapping the unique users first makes it ~1.4k.
+            uids = d["user_id"].astype(str)
+            inst_map = {u: institution_of(u) for u in uids.unique()}
+            d["inst"] = uids.map(inst_map)
+            idx.fanin = d.groupby("rid")["user_id"].nunique().astype(int).to_dict()
+            fbi: dict = {}
+            for (rid, inst), v in d.groupby(["rid", "inst"])["user_id"].nunique().items():
+                fbi.setdefault(rid, {})[inst] = int(v)
+            idx.fanin_by_inst = fbi
+            idx.recipient_tx = d.groupby("rid").size().astype(int).to_dict()
+            idx.network_tx_total = int(len(d))
+            rail_col = "payment_rail" if "payment_rail" in df_all.columns else "rail"
+            if rail_col in df_all.columns and "amount" in df_all.columns:
+                amt = pd.to_numeric(df_all["amount"], errors="coerce")
+                gg = (df_all.assign(_amt=amt).dropna(subset=["_amt"])
+                      .groupby(rail_col)["_amt"].agg(["count", "mean", "std"]))
+                for rail, r in gg.iterrows():
+                    idx.rail_norm[str(rail)] = {"n": int(r["count"]),
+                                                "mean": round(float(r["mean"]), 2),
+                                                "std": round(float(r["std"] or 0.0), 2)}
+        _aiq_index = idx
+        return _aiq_index
+
+
+@app.post("/authorization-iq")
+def authorization_iq(body: dict):
+    """Authorization-time network intelligence for one PUSH payment.
+
+    Body: {recipient_id, amount, rail, sender_id?, as_institution?, epsilon?}. Returns the
+    AQF-style insight pack: each field with its network delta, the composed network_risk, the
+    reason codes that fired, and whether the network REVEALS a payee the querying bank could not
+    have flagged from its own book. This is the signal a single bank on a push rail cannot
+    produce, delivered before the irrevocable payment settles."""
+    if STORE is None:
+        raise HTTPException(503, "Backbone store not available.")
+    from core.authorization_iq import authorize
+    from core.consortium import INSTITUTIONS
+    rid = str(body.get("recipient_id") or "").strip()
+    if not rid:
+        raise HTTPException(400, "recipient_id is required")
+    if not rid.startswith("recipient:"):
+        rid = f"recipient:{rid}"
+    # The network index is warmed in the background at startup and takes ~35s over 881k edges.
+    # A request that arrives during the warm must NOT block on the lock for half a minute: say
+    # so immediately and let the caller retry or fall back. 503 + Retry-After is the honest
+    # answer to "not ready yet"; silently waiting looks like a hung endpoint.
+    if _aiq_index is None:
+        raise HTTPException(503, "Authorization IQ network index is still warming; retry shortly.",
+                            headers={"Retry-After": "20"})
+    as_inst = body.get("as_institution")
+    if as_inst and as_inst not in INSTITUTIONS:
+        raise HTTPException(400, f"as_institution must be one of {list(INSTITUTIONS)}")
+    payment = {
+        "recipient": rid,
+        "sender": body.get("sender_id") or body.get("user_id"),
+        "amount": body.get("amount", 0.0),
+        "rail": body.get("rail") or body.get("payment_rail") or "unknown",
+    }
+    pack = authorize(payment, _get_aiq_index(),
+                     querying_institution=as_inst, epsilon=float(body.get("epsilon", 1.0)))
+    pack["recipient_id"] = rid
+    return pack
 
 
 # -- SyntheticID Ingest --------------------------------------------------------

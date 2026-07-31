@@ -36,8 +36,8 @@ Generated `*.jsonl` sets are gitignored (regenerate via the build scripts).
 
 ## Honesty guardrails
 
-- Results are on an **880K-transaction synthetic benchmark**, except the real-data payment
-  model (PR-AUC 0.90, validated on real ULB labels).
+- Results are on an **~900K-transaction synthetic benchmark** (the campaign-based ledger),
+  except the real-data payment model (PR-AUC 0.90, validated on real ULB labels).
 - **No human-labeled set exists until you run `label_goldset.py`** - do not claim
   "verifier agrees with human X%" before that.
 - FraudSense is a single-shot LLM call with **no retrieval** - there is no RAG
