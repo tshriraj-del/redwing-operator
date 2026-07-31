@@ -58,10 +58,39 @@ AIQ_CODES = {
 }
 
 # Thresholds. Named, sourced to a rationale, changed here not inline.
-FANIN_ALERT = 12          # a personal payee taking money from this many DISTINCT senders is not
-                          # a person being repaid; it is a collector. Merchants are excluded by
-                          # the multi-institution test below, not by a raw count.
-FANIN_SATURATE = 60       # fan-in risk reaches 1.0 here
+# The fan-in BAND in which a collector is distinguishable at all. Both ends are set from the
+# reference ledger, where the signal was measured by fan-in bucket:
+#
+#     fan-in  3-6    1.77x lift      6-12   2.24x      12-30   0.89x      30+   1.03x
+#
+# The signal lives in the middle and is gone above it. That is not a quirk of one ledger: past a
+# certain scale an unconcentrated payee is a merchant by weight of evidence, because no mule
+# grooms hundreds of victims across every institution without also being the sort of business
+# that would. The old value of 12 sat exactly where the signal STOPS, which is a large part of
+# why this insight never separated anything.
+FANIN_ALERT = 4           # below this a payee is simply not busy enough to read as a collector
+FANIN_MERCHANT = 60       # at or above this an even split reads as a merchant, and the insight
+                          # goes deliberately quiet rather than guaranteeing a false positive.
+                          # Deployment-specific: recalibrate against the operator's own fan-in
+                          # distribution rather than carrying this number over.
+# How evenly a payee's senders are spread across institutions. CONCENTRATION is the share banked
+# at the single most-represented member: 1.0 means every sender banks in one place, and at n=2 an
+# even split floors at 0.5.
+#
+# This replaced a multi-institution PRESENCE test ("2 or more members see this payee"), which was
+# measured at a lift of 1.00x - it separated nothing. The old rationale said a legitimate merchant
+# "concentrates within the acquirer that banks it", which confuses where a merchant banks with
+# where its CUSTOMERS bank. A supermarket's customers bank everywhere, so presence across members
+# is the default for anything popular rather than a mule signature.
+#
+# Concentration is the property that actually differs. An ordinary payee is paid by one segment
+# of the market: a crypto off-ramp by a crypto platform's customers, a local tradesman by a
+# retail bank's. Measured on the reference ledger, legitimate payees at fan-in 3-6 sit at a
+# median concentration of 1.00 against 0.75 for fraud-touched ones, and flagging below 0.75
+# carries a 1.65x lift over the base rate while covering half of all fraud-touched payees.
+# A collector takes from whoever it can groom, and its victims bank wherever they bank.
+CONC_ALERT = 0.80         # at or below this the senders are not concentrated: risk starts
+CONC_FLOOR = 0.55         # at or below this the split is as even as it gets: risk reaches 1.0
 Z_ALERT = 3.0             # amount z-score vs the rail's network norm at which the insight fires
 Z_SATURATE = 8.0
 NEW_TO_NETWORK_TX = 5     # at or below this network-wide tx count a payee is "new to the network"
@@ -197,27 +226,46 @@ def _insight_network_rep(recipient, idx, querying_institution, epsilon):
 
 
 def _insight_fanin(recipient, idx, querying_institution):
+    """A collector takes money from many distinct senders whose banking is UNCONCENTRATED.
+
+    Both halves are load-bearing. Fan-in alone flags every busy merchant. Spread alone flags
+    every universal one, since a supermarket's customers also bank everywhere. It is a payee
+    with collector-scale fan-in that ALSO fails to belong to any one institution's customer
+    base that has no ordinary explanation. See CONC_ALERT for what this replaced and why.
+    """
     total = idx.fanin.get(recipient, 0)
     per_inst = idx.fanin_by_inst.get(recipient, {})
     local = per_inst.get(querying_institution, 0)
     institutions_seeing = sum(1 for v in per_inst.values() if v > 0)
-    # a collector is a payee taking from many DISTINCT senders across MORE THAN ONE institution.
-    # the multi-institution test is what separates a mule from a legitimate merchant, which also
-    # has high fan-in but concentrates within the acquirer that banks it.
-    multi_bank = institutions_seeing >= 2
-    risk = _norm(total, FANIN_ALERT, FANIN_SATURATE) if multi_bank else 0.0
-    fired = multi_bank and total >= FANIN_ALERT
+    # Share of senders at the single most-represented member. Undefined with no senders, and
+    # 1.0 is the right default there: an unseen payee is not evidence of a collector, and this
+    # insight must not fire on absence. AIQ04 covers new-to-network payees.
+    concentration = (max(per_inst.values()) / total) if total and per_inst else 1.0
+    in_band = FANIN_ALERT <= total < FANIN_MERCHANT
+    fanin_risk = _norm(total, FANIN_ALERT, FANIN_MERCHANT) if in_band else 0.0
+    spread_risk = _norm(-concentration, -CONC_ALERT, -CONC_FLOOR)
+    # Multiplied, not added: either property alone is ordinary, and only their conjunction is
+    # the signature. A sum would let a large merchant's fan-in carry the score on its own.
+    risk = fanin_risk * spread_risk
+    fired = in_band and concentration <= CONC_ALERT
     return {
         "field": "aiq_recipient_fanin",
         "value": total,
         "local_value": local,
         "network_delta": total - local,
         "institutions_seeing": institutions_seeing,
+        "concentration": round(concentration, 3),
         "risk": round(risk, 3),
         "fired": fired,
         "code": "AIQ02_CROSS_BANK_FANIN" if fired else None,
-        "note": (f"{total} distinct senders across {institutions_seeing} institutions pay this "
-                 f"payee; you can see {local}. Cross-bank fan-in is the collector-mule signature."),
+        "note": (f"{total} distinct senders pay this payee and you can see {local}. "
+                 f"{concentration:.0%} of them bank at one institution"
+                 + (", which is unconcentrated for a payee this busy: an ordinary payee is used "
+                    "by one institution's customers, a collector takes from whoever it grooms."
+                    if fired else
+                    (f", and at {total} senders it is at merchant scale, where an even split "
+                     f"is ordinary." if total >= FANIN_MERCHANT else
+                     ", so its senders look like one institution's customer base."))),
     }
 
 

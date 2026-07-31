@@ -54,8 +54,9 @@ def test_index_counts_distinct_senders_and_rail_norms():
 # -- fan-in: the merchant vs mule distinction -----------------------------------
 
 def test_fanin_does_not_fire_when_concentrated_at_one_institution():
-    """High fan-in at a SINGLE institution is a merchant, not a mule. The multi-institution
-    test is what stops Authorization IQ flagging every popular payee."""
+    """High fan-in whose senders all bank in one place is an ordinary payee serving that
+    institution's customer base, not a collector. Concentration is what stops Authorization IQ
+    flagging every popular payee."""
     edges = [_edge("recipient:MERCH", s) for s in _senders_for("inst_neobank", 25, "m")]
     idx = A.build_index(edges)
     # send from the same institution that banks all those senders
@@ -79,6 +80,64 @@ def test_fanin_fires_across_institutions_with_a_positive_network_delta():
     assert fanin["fired"], "cross-bank fan-in above the alert must fire"
     # the delta is the whole point: the network sees more senders than the querying bank
     assert fanin["network_delta"] == fanin["value"] - fanin["local_value"] > 0
+
+
+def test_fanin_does_not_fire_on_a_universal_merchant():
+    """THE case the previous discriminator got wrong, and the reason it was replaced.
+
+    The old gate fired on any payee seen by two or more institutions, justified by the claim
+    that a legitimate merchant "concentrates within the acquirer that banks it". That confuses
+    where a merchant banks with where its CUSTOMERS bank. A supermarket is paid by customers of
+    every institution, so under the old rule every large merchant fired, and measured across the
+    reference ledger the gate separated fraud from legitimate payees at a lift of 1.00x.
+
+    A universal merchant has an even split AND overwhelming fan-in. What marks a collector is an
+    even split at a fan-in that no ordinary payee of that kind would have, so this asserts the
+    merchant stays quiet while remaining plainly visible to the network."""
+    edges = ([_edge("recipient:TESCO", s) for s in _senders_for("inst_neobank", 200, "n")]
+             + [_edge("recipient:TESCO", s) for s in _senders_for("inst_crypto", 200, "c")])
+    idx = A.build_index(edges)
+    pack = A.authorize({"sender": _senders_for("inst_neobank", 1, "q")[0],
+                        "recipient": "recipient:TESCO", "amount": 40.0, "rail": "card"}, idx,
+                       querying_institution="inst_neobank")
+    fanin = next(i for i in pack["insights"] if i["field"] == "aiq_recipient_fanin")
+    assert fanin["institutions_seeing"] == 2, "the merchant IS seen by both, as expected"
+    assert fanin["value"] >= A.FANIN_ALERT, "and its fan-in IS above the raw alert line"
+    # ... yet it must not fire, because an even split is normal for something this universal.
+    assert not fanin["fired"], (
+        "a universal merchant fired the collector insight; this is the exact false positive "
+        "the concentration test exists to remove")
+
+
+def test_fanin_risk_needs_both_properties_not_either_one():
+    """Multiplied, not added. Either property alone is ordinary: plenty of payees have high
+    fan-in, plenty have an even split. Only together do they lack an innocent explanation."""
+    # high fan-in, fully concentrated -> no risk
+    conc = A.build_index([_edge("recipient:A", s)
+                          for s in _senders_for("inst_neobank", 40, "a")])
+    # even split but fan-in below the band -> no risk (one sender each side)
+    tiny = A.build_index([_edge("recipient:B", s) for s in _senders_for("inst_neobank", 1, "b")]
+                         + [_edge("recipient:B", s) for s in _senders_for("inst_crypto", 1, "c")])
+    for idx, rid in ((conc, "recipient:A"), (tiny, "recipient:B")):
+        pack = A.authorize({"sender": "user_probe", "recipient": rid,
+                            "amount": 100.0, "rail": "Zelle"}, idx,
+                           querying_institution="inst_neobank")
+        fi = next(i for i in pack["insights"] if i["field"] == "aiq_recipient_fanin")
+        assert fi["risk"] == 0.0 and not fi["fired"], f"{rid} should carry no fan-in risk"
+
+
+def test_fanin_reports_concentration_and_never_fires_on_an_unseen_payee():
+    """Absence is not evidence. A payee with no senders at all has an undefined split, and the
+    insight must default to fully concentrated rather than to maximally suspicious, or every
+    brand-new payee would fire the collector code. AIQ04 is what covers new-to-network."""
+    idx = A.build_index([_edge("recipient:OTHER", s)
+                         for s in _senders_for("inst_neobank", 5, "o")])
+    pack = A.authorize({"sender": "user_probe", "recipient": "recipient:GHOST",
+                        "amount": 100.0, "rail": "Zelle"}, idx,
+                       querying_institution="inst_neobank")
+    fi = next(i for i in pack["insights"] if i["field"] == "aiq_recipient_fanin")
+    assert fi["concentration"] == 1.0, "an unseen payee must default to concentrated, not split"
+    assert not fi["fired"] and fi["risk"] == 0.0
 
 
 # -- the reveal: the field a single bank structurally cannot produce ------------
