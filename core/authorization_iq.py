@@ -97,11 +97,39 @@ NEW_TO_NETWORK_TX = 5     # at or below this network-wide tx count a payee is "n
 MIN_RAIL_NORM_N = 30      # a rail needs this many network observations before its norm is trusted
 
 # How the individual insight risks compose into the single authorization-time network signal.
-# Reputation and the reveal dominate because they are the consortium's core product; the others
-# are corroborating. Weights are a modelling choice, documented as such, not a measurement.
+#
+# These were a modelling choice until the pack was measured end to end, at which point the old
+# weights turned out to be actively harmful. Folding network_risk into the live score made
+# detection WORSE at every alert budget, and worst on the unseen-payee segment the layer exists
+# for (17.6% -> 7.7% at an 8,000 budget). The cause was a floor: two insights fired on roughly a
+# quarter of ALL traffic at no lift, so network_risk had a non-zero median while the local
+# model's median score is 0.0000, and escalate-only's max() therefore overwrote the local score
+# on 56.9% of rows. A signal that fires on a quarter of payments is not a signal, and weighting
+# it is what let it flood the ranking.
+#
+# Fire rate and fraud lift, measured over 100-150k held-out rows against a 0.65% base rate:
+#
+#     insight                 fires on   fraud|fired   lift
+#     amount_over_norm            0.6%        15.09%   23.11x
+#     network_rep                 2.7%         2.89%    4.43x
+#     network_newness             3.7%         1.45%    2.21x
+#     recipient_fanin            22.4%         0.75%    1.15x     <- floor
+#     cashout_corridor           23.4%         0.67%    1.03x     <- floor
+#
+# So weight now follows measured lift, and the two floors are dropped to ZERO for SCORING while
+# staying in the pack as displayed insights. That separation is deliberate: "this payee takes
+# from many senders across institutions" is useful for an investigator reading a case, and
+# useless as a term in an authorization-time score. They are not the same job.
+#
+# recipient_fanin specifically was swept across every combination of its thresholds and no
+# setting rescues it: lift peaks at 1.28x and FALLS to 0.03x as the band tightens, because
+# high-fan-in payees are merchants and transaction volume concentrates on them. Unconcentrated
+# mid-fan-in is a real property of collector accounts at the PAYEE level (2.24x there), and it
+# does not survive the change of unit to a single payment. Fixing the discriminator, which was
+# the right fix for what it was, did not make it a scoring feature.
 COMPOSE_WEIGHTS = {
-    "network_rep": 0.34, "reveal": 0.24, "fanin": 0.18,
-    "amount_norm": 0.10, "new_to_network": 0.08, "corridor": 0.06,
+    "network_rep": 0.40, "reveal": 0.28, "amount_norm": 0.22, "new_to_network": 0.10,
+    "fanin": 0.0, "corridor": 0.0,
 }
 
 # Institutions whose inbound is a classic irrevocable cash-out (the off-ramp leg of a scam).
