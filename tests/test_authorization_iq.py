@@ -271,10 +271,9 @@ def test_clean_payment_adds_no_network_risk():
 # authorize() output that helper consumes, so they hold wherever it is wired.
 
 def _apply(local_score, pack):
-    """The escalate-only composition main.py._network_view applies."""
-    if pack.get("sufficient_evidence"):
-        return max(local_score, float(pack.get("network_risk") or 0.0))
-    return local_score
+    """The escalate-only composition, imported rather than reimplemented. A test that keeps
+    its own copy of the rule cannot catch the rule changing."""
+    return A.apply_escalate_only(local_score, pack)
 
 
 def test_network_escalates_a_payment_the_local_model_would_have_missed():
@@ -312,6 +311,54 @@ def test_thin_evidence_cannot_move_a_live_decision():
     assert not pack["sufficient_evidence"]
     local = 0.10
     assert _apply(local, pack) == local, "noise must not escalate a live decision"
+
+
+# -- escalate-only as a checkable guarantee, not a design intention -------------
+
+def test_escalate_only_never_lowers_a_score():
+    """Claim 1, DIRECTION. The original rule, and the only one that was ever stated."""
+    for local, nr, suf in ((0.9, 0.1, True), (0.4, 0.4, True), (0.7, 0.0, True),
+                           (0.3, 0.99, False), (0.0, 0.5, True)):
+        out = A.apply_escalate_only(local, {"sufficient_evidence": suf, "network_risk": nr})
+        assert out >= local - 1e-12, f"escalate-only lowered {local} to {out}"
+
+
+def test_direction_alone_does_not_make_the_guarantee_hold():
+    """Claim 2, BUDGET, and THE lesson. Folding the network into the live score degraded
+    detection at every alert budget while direction held on every single payment: the network
+    simply raised 56.9% of scores, and a floor over most of the book destroys the local
+    ranking as effectively as lowering scores would. A rule that cannot fail on the case that
+    actually hurt is not a guarantee, it is a slogan."""
+    flood = [(0.001, 0.02)] * 570 + [(0.001, 0.001)] * 430   # 57% raised, none lowered
+    a = A.audit_escalate_only(flood)
+    assert a["direction_violations"] == 0, "the flooding case never lowered a score"
+    assert not a["holds"], (
+        "the audit passed a composition that raised 57% of payments; the budget claim is "
+        "what makes this guarantee mean something")
+    assert a["escalation_rate"] > a["escalation_budget"]
+
+
+def test_a_sparse_escalation_holds():
+    """The shape the reweighted pack actually produces: a small number of payments raised."""
+    ok = [(0.001, 0.9)] * 20 + [(0.001, 0.001)] * 980       # 2% raised
+    a = A.audit_escalate_only(ok)
+    assert a["holds"] and a["within_budget"]
+    assert a["direction_violations"] == 0
+
+
+def test_the_audit_catches_an_actual_de_escalation():
+    """If the composition is ever changed to blend rather than take a maximum, direction goes
+    first and this is what notices."""
+    a = A.audit_escalate_only([(0.8, 0.4), (0.1, 0.1), (0.2, 0.9)])
+    assert a["direction_violations"] == 1 and not a["holds"]
+
+
+def test_displacement_is_reported_so_the_cost_is_visible():
+    """Claim 3. Reported rather than bounded, because the honest value depends on how many
+    cases the team can actually review."""
+    a = A.audit_escalate_only([(0.9, 0.9)] * 10 + [(0.1, 0.99)] * 10, top_n=10)
+    assert 0.0 <= a["top_n_displaced"] <= 1.0
+    assert a["top_n_displaced"] > 0, "raising ten low scores above the top ten displaced none?"
 
 
 if __name__ == "__main__":
