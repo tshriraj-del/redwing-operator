@@ -290,9 +290,11 @@ def _network_view(row: dict, local_score: float):
              "sender": row.get("user_id"), "amount": row.get("amount", 0.0),
              "rail": row.get("payment_rail", "card")},
             _aiq_index)
-        if pack.get("sufficient_evidence"):
-            return pack, max(local_score, float(pack.get("network_risk") or 0.0))
-        return pack, local_score
+        # ONE definition of the rule, in core/authorization_iq. It used to be inlined here
+        # and copied into the tests, which is how a guarantee ends up with two
+        # implementations and no audit of either.
+        from core.authorization_iq import apply_escalate_only
+        return pack, apply_escalate_only(local_score, pack)
     except Exception:
         return None, local_score      # the network layer must never fail a score
 
