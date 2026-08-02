@@ -354,6 +354,22 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
         "maturity": maturity,              # None when mature_only was not requested
     }
 
+    if positive_label and positive_label not in classes:
+        # A positive class that does not exist in the data scores f1 = 0 for BOTH model and
+        # rule, so `beats` is 0 > 0 = False and the verdict reads "keep the rule" no matter how
+        # good the model is. That is exactly what /substrate/graduation was doing: it passed
+        # positive_label="True" while every stored value is "1" or "0", and the comparison had
+        # been meaningless for as long as the endpoint has existed. It never showed because
+        # there were no trainable gold rows to reach it.
+        #
+        # Refusing here rather than at the call sites, because two call sites were wrong in the
+        # same way and a third would have been.
+        return {"target": f"{label_space}.{label_key}", "trained": False,
+                "reason": f"positive_label {positive_label!r} does not appear in this target's "
+                          f"labels, which are {classes}. Every f1 would be 0 for both model and "
+                          f"rule, and the verdict would say 'keep the rule' regardless of the "
+                          f"model's quality."}
+
     if positive_label:
         # Rare-target mode: judge on F1 for the positive class, because accuracy here is
         # dominated by the negative class and would call a do-nothing model excellent.
