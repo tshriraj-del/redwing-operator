@@ -655,6 +655,18 @@ class Store:
         ).fetchone()
         return self._row_to_decision(row) if row else None
 
+    def decisions_for_entity(self, entity_id: str, limit: int = 200) -> list:
+        """Every decision recorded against an entity, oldest first.
+
+        Needed to tell "was warned and stopped" from "was warned and carried on", which is the
+        one piece of witting-ness evidence a system can observe about itself without an
+        investigator interviewing anybody."""
+        rows = self._conn.execute(
+            "SELECT * FROM decisions WHERE entity_id=? ORDER BY ts ASC LIMIT ?",
+            (str(entity_id or ""), int(limit)),
+        ).fetchall()
+        return [self._row_to_decision(r) for r in rows]
+
     def add_label(
         self,
         label_space: str,
