@@ -105,18 +105,66 @@ def _confusion(pairs) -> dict:
     return out
 
 
+def _maturity(store, label_space: str, label_key: str, gold_sources, as_of=None) -> dict:
+    """How much of the gold evidence is old enough to be trusted.
+
+    Imported lazily so graduation keeps working if the maturity module is unavailable, and so
+    an unknown maturity never becomes a hard failure of the gate.
+    """
+    try:
+        from .label_maturity import maturity_floor, partition
+    except Exception:                                        # noqa: BLE001
+        return {"known": False, "reason": "label_maturity unavailable"}
+    try:
+        mf = maturity_floor(store, label_space, label_key, as_of=as_of)
+        if not mf["known"]:
+            return {"known": False, "reason": mf["reason"]}
+        rows = store.training_rows(label_space, label_key, sources=list(gold_sources),
+                                   limit=1_000_000)
+        part = partition(rows, mf["floor"])
+        return {"known": True, "floor": mf["floor"],
+                "days_to_coverage": mf["days_to_coverage"], "coverage": mf["coverage"],
+                "gold_mature": len(part["mature"]), "gold_immature": len(part["immature"])}
+    except Exception as e:                                   # noqa: BLE001
+        return {"known": False, "reason": f"maturity check failed: {type(e).__name__}"}
+
+
 def evaluate_target(store, label_space: str, label_key: str,
-                    gold_sources=GOLD_SOURCES) -> dict:
+                    gold_sources=GOLD_SOURCES, as_of=None) -> dict:
     """Graduation readiness for one (label_space, label_key) target."""
     gold = _subjects_with_gold(store, label_space, label_key, gold_sources)
     heur = _heuristic_by_subject(store, gold.keys(), label_space, label_key)
     n_trainable = _trainable_gold(store, label_space, label_key, gold_sources)
+    mat = _maturity(store, label_space, label_key, gold_sources, as_of=as_of)
 
     pairs = [(heur[s], gold[s]) for s in gold if s in heur]
     n_gold = len(gold)
     n_paired = len(pairs)
     accuracy = round(sum(1 for h, g in pairs if h == g) / n_paired, 3) if n_paired else 0.0
     kappa = _cohen_kappa(pairs)
+
+    # Maturity is checked BEFORE the agreement thresholds, because a kappa computed over
+    # labels whose cohort is still receiving reports is a measurement of the calendar, not of
+    # the rule. The bar is the same MIN_GOLD rather than a second threshold: the question is
+    # simply whether enough of the gold is old enough to count.
+    if (mat.get("known") and n_gold >= MIN_GOLD
+            and mat.get("gold_mature", 0) < MIN_GOLD):
+        return {
+            "target": f"{label_space}.{label_key}",
+            "gold_labels": n_gold, "trainable_gold": n_trainable,
+            "paired_with_heuristic": n_paired,
+            "heuristic_accuracy_vs_gold": accuracy, "cohen_kappa": kappa,
+            "confusion": _confusion(pairs), "maturity": mat,
+            "verdict": "immature_evidence",
+            "reason": (
+                f"{n_gold} gold labels but only {mat['gold_mature']} are mature (need "
+                f">= {MIN_GOLD}); {mat['gold_immature']} sit on decisions after "
+                f"{mat['floor']}, whose labels are still arriving. Certifying here would "
+                f"measure a window whose fraud has not been reported yet, and the error is "
+                f"one-directional: the missing labels are overwhelmingly the frauds, so both "
+                f"kappa and any model trained on this would flatter themselves. Wait "
+                f"{mat['days_to_coverage']}d from the last decision, do not label harder."),
+        }
 
     if n_gold < MIN_GOLD or n_paired < MIN_PAIRED:
         verdict, reason = "not_enough_gold", (
@@ -134,6 +182,12 @@ def evaluate_target(store, label_space: str, label_key: str,
         verdict, reason = "ready_to_train", (
             f"kappa {kappa} in the useful band with {n_paired} paired examples: enough "
             f"trustworthy data and residual disagreement for a model to improve on the rule")
+        if not mat.get("known"):
+            # An unknown maturity is not evidence of maturity, and it is not evidence against
+            # it either, so it does not flip the verdict. It rides ON the verdict instead,
+            # because a caveat in a separate field is a caveat nobody reads.
+            reason += (f". MATURITY UNKNOWN, so this assumes the labels are complete and "
+                       f"nothing has checked that: {mat.get('reason', 'no curve')}")
 
     return {
         "target": f"{label_space}.{label_key}",
@@ -143,6 +197,7 @@ def evaluate_target(store, label_space: str, label_key: str,
         "heuristic_accuracy_vs_gold": accuracy,
         "cohen_kappa": kappa,
         "confusion": _confusion(pairs),
+        "maturity": mat,
         "verdict": verdict,
         "reason": reason,
     }
