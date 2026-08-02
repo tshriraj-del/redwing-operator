@@ -1103,10 +1103,18 @@ def post_feedback(body: dict):
             if rejected:
                 result["intent_rejected"] = rejected
 
+            # WHEN the fact became true, not when this row was written. Without it the only
+            # lag the substrate can measure is "how long until somebody typed it in", which
+            # is a fact about staffing. With it, a year of chargebacks imported this morning
+            # still carries its real lags, and core/label_maturity.py can tell an immature
+            # window from a complete one. Optional, because an analyst often does not know.
+            effective_ts = str(body.get("effective_ts", "") or "")
+
             result["receipt"] = close_loop(
                 STORE, transaction_id, recipient_id, label, is_fraud, rep_rate, source,
-                intent=intent or None)
+                intent=intent or None, effective_ts=effective_ts)
             result["intent_recorded"] = sorted(intent.keys())
+            result["effective_ts_recorded"] = bool(effective_ts)
         except Exception:
             pass   # receipt is additive; a backbone failure must not fail the disposition
 
@@ -1171,6 +1179,30 @@ def substrate_next_questions(limit: int = 10):
         return next_questions(STORE, limit=max(1, min(50, limit)))
     except Exception as e:
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
+
+
+@app.get("/substrate/maturity")
+def substrate_maturity(horizon_days: int = 90, coverage: float = 0.9):
+    """How complete the label set is, and therefore what window is safe to train on.
+
+    Fraud labels arrive late and the lateness is not random: the scams that do the damage on an
+    irrevocable rail surface weeks or months after the payment, because the victim does not know
+    yet. So the recent window is systematically missing its positives, and anything measured
+    there flatters itself. This reports the arrival-lag curve per target and the maturity floor
+    it implies.
+
+    It very often answers "not derivable", and that is the honest answer rather than a failure:
+    a curve needs gold labels on cohorts old enough to have settled, and a young substrate has
+    none. A fitted curve there would license training on exactly the window it exists to
+    withhold.
+    """
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    try:
+        from core.label_maturity import maturity_report
+        return maturity_report(STORE, horizon_days=horizon_days, coverage=coverage)
+    except Exception as e:                                        # never take the page down
+        return {"substrate": "error", "detail": str(e)[:200]}
 
 
 @app.get("/substrate/graduation")

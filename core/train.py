@@ -39,6 +39,7 @@ import math
 from collections import defaultdict
 
 from .graduation import GOLD_SOURCES, _heuristic_by_subject
+from .label_maturity import maturity_floor, partition
 
 
 def _is_num(v) -> bool:
@@ -239,11 +240,22 @@ def _prf(pairs, positive: str) -> dict:
 def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOURCES,
                  test_frac: float = 0.3, min_rows: int = 40, seed: str = "redwing-train",
                  observed_only: bool = False, positive_label: str = "",
-                 model: str = "logreg") -> dict:
+                 model: str = "logreg", mature_only: bool = False, as_of=None) -> dict:
     """Train a model on gold labels for one target and compare it to the heuristic on a held-out
     test split. Returns model vs heuristic accuracy and whether the model beats the rule. Set
     `observed_only=True` for OUTCOME targets to train on uncensored (allowed) decisions only,
     so the model is not fit on labels the analyst inferred for cases we blocked.
+
+    `mature_only=True` additionally drops decisions too recent for their labels to have arrived.
+    These two flags close DIFFERENT holes and neither substitutes for the other: observed_only
+    is about cases we blocked, so the outcome was never observable at all; mature_only is about
+    cases we allowed, where the outcome exists and simply has not reached us yet. Train without
+    it and the recent window contributes rows whose fraud is still in the post, every one of
+    them labelled negative, and the model learns that recent traffic is safe.
+
+    It REFUSES rather than degrades. If the maturity curve cannot be derived, this returns
+    trained=False with the reason instead of quietly training on everything, because a filter
+    that silently does nothing while the caller believes it ran is worse than no filter.
 
     `model` is "logreg" (default) or "naive_bayes". Logreg fits feature weights jointly and so
     stays calibrated on REDWING's correlated features (the velocity family); NB assumes
@@ -259,10 +271,32 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
                                            observed_only=observed_only, limit=1_000_000)
             if r["features"]]
     rows = list({r["subject_ref"]: r for r in rows}.values())    # one row per subject
+
+    maturity = None
+    if mature_only:
+        mf = maturity_floor(store, label_space, label_key, as_of=as_of)
+        if not mf["known"]:
+            return {"target": f"{label_space}.{label_key}", "trained": False,
+                    "mature_only": True, "maturity_known": False,
+                    "reason": f"mature_only was requested and the maturity floor is not "
+                              f"derivable, so the filter cannot be applied and training would "
+                              f"silently include immature rows: {mf['reason']}"}
+        part = partition(rows, mf["floor"])
+        maturity = {"floor": mf["floor"], "days_to_coverage": mf["days_to_coverage"],
+                    "coverage": mf["coverage"], "excluded_immature": len(part["immature"])}
+        rows = part["mature"]
+
     if len(rows) < min_rows:
+        # Name the maturity filter when it is what emptied the set, so nobody reads this as
+        # "we have no labels" and goes looking for analysts. It is "we have labels about a
+        # window too recent to trust", and the fix is time, not effort.
+        why = (f" ({maturity['excluded_immature']} more were dropped as immature, decided "
+               f"after {maturity['floor']})" if maturity and maturity["excluded_immature"]
+               else "")
         return {"target": f"{label_space}.{label_key}", "trained": False,
-                "reason": f"{len(rows)} usable gold rows with features (< {min_rows}); "
-                          f"not enough to train and hold out"}
+                "maturity": maturity,
+                "reason": f"{len(rows)} usable gold rows with features (< {min_rows})"
+                          f"{why}; not enough to train and hold out"}
 
     heur = _heuristic_by_subject(store, [r["subject_ref"] for r in rows], label_space, label_key)
     train = [r for r in rows if not _split(r["subject_ref"], test_frac, seed)]
@@ -317,6 +351,7 @@ def train_target(store, label_space: str, label_key: str, gold_sources=GOLD_SOUR
         "model_accuracy": m_acc,
         "heuristic_accuracy": h_acc,
         "model_log_loss": log_loss,        # calibration: lower is better, exposes overconfidence
+        "maturity": maturity,              # None when mature_only was not requested
     }
 
     if positive_label:
