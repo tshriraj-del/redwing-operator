@@ -334,7 +334,12 @@ def build_event(row) -> dict:
     # score came from outside their own institution.
     aiq, network_score = _network_view(row, cascade_score)
 
-    alert = is_alert(network_score) or bool(row.get("is_fraud", False))
+    # bool() on a CSV field is a trap: bool("False") is True, because a non-empty string is
+    # truthy. Scoring a CSV-sourced row therefore flagged EVERY non-fraud transaction as an
+    # alert. Measured over 3,000 replayed payments: the model's own call fired on 0.07% and
+    # this line reported 98.33%, and essentially all of that gap was the string "False".
+    _known_fraud = str(row.get("is_fraud", "")).strip().lower() in ("1", "true", "yes")
+    alert = is_alert(network_score) or _known_fraud
 
     # -- Tier 3: offline graph context (O(1) lookup) ---------------------------
     graph_ctx = graph_features.get_features(
@@ -448,6 +453,43 @@ def build_event(row) -> dict:
                 model_version=str(config.get("version", "")),
                 decision_id=did,
             )
+
+            # The scorer's OWN call, recorded so an analyst's adjudication has something to
+            # pair against. Measured before this existed: 0 subjects in the whole substrate
+            # carried both a machine prediction and a human label, so no amount of
+            # adjudication could ever fill the gate. The only target that wrote a machine
+            # label was intent.motive, which needs telemetry and so covered 6% of decisions;
+            # whatever an analyst happened to pick, there was almost never a prediction
+            # sitting there. This covers ~100%.
+            #
+            # READ IT AS AGREEMENT, NOT GRADUATION. For the intent targets the machine side is
+            # a genuine expert rule and "should this become a model" is the real question. Here
+            # the machine side is ALREADY the model, so pairing it with human labels measures
+            # whether the model and the analysts agree. That is worth knowing on its own terms,
+            # and kappa on it is a drift signal, but it is not the question graduation.py was
+            # written to answer and should not be quoted as if it were.
+            # Derived from the SCORE, not from the action, and deliberately not from
+            # event["is_alert"]. Two traps, both of which this first got wrong:
+            #
+            #   1. the enforced action is not a fraud call. HOLD means "worth a look" and is
+            #      two thirds of all decisions, against a 0.65% base rate, so recording
+            #      HOLD -> is_fraud=1 would assert fraud on most of the book.
+            #   2. event["is_alert"] is `is_alert(network_score) OR row["is_fraud"]`, so it
+            #      carries the ground-truth label. Storing that as a "prediction" would write
+            #      the answer into the substrate wearing a model's name, and the agreement
+            #      measured against a human label later would be the label against itself.
+            #
+            # is_alert(network_score) alone is the model's own call, with nothing borrowed.
+            try:
+                model_call = 1 if is_alert(network_score) else 0
+                STORE.add_label(
+                    "outcome", "is_fraud", model_call,
+                    source="heuristic", confidence=round(float(network_score or 0.0) / 100.0, 4),
+                    decision_id=did, subject_ref=tid,
+                    entity_id=eid("user", str(row.get("user_id", "unknown"))),
+                    annotator="model_score_call")
+            except Exception:
+                pass   # a training label is never worth failing a score for
 
             # Real-telemetry actor read: ONLY when the client reported behaviour for this
             # subject. Derived from reported telemetry (never the typology), so the motive
