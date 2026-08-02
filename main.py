@@ -470,6 +470,22 @@ def build_event(row) -> dict:
         except Exception:
             pass   # the substrate is additive; a failure here must never fail scoring
 
+    # NO witting-ness label is written here, and that is a decision rather than an omission.
+    #
+    # The graduation gate cannot fire for intent.witting_role because paired_with_heuristic is 0
+    # and nothing here can raise it. The obvious fix, run the witting-ness heuristic during
+    # scoring, was built and MEASURED, and it does not work: its twelve tells and the session
+    # telemetry the scorer has share zero fields, and of the tells derivable from the ledger and
+    # the store, every one points at guilt. Wired in, it labelled 99% of accounts "witting";
+    # after correcting the worst of it, 68%, which turned out to be a fact about the decisions
+    # table being 66% HOLD rather than anything about mules.
+    #
+    # Auto-recording those as training labels would launder our own data shape into the ground
+    # truth a classifier is later trained on. core/mule_behaviour.py keeps the derivation and
+    # refuses to return a verdict from one-directional evidence; witting-ness stays an
+    # investigator's judgment, captured through the adjudication panel, until the substrate
+    # carries the tells that only a person can observe.
+
     return event
 
 
