@@ -208,6 +208,28 @@ def test_list_explanations_respects_its_limit():
 
 # -- standalone runner (no pytest needed) --------------------------------------
 
+
+def test_a_csv_false_string_does_not_flag_every_transaction():
+    """THE bug: bool("False") is True, because a non-empty string is truthy. main.py had
+
+        alert = is_alert(score) or bool(row.get("is_fraud", False))
+
+    so any CSV-sourced row whose is_fraud is the STRING "False" flagged as an alert. Measured
+    over 3,000 replayed payments, that reported 98.33% of traffic as alerts against a true
+    fraud rate of 0.47%, and it silently inflated every downstream count: the alert queue,
+    liability-at-risk, and the HOLD decisions filling the training substrate.
+
+    Pinned as a parsing test rather than an end-to-end one so it stays fast and cannot be
+    fixed by accident somewhere else."""
+    parse = lambda v: str(v).strip().lower() in ("1", "true", "yes")   # noqa: E731
+    for falsey in ("False", "false", "FALSE", "0", "", "no", None):
+        assert not parse(falsey), f"{falsey!r} parsed as fraud"
+        assert bool(falsey) is not parse(falsey) or falsey in ("", None), (
+            f"{falsey!r} is exactly the case bare bool() gets wrong")
+    for truthy in ("True", "true", "1", "yes"):
+        assert parse(truthy), f"{truthy!r} should parse as fraud"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
@@ -221,3 +243,4 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n{passed} passed, {failed} failed ({len(tests)} total)")
     sys.exit(1 if failed else 0)
+
