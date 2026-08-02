@@ -183,7 +183,7 @@ except Exception as _pe:
 # scoring, so every write is best-effort.
 # Pure helpers (stdlib-only) import at module scope so they exist even if the SQLite
 # store fails to open; only the Store() instantiation is guarded.
-from core.store import Store, DEFAULT_DB_PATH, eid
+from core.store import Store, DEFAULT_DB_PATH, eid, FRAUD_TRUE
 from core.record import record_scored_event, row_from_backbone
 from core.adjudication import schema as adjudication_schema, validate as adjudication_validate
 from core.loop import close_loop, record_decision
@@ -1181,6 +1181,55 @@ def substrate_next_questions(limit: int = 10):
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
 
 
+@app.post("/outcomes")
+def post_outcomes(body: dict):
+    """Ingest outcome reports: chargebacks, recalls, confirmed losses, victim reports.
+
+    Body: {"records": [{subject_ref, outcome, source, effective_ts, reference, ...}]}, or a
+    single record. `override_reason` on the body lets a weaker source deliberately overturn a
+    stronger standing one, which real work needs: an analyst who reviews a chargeback and finds
+    first-party abuse is exactly that. Without it, a weaker source is recorded as evidence and
+    does not win.
+
+    Of the five sources the graduation gate trusts, only `analyst` previously had a live path.
+    This is the other four.
+    """
+    if STORE is None:
+        raise HTTPException(503, "Substrate not available.")
+    from core.outcome_ledger import ingest_outcomes
+    recs = body.get("records")
+    if recs is None:
+        recs = [body] if body.get("subject_ref") or body.get("transaction_id") else []
+    return ingest_outcomes(STORE, recs,
+                           override_reason=str(body.get("override_reason", "") or ""))
+
+
+@app.get("/outcomes/stats")
+def outcomes_stats():
+    """The outcome supply by source, plus the disagreements it has produced."""
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    from core.outcome_ledger import ledger_stats
+    return ledger_stats(STORE)
+
+
+@app.get("/outcomes/disagreements")
+def outcomes_disagreements(limit: int = 100):
+    """Cases where two ground-truth sources said different things.
+
+    The most valuable rows in the substrate. When the analyst cleared a payment and a chargeback
+    later says fraud, that is a labelled FALSE NEGATIVE found by the world rather than by us,
+    with the point-in-time features still attached to the decision.
+    """
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    from core.outcome_ledger import disagreements
+    d = disagreements(STORE, limit=limit)
+    return {"count": len(d), "disagreements": d,
+            "missed_fraud": sum(1 for x in d if x["kind"] == "missed_fraud"),
+            "reversals": sum(1 for x in d if x["reversal"])}
+
+
 @app.get("/substrate/maturity")
 def substrate_maturity(horizon_days: int = 90, coverage: float = 0.9):
     """How complete the label set is, and therefore what window is safe to train on.
@@ -1227,7 +1276,7 @@ def substrate_graduation():
                 "substrate": STORE.labeling_stats(),
                 "readiness": readiness_report(STORE, targets=[("outcome", "is_fraud")]),
                 "trained": train_target(STORE, "outcome", "is_fraud",
-                                        observed_only=True, positive_label="True"),
+                                        observed_only=True, positive_label=FRAUD_TRUE),
             }
         except Exception as e:                                    # never take the page down
             out["live"] = {"substrate": "error", "detail": str(e)[:200]}
