@@ -32,10 +32,13 @@ effect, and reports rule evaluability as a first-class result rather than a foot
 from __future__ import annotations
 
 from .graduation import readiness_report
+from .store import FRAUD_TRUE
 from .train import train_target
 
 TARGET = ("outcome", "is_fraud")
-POSITIVE = "True"
+# The stored value, not the Python literal. close_loop writes int(is_fraud), so the column
+# holds "1" and "0". Passing "True" here made every f1 zero and every verdict "keep the rule".
+POSITIVE = FRAUD_TRUE
 
 
 def _arm(store, label: str) -> dict:

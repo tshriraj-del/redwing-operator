@@ -136,6 +136,9 @@ class Label:
 # Recognised event types (a soft contract, not enforced - the log stays open).
 EVENT_TYPES = (
     "transaction", "alert", "disposition", "enrichment", "feedback", "model_update",
+    # An outcome reported by the world rather than decided by us: a chargeback, a recall, a
+    # confirmed loss. Distinct from "disposition", which is our own analyst's call.
+    "outcome",
 )
 ENTITY_TYPES = ("user", "device", "recipient", "account", "institution")
 
@@ -149,12 +152,52 @@ DECISION_ACTIONS = (
 LABEL_SPACES = (
     "outcome", "intent", "witting", "scam_stage", "vulnerability_outcome", "loophole_outcome",
 )
-# Provenance, ranked roughly by trust. A heuristic self-label is the weakest; a confirmed
-# loss or an analyst adjudication is the strongest. training_rows() can filter on these.
+# Provenance. This tuple used to carry the comment "ranked roughly by trust" while being in no
+# order at all, with the weakest source listed first. The ranking is now real and lives in
+# SOURCE_PRECEDENCE below, because an unenforced ordering is how a nightly feed silently
+# overwrites a considered human judgement.
 LABEL_SOURCES = (
     "heuristic", "analyst", "confirmed_loss", "chargeback", "victim_report",
     "law_enforcement", "consortium",
 )
+
+# Evidential authority, high number wins. The reasoning, since these are judgement calls and a
+# reader should be able to disagree with them explicitly rather than discover them by surprise:
+#
+#   law_enforcement  an external authority's determination. Nothing internal outranks it.
+#   confirmed_loss   the money is gone and reconciled. An accounting fact, not an opinion.
+#   chargeback       a formal dispute adjudicated by the scheme, with its own evidence process.
+#   analyst          a trained human with the full case file in front of them.
+#   victim_report    a claim, and specifically an UNADJUDICATED one. First-party abuse is
+#                    precisely a false victim report, so this cannot outrank the analyst whose
+#                    job is to test it.
+#   consortium       another institution's assertion about our customer. Real signal, but it
+#                    does not outrank our own investigation of our own customer.
+#   heuristic        the machine's own call. Always the weakest thing in the room.
+SOURCE_PRECEDENCE = {
+    "law_enforcement": 60,
+    "confirmed_loss": 50,
+    "chargeback": 40,
+    "analyst": 30,
+    "victim_report": 20,
+    "consortium": 10,
+    "heuristic": 0,
+}
+
+
+# The stored representation of outcome.is_fraud. close_loop() writes int(is_fraud), so the
+# column holds "1" and "0" and always has. Named here because two call sites independently
+# guessed "True", which silently zeroed every f1 they computed; a constant is harder to guess
+# wrong than a convention nobody wrote down.
+FRAUD_TRUE = "1"
+FRAUD_FALSE = "0"
+
+
+def precedence_of(source: str) -> int:
+    """Authority of a label source. Unknown sources sit just above a machine guess: high enough
+    that a new integration is not silently discarded, low enough that it cannot bulldoze an
+    adjudication before somebody has decided where it belongs."""
+    return SOURCE_PRECEDENCE.get(str(source or "").strip().lower(), 5)
 
 
 # -- Store ---------------------------------------------------------------------
@@ -681,11 +724,28 @@ class Store:
         annotator: str = "",
         notes: str = "",
         ts: Optional[str] = None,
+        override_reason: str = "",
     ) -> str:
         """Attach a label. Resolves the decision from `subject_ref` when `decision_id` is
         not given, so a chargeback that arrives keyed only by transaction id still links to
         the point-in-time features. Supersedes (does not overwrite) the current label for the
-        same target + space + key, so revisions keep their history."""
+        same target + space + key, so revisions keep their history.
+
+        PRECEDENCE. A label from a WEAKER source than the standing one does not take over. It is
+        still written, arriving already superseded by the label it lost to, because the evidence
+        should never be discarded and because the graduation gate recovers the machine's own
+        prediction from exactly this history. What it does not do is win.
+
+        Structural rather than a rule each caller remembers, because the repo has already run
+        that experiment: `backfill_outcome_labels.py` wrote machine calls over two of the five
+        analyst gold labels and marked the humans superseded. That was fixed with a skip-guard
+        inside that one script, which protects nothing from the next writer, and a nightly
+        outcome feed is the next writer.
+
+        `override_reason` is the deliberate escape, and real work needs it: an analyst who
+        reviews a chargeback and finds first-party abuse is a weaker source correctly overturning
+        a stronger one. Default refuse, explicit override, always recorded in `notes`.
+        """
         ts = ts or _now()
         subject_ref = str(subject_ref or "")
         with self._lock:
@@ -701,19 +761,42 @@ class Store:
             label_id = uuid.uuid4().hex
             key_col = "decision_id" if decision_id else "subject_ref"
             key_val = decision_id or subject_ref
+
+            standing = None
             if key_val:
-                self._conn.execute(
-                    f"UPDATE labels SET superseded_by=? WHERE {key_col}=? AND label_space=? "
-                    "AND label_key=? AND superseded_by=''",
-                    (label_id, key_val, label_space, label_key),
-                )
+                standing = self._conn.execute(
+                    f"SELECT label_id, source, label_value FROM labels WHERE {key_col}=? "
+                    "AND label_space=? AND label_key=? AND superseded_by='' LIMIT 1",
+                    (key_val, label_space, label_key),
+                ).fetchone()
+
+            outranked = bool(standing and not override_reason
+                             and precedence_of(source) < precedence_of(standing["source"]))
+            if outranked:
+                # Born superseded by the label it lost to: kept as evidence, invisible to
+                # current_labels / labels_for_target / training_rows, visible to label_history.
+                born_superseded = standing["label_id"]
+                notes = (notes + " | " if notes else "") + (
+                    f"outranked: {source}({precedence_of(source)}) did not supersede standing "
+                    f"{standing['source']}({precedence_of(standing['source'])})")
+            else:
+                born_superseded = ""
+                if override_reason and standing:
+                    notes = (notes + " | " if notes else "") + (
+                        f"override of {standing['source']}: {override_reason}")
+                if key_val:
+                    self._conn.execute(
+                        f"UPDATE labels SET superseded_by=? WHERE {key_col}=? AND label_space=? "
+                        "AND label_key=? AND superseded_by=''",
+                        (label_id, key_val, label_space, label_key),
+                    )
             self._conn.execute(
                 "INSERT INTO labels (label_id, decision_id, subject_ref, entity_id, "
                 "label_space, label_key, label_value, source, confidence, ts, effective_ts, "
                 "superseded_by, annotator, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (label_id, decision_id, subject_ref, entity_id, label_space, label_key,
                  _to_text(label_value), source, float(confidence or 0.0), ts,
-                 effective_ts, "", annotator, notes),
+                 effective_ts, born_superseded, annotator, notes),
             )
             self._commit()
         return label_id
