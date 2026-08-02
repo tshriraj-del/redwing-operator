@@ -2508,6 +2508,31 @@ def report_fraud(body: dict):
     if not body.get("connectors"):
         raise HTTPException(400, "connectors list is required - specify which agencies to report to")
 
+    # Agent-drafted, HUMAN-ATTESTED. A narrative filed with a regulator under a named person's
+    # signature must (a) say nothing the case file does not, and (b) be the exact text that
+    # person signed. Both are enforced here rather than trusted to the caller, because the
+    # failure mode is a filing that reads perfectly and is not true.
+    description = body.get("description") or ""
+    if description.strip():
+        from core.sar_draft import check_grounding, narrative_sha
+        case = body.get("evidence") or {}
+        grounding = check_grounding(description, case)
+        if not grounding["grounded"]:
+            raise HTTPException(422, {
+                "error": "narrative contains claims the case file does not support",
+                "unsupported": grounding["unsupported"],
+                "hint": "every amount, identifier and date in the narrative must appear in "
+                        "`evidence`. Fix the narrative or supply the evidence it relies on.",
+            })
+        attester = (body.get("attested_by") or "").strip()
+        if not attester:
+            raise HTTPException(422, "attested_by is required: a SAR narrative is filed under "
+                                     "a named human's signature, not an agent's")
+        claimed = (body.get("narrative_sha") or "").strip()
+        if claimed and claimed != narrative_sha(description):
+            raise HTTPException(422, "narrative_sha does not match the description; the text "
+                                     "changed after it was attested to")
+
     req = ReportRequest(
         transaction_id = body["transaction_id"],
         user_id        = body["user_id"],
