@@ -79,8 +79,25 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/score` | Score a single transaction (XGBoost + rule engine) |
+| POST | `/score/payment` | Score against the real-label card model (ULB), calibrated |
+| GET | `/payment/meta` | That model's provenance and honest headline metric |
 | GET | `/monitor/stream` | SSE stream of live transaction scoring |
-| GET | `/alerts` | Recent high-confidence fraud alerts |
+| GET | `/alerts` | Recent high-confidence fraud alerts, ranked by value at risk |
+| GET | `/case/{transaction_id}` | The investigator case file for one transaction |
+| POST | `/case` | Case file for an ad-hoc transaction body |
+| POST | `/narrative` | Plain-language scam narrative for a decision |
+| GET | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
+| GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
+
+### The Closed Loop
+
+An analyst disposition moves the recipient's reputation, writes gold labels, and returns a
+receipt showing what that one decision bought.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/feedback` | Record a disposition (+ optional adjudicated intent and `effective_ts`) |
+| GET | `/feedback/status` | Labelled totals, online updates applied, retrain queue depth |
 
 ### Ingestion Pipeline
 
@@ -122,6 +139,43 @@ replaced by trained models, and reports when that is worthwhile.
 |--------|------|-------------|
 | GET | `/substrate/stats` | Decisions logged, enforced vs shadow, observed vs censored, label provenance |
 | GET | `/substrate/readiness` | Per-target graduation verdict (heuristic-vs-gold agreement, Cohen's kappa) |
+| GET | `/substrate/graduation` | The full evidence chain: gate verdict, label counts, held-out model-vs-rule result |
+| GET | `/substrate/next-questions` | Which case to adjudicate next, ranked by how much it moves the gate |
+| GET | `/substrate/maturity` | Label arrival-lag curve and the maturity floor it implies |
+| GET | `/adjudication/schema` | What an analyst can be asked when closing a case, and why each answer is wanted |
+
+### Outcome Ledger
+
+Where gold labels come from once a human clicking is no longer the only source. Of the five
+sources the graduation gate trusts, only `analyst` previously had a live path; these are the
+other four.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/outcomes` | Ingest chargebacks, recalls, confirmed losses, victim reports |
+| GET | `/outcomes/stats` | Outcome supply by source, plus reversals and disagreements |
+| GET | `/outcomes/disagreements` | Cases where two ground-truth sources disagree: labelled misses, with features attached |
+
+Source precedence is enforced in `store.add_label()` rather than by convention, so a nightly
+feed cannot overwrite a considered adjudication. A weaker source is still recorded, arriving
+already superseded, because evidence should not be discarded merely because it lost.
+
+### Model Performance
+
+`/drift/status` computes PSI over distributions, which is label-free: it can say the input
+moved and can never say the model decayed. This is the other half, and it separates the three
+explanations for a bad-looking month because they demand opposite responses.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/model/performance` | `degraded` / `population_shift` / `unmeasurable` / `degraded_unconfirmed`, with the evidence |
+| GET | `/drift/status` | PSI on score and feature distributions (input movement only) |
+| POST | `/drift/reset` | Clear the rolling buffers |
+
+Metrics are named `*_on_allowed`, never plain precision or recall, because outcomes exist only
+where the payment was allowed: the frauds that were caught and blocked are exactly the ones
+missing from the denominator. Where a holdout exists, the released sample estimates the blocked
+population's fraud rate.
 
 ### Autonomous Agent (SyntheticID)
 
@@ -133,6 +187,7 @@ replaced by trained models, and reports when that is worthwhile.
 | POST | `/agent/stop` | Gracefully stop the agent loop |
 | GET | `/agent/config` | Current agent config (thresholds, toggles, speed) |
 | PUT | `/agent/config` | Update config live - no restart needed |
+| POST | `/syntheticid/ingest` | Accept a SyntheticID Lab result; bypassed attacks become rule-factory input |
 | GET | `/agent/cases` | Case review queue; supports `?status=pending\|approved\|declined` |
 | POST | `/agent/cases/{case_id}/resolve` | Approve or decline a flagged case (analyst override) |
 | POST | `/agent/override/{tx_id}` | Direct action override on a specific transaction |
@@ -167,6 +222,40 @@ replaced by trained models, and reports when that is worthwhile.
 |--------|------|-------------|
 | GET | `/network/graph` | Fraud ring graph - nodes and edges from transaction data |
 | GET | `/network/typologies` | Distinct fraud typologies available for filtering |
+| GET | `/graph/stats` | Ring and component topology over the backbone |
+| GET | `/gnn/stats` | Graph-feature summary used by the scorer |
+| GET | `/backbone/stats` | Entity and event counts on the durable backbone |
+| GET | `/backbone/recent` | Most recent events across the graph |
+| GET | `/backbone/graph` | Backbone-derived subgraph |
+| GET | `/backbone/liability` | Reimbursement dollars currently exposed |
+| GET | `/backbone/entity/{entity_id}` | One entity: reputation, events, linked counterparties |
+
+### Consortium (n=2, differentially private)
+
+Two synthetic member institutions with genuinely different customers, rails and payee exposure.
+Members share only clamped, differentially private aggregates; the privacy budget is split
+across the statistics released rather than spent per statistic.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/consortium/demo` | The n=2 network view and what it adds over one bank's own book |
+| GET | `/consortium/recipient/{recipient_id}` | Pooled view of one payee across members |
+| GET | `/consortium/mules` | Payees the pool flags that no single member would |
+| GET | `/privacy/curve` | Epsilon-versus-utility curve for the shared aggregates |
+
+### Verifiable Agent Environment
+
+Fraud scenarios with programmatic verifiers, so an agent is graded on whether it actually
+investigated rather than on whether its answer reads well.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/env/spec` | The scenario contract and available verifiers |
+| POST | `/env/run` | Run one scenario end to end |
+| POST | `/env/run-all` | Run the whole suite |
+| POST | `/env/step` | Single-step an episode |
+| GET | `/adversary/strategies` | Evasion strategies the red-team simulator can apply |
+| POST | `/adversary/simulate` | Attack a rule or model and report what survives |
 
 ### Rule Factory
 
@@ -184,6 +273,9 @@ replaced by trained models, and reports when that is worthwhile.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/xai/explain` | SHAP explanation for a transaction |
+| GET | `/xai/explain/{transaction_id}` | The stored explanation for one scored transaction |
+| GET | `/xai/explanations` | Recent explanations with their feature attributions |
+| GET | `/xai/model-card` | Model card: training data, validation regime, known limitations |
 | GET | `/xai/governance` | Model drift + EU AI Act + SR 26-02 governance report |
 
 ### LLM Proxy
@@ -219,16 +311,21 @@ The hub connects to external agencies and bureaus for transaction enrichment and
 ## Core modules
 
 Everything in `core/` is pure Python over the store, deliberately free of the ML stack so it is
-testable without loading models. 93 tests (`python3 tests/test_core_store.py`, `tests/test_redwing.py`).
+testable without loading models. **242 tests across 12 files**; run any of them directly
+(`python3 tests/test_core_store.py`) or the lot under pytest. One file (`test_live_path.py`)
+needs numpy and so wants the venv.
 
 | Layer | Modules | What it does |
 |-------|---------|--------------|
 | Substrate | `store.py`, `record.py`, `loop.py` | Entity/event backbone, decisions + labels, checkpoints, the closed loop |
 | Ingestion | `ingest_schema.py`, `stream.py`, `connectors.py`, `webhook.py` | Schema contract, durable transport, file/SQL/webhook sources |
 | Signals | `attributes.py`, `telemetry.py` | Device and identity attribute fabric; behavioural telemetry to actor tells |
-| Actor Intelligence | `motive.py`, `scam_arc.py`, `mule_network.py`, `first_party.py`, `vulnerability.py`, `loophole.py`, `onboarding.py` | Who and why: offender motive, victim grooming arc, mule witting-ness, first-party intent, victimization risk, policy exploitation, onboarding gauntlet |
-| Learning | `holdout.py`, `graduation.py`, `train.py`, `seed_substrate.py` | Monitored holdout, graduation gate, stdlib trainer, synthetic cohort |
-| Decisioning | `liability.py`, `narrative.py`, `graph.py`, `consortium.py` | Liability pricing, scam narrative, fraud graph, DP consortium |
+| Actor Intelligence | `motive.py`, `scam_arc.py`, `mule_network.py`, `mule_behaviour.py`, `first_party.py`, `vulnerability.py`, `loophole.py`, `onboarding.py` | Who and why: offender motive, victim grooming arc, mule witting-ness from observable tells, first-party intent, victimization risk, policy exploitation, onboarding gauntlet |
+| Label supply | `outcome_ledger.py`, `label_maturity.py`, `backfill_outcome_labels.py` | Outcomes from chargebacks and recalls with source precedence; arrival-lag curve and maturity floor; recovering the machine's call onto historical decisions |
+| Learning | `holdout.py`, `graduation.py`, `train.py`, `seed_substrate.py`, `active_learning.py` | Monitored holdout, graduation gate, stdlib trainer, synthetic cohort, next-best-label queue |
+| Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
+| Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
+| Decisioning | `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
 
 ## Part of the RedWing Platform
 
