@@ -1181,6 +1181,33 @@ def substrate_next_questions(limit: int = 10):
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
 
 
+@app.get("/model/performance")
+def model_performance(window_days: int = 30, windows: int = 6, mature_only: bool = True):
+    """Did the model get worse, and how would we know.
+
+    `drift_monitor` computes PSI over distributions, which is label-free: it can say the input
+    moved and can never say the model decayed. This is the other half, and it separates the
+    three explanations for a bad-looking month, because they demand opposite responses:
+
+        degraded            retrain
+        population_shift    the model may be fine, the traffic changed
+        unmeasurable        nothing happened; the outcomes have not arrived yet
+
+    Metrics are named `*_on_allowed`, never plain precision/recall, because outcomes exist only
+    where the payment was allowed. Where a holdout exists, the released sample estimates what
+    the block wall is hiding.
+    """
+    if STORE is None:
+        return {"substrate": "unavailable"}
+    try:
+        from core.model_performance import diagnose, trend
+        return {"diagnosis": diagnose(STORE, window_days=window_days),
+                **trend(STORE, windows=windows, window_days=window_days,
+                        mature_only=mature_only)}
+    except Exception as e:                                        # never take the page down
+        return {"substrate": "error", "detail": str(e)[:200]}
+
+
 @app.post("/outcomes")
 def post_outcomes(body: dict):
     """Ingest outcome reports: chargebacks, recalls, confirmed losses, victim reports.
