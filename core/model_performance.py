@@ -304,8 +304,9 @@ def diagnose(store, *, window_days: int = 30, as_of=None) -> dict:
             "maturity_known": recent["maturity"]["known"]}
 
     if not recent.get("measurable"):
+        why = recent.get("reason", "the recent window carries too few outcomes").rstrip(". ")
         return {**base, "verdict": "unmeasurable",
-                "reason": (f"{recent.get('reason', 'the recent window carries too few outcomes')} "
+                "reason": (f"{why}. "
                            f"This is a statement about the label supply, not about the model. "
                            f"Do not retrain on it."),
                 "label_coverage": recent["label_coverage"]}
