@@ -1,0 +1,17 @@
+#!/bin/sh
+# Refuse commits straight onto the default branch.
+#
+# Written after doing exactly that: the novelty-gate wiring was committed and pushed to main
+# with no branch and no PR, because the branch for that piece of work had been created in the
+# SIBLING repo and the mistake is invisible while you are busy in another directory.
+#
+# `git branch --show-current` is not enough to notice in the moment, so this notices for you.
+# Deliberate exceptions: git commit --no-verify.
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+  echo "pre-commit: refusing to commit directly to '$branch'." >&2
+  echo "  git checkout -b <branch>   then commit, push and open a PR." >&2
+  echo "  Deliberate exception: git commit --no-verify" >&2
+  exit 1
+fi
+exit 0
