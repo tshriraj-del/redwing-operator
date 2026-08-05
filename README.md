@@ -254,6 +254,7 @@ investigated rather than on whether its answer reads well.
 | POST | `/env/run` | Run one scenario end to end |
 | POST | `/env/run-all` | Run the whole suite |
 | POST | `/env/step` | Single-step an episode |
+| POST | `/env/agent` | Run the LLM investigator, graded by the same verifiers (`compare: true` ranks it against the reference policies) |
 | GET | `/adversary/strategies` | Evasion strategies the red-team simulator can apply |
 | POST | `/adversary/simulate` | Attack a rule or model and report what survives |
 
@@ -323,6 +324,7 @@ needs numpy and so wants the venv.
 | Actor Intelligence | `motive.py`, `scam_arc.py`, `mule_network.py`, `mule_behaviour.py`, `first_party.py`, `vulnerability.py`, `loophole.py`, `onboarding.py` | Who and why: offender motive, victim grooming arc, mule witting-ness from observable tells, first-party intent, victimization risk, policy exploitation, onboarding gauntlet |
 | Label supply | `outcome_ledger.py`, `label_maturity.py`, `backfill_outcome_labels.py` | Outcomes from chargebacks and recalls with source precedence; arrival-lag curve and maturity floor; recovering the machine's call onto historical decisions |
 | Learning | `holdout.py`, `graduation.py`, `train.py`, `seed_substrate.py`, `active_learning.py` | Monitored holdout, graduation gate, stdlib trainer, synthetic cohort, next-best-label queue |
+| Agents | `investigator_agent.py` | An LLM investigator driven through `fraud_env.py` and graded by its verifiers, never by itself |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
 | Decisioning | `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
