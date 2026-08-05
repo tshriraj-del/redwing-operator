@@ -668,6 +668,17 @@ def health():
         "features": FEATURES,
         "model_metrics": config.get("metrics", {}) if MODEL_OK else {},
         "patterns": len(PATTERNS),
+        # The unsupervised second opinion's status and its measured contribution. Reported
+        # here so "is the gate actually on?" is answerable without reading the boot log, which
+        # is how it stayed unwired and unnoticed for as long as it did.
+        "novelty_gate": ({
+            "loaded": True,
+            "standalone_auc": (config.get("anomaly") or {}).get("standalone_auc"),
+            "threshold": (config.get("anomaly") or {}).get("novelty_threshold"),
+            "composition": "escalate-only, capped at the alert line",
+        } if ANOMALY else {"loaded": False,
+                           "why": "artifact missing, stale, or unreadable; supervised "
+                                  "scoring is unaffected"}),
     }
 
 
