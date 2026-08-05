@@ -1012,6 +1012,25 @@ def env_run(body: dict):
     return fraud_env.run_episode(case, agent=str(body.get("agent", "investigator")))
 
 
+@app.post("/env/agent")
+def env_agent(body: dict):
+    """Run the LLM investigator on one case, graded by the environment's own verifiers.
+
+    Body: {transaction_id, compare?}. With `compare: true` it also runs the three reference
+    policies on the same case and ranks them together, which is the honest presentation: the
+    `investigator` policy is a strong hand-written baseline, and an agent that does not beat it
+    should be seen not beating it.
+
+    Without an ANTHROPIC_API_KEY this returns available=false and says so. It does not fall
+    back to a scripted policy and report the result as an agent run.
+    """
+    from core.investigator_agent import compare, run_episode
+    case = _case_for_env(str(body.get("transaction_id", "")))
+    if body.get("compare"):
+        return compare(case)
+    return run_episode(case)
+
+
 @app.post("/env/run-all")
 def env_run_all(body: dict):
     """Run every reference policy on one case - shows that the verifiers discriminate
