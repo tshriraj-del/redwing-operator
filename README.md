@@ -78,7 +78,7 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/score` | Score a single transaction (XGBoost + rule engine) |
+| POST | `/score` | Score a single transaction (XGBoost + rule engine + novelty gate) |
 | POST | `/score/payment` | Score against the real-label card model (ULB), calibrated |
 | GET | `/payment/meta` | That model's provenance and honest headline metric |
 | GET | `/monitor/stream` | SSE stream of live transaction scoring |
@@ -88,6 +88,25 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/narrative` | Plain-language scam narrative for a decision |
 | GET | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
+
+### The Novelty Gate
+
+A supervised model is blind by construction to patterns unlike its training labels. An
+unsupervised isolation forest (trained in the ML repo, calibrated there, loaded here) supplies
+the one view XGBoost structurally lacks: *we have never seen this before*.
+
+It is a **gate, not a blend**, because blending was measured to dilute the supervised model on
+known fraud. XGBoost and the consortium speak first; the gate may then raise a score to the
+alert line and no further, and may never lower one. An unsupervised detector saying "this is
+unusual" is a reason to look, not a reason to be sure.
+
+Measured on held-out test: recovers **751 of the 1,681 frauds XGBoost missed**, taking catch
+from **11.2% to 50.9%** for **1.04%** of legitimate traffic sent to review. Reported as a
+`novelty` block beside the score, never folded into it, so an analyst can see that a payment
+arrived because it was unusual rather than because the model was confident.
+
+If the artifact is missing, throws, or was trained on a different feature set, the gate declines
+to load and supervised scoring continues untouched.
 
 ### The Closed Loop
 

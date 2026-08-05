@@ -100,6 +100,19 @@ async def _require_api_key(request: Request, call_next):
             return JSONResponse({"detail": "invalid or missing X-API-Key"}, status_code=401)
     return await call_next(request)
 
+def gate_is_compatible(iso, features) -> bool:
+    """Is this novelty artifact trained on the feature set the model currently uses?
+
+    Named and separate so it can be tested against a genuinely stale artifact, rather than only
+    asserted about whatever happens to be on disk. The stale case is not hypothetical: the
+    isolation forest sitting in the ML repo was trained on 23 features while the supervised
+    model had moved to 32, and loading it would have scored a feature space that no longer
+    means what it did.
+    """
+    n = getattr(iso, "n_features_in_", None)
+    return n is None or int(n) == len(features)
+
+
 # Load models once at startup
 import sys
 sys.path.insert(0, str(MODELS_DIR))   # share the ML backend's feature foundation
@@ -115,6 +128,34 @@ try:
         xgb    = pickle.load(open(MODELS_DIR / "xgboost.pkl", "rb"))
         MODEL_TAG = "original"
     config  = json.load(open(MODELS_DIR  / "model_config.json"))
+    # The NOVELTY GATE. Trained by pulseml_models/anomaly_layer.py, saved to disk, and until
+    # now never loaded by the operator: the README described it as 30% of an ML ensemble while
+    # nothing in the live path had ever opened the file.
+    #
+    # It is deliberately NOT a blend. anomaly_layer.py measured that blending the anomaly score
+    # into XGBoost DILUTES the supervised model on known fraud, so the design is a gate:
+    # XGBoost drives the decision, and this only speaks up to escalate something XGBoost was
+    # about to let through. It can raise a score, never lower one.
+    ANOMALY = None
+    try:
+        _acfg = config.get("anomaly") or {}
+        _iso = pickle.load(open(MODELS_DIR / "anomaly_iforest.pkl", "rb"))
+        _span = (float(_acfg["hi"]) - float(_acfg["lo"])) or 1.0
+        if not gate_is_compatible(_iso, config["features"]):
+            # A stale gate is worse than none: it was trained on a different feature set, so
+            # its notion of "unusual" describes a model that no longer exists. Refusing is the
+            # only safe read, and it is loud rather than silent.
+            print(f"⚠ novelty gate NOT loaded: trained on {_iso.n_features_in_} features, "
+                  f"the current set has {len(config['features'])}. Re-run anomaly_layer.py.")
+        else:
+            ANOMALY = {"iso": _iso, "hi": float(_acfg["hi"]), "span": _span,
+                       "threshold": float(_acfg.get("novelty_threshold", 1.0)),
+                       "auc": _acfg.get("standalone_auc")}
+            print(f"✓ Novelty gate loaded (standalone AUC {_acfg.get('standalone_auc')}, "
+                  f"escalate-only)")
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as _e:
+        print(f"⚠ novelty gate unavailable ({type(_e).__name__}); "
+              f"supervised scoring continues unaffected")
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
@@ -267,6 +308,50 @@ def ml_score_row(features: dict) -> float:
     return float(xgb.predict_proba(X_scaled)[0][1])
 
 
+def _alert_line() -> float:
+    """The live alert threshold, read from is_alert's own default rather than restated here.
+    A second copy of 0.65 in this file is how the gate and the alert decision drift apart."""
+    d = getattr(is_alert, "__defaults__", None)
+    return float(d[0]) if d else 0.65
+
+
+def novelty_view(features: dict) -> dict:
+    """The unsupervised second opinion on one payment.
+
+    Returns {available, anomaly, novel} where `anomaly` is the calibrated 0-1 score
+    (anomaly_layer.py anchors p50 of train to 0 and p1 to 1) and `novel` says whether it
+    crosses the ~99th-percentile threshold, i.e. roughly the most anomalous 1% of traffic.
+    """
+    if not MODEL_OK or ANOMALY is None or not FEATURES:
+        return {"available": False, "anomaly": 0.0, "novel": False}
+    try:
+        X = scaler.transform(np.array([[float(features.get(f, 0.0)) for f in FEATURES]]))
+        raw = float(ANOMALY["iso"].score_samples(X)[0])          # lower = more anomalous
+        a = max(0.0, min(1.0, (ANOMALY["hi"] - raw) / ANOMALY["span"]))
+        return {"available": True, "anomaly": round(a, 4),
+                "novel": a >= ANOMALY["threshold"]}
+    except Exception:                                            # noqa: BLE001
+        # An unsupervised second opinion must never cost a decision.
+        return {"available": False, "anomaly": 0.0, "novel": False}
+
+
+def apply_novelty_gate(score: float, features: dict) -> tuple:
+    """Escalate-only composition of the novelty gate onto a supervised score.
+
+    Returns (score_after, view). The gate can only RAISE a score to the alert line, never lower
+    one and never past it into an auto-decline: an unsupervised detector saying "this is
+    unusual" is a reason to look, not a reason to be sure. Measured on held-out test, this
+    recovers 751 of the 1,681 frauds XGBoost missed, taking catch from 11.2% to 50.9% for 1.04%
+    of legitimate traffic sent to review.
+    """
+    view = novelty_view(features)
+    if not view["available"] or not view["novel"]:
+        return score, view
+    raised = max(float(score), _alert_line())
+    view["escalated"] = raised > float(score)
+    return raised, view
+
+
 def _network_view(row: dict, local_score: float):
     """Authorization IQ applied to one payment: returns (pack_or_None, score_after_network).
 
@@ -334,6 +419,13 @@ def build_event(row) -> dict:
     # score came from outside their own institution.
     aiq, network_score = _network_view(row, cascade_score)
 
+    # The novelty gate, applied AFTER the network view and on the same escalate-only terms.
+    # Order matters and is deliberate: the supervised model and the consortium both speak
+    # first, and the unsupervised detector only gets to raise what those two were about to let
+    # through. That keeps "this is unusual" in its proper place, a reason to look rather than a
+    # reason to be sure.
+    network_score, novelty = apply_novelty_gate(network_score, features)
+
     # bool() on a CSV field is a trap: bool("False") is True, because a non-empty string is
     # truthy. Scoring a CSV-sourced row therefore flagged EVERY non-fraud transaction as an
     # alert. Measured over 3,000 replayed payments: the model's own call fired on 0.07% and
@@ -373,6 +465,10 @@ def build_event(row) -> dict:
         "network_reveal":    bool(aiq.get("network_reveal")) if aiq else False,
         "network_codes":     [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":          alert,
+        # Reported separately, never folded silently into the score, for the same
+        # reason the network contribution is: an analyst must be able to see that a
+        # payment was raised by an unsupervised detector rather than by the model.
+        "novelty":           novelty,
         "matched_signals":   top["matched_signals"] if top else [],
         "graph_context":     graph_ctx,
         "graph_risk_score":  graph_ctx["graph_risk_score"],
@@ -687,6 +783,11 @@ def score(body: dict):
     # reported separately below so the network's contribution is never hidden in the headline.
     aiq, net_score = _network_view(body, c_score)
 
+    # Same gate, same order, same terms as build_event(). Applied here too because /score is a
+    # second decision path, and a control that lives on only one of them is a control that
+    # disagrees with itself depending on how the payment arrived.
+    net_score, novelty = apply_novelty_gate(net_score, features)
+
     transaction_id = str(body.get("transaction_id", f"txn_{uuid.uuid4().hex[:8]}"))
     explanation = _xai_explain(
         features       = features,
@@ -737,6 +838,11 @@ def score(body: dict):
         "network_risk":   round(float(aiq["network_risk"]), 4) if aiq else None,
         "network_lift":   round(net_score - c_score, 4),
         "network_reveal": bool(aiq.get("network_reveal")) if aiq else False,
+        # The unsupervised second opinion, reported beside the score rather than folded into
+        # it, on the same principle as network_reveal above: an analyst must be able to see
+        # that a payment reached them because it was UNUSUAL, not because the model was
+        # confident. Those two justify very different next steps.
+        "novelty":        novelty,
         "network_codes":  [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":       alert,
         "top_pattern":    top,
