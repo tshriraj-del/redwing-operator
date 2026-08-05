@@ -86,7 +86,7 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | GET | `/case/{transaction_id}` | The investigator case file for one transaction |
 | POST | `/case` | Case file for an ad-hoc transaction body |
 | POST | `/narrative` | Plain-language scam narrative for a decision |
-| GET | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
+| POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
 ### The Novelty Gate
@@ -292,7 +292,6 @@ investigated rather than on whether its answer reads well.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/xai/explain` | SHAP explanation for a transaction |
 | GET | `/xai/explain/{transaction_id}` | The stored explanation for one scored transaction |
 | GET | `/xai/explanations` | Recent explanations with their feature attributions |
 | GET | `/xai/model-card` | Model card: training data, validation regime, known limitations |
@@ -303,7 +302,6 @@ investigated rather than on whether its answer reads well.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/llm/proxy` | Routes LLM requests server-side - supports Anthropic, OpenAI, Groq, Mistral. API key never touches the browser. |
-| POST | `/llm/stream` | Streaming variant of the LLM proxy (SSE) |
 
 ### Integration Hub
 
