@@ -1428,6 +1428,65 @@ def substrate_next_questions(limit: int = 10):
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
 
 
+@app.post("/authorize")
+def authorize_payment(body: dict):
+    """A card authorization. Approve or decline, inside the window, with a response code.
+
+    The question a network actually asks, and the one this platform could not answer until now:
+    every other layer existed and none of them were reachable from an authorization.
+
+    Body is the auth message: amount, merchant_id / merchant_name, mcc_code, entry_mode,
+    cardholder_name, plus whatever the issuer knows (available_balance, daily_count,
+    account_age_days). Everything is optional; missing fields simply mean that check cannot run.
+
+    NOT connected to a network. There is no ISO 8583 wire format and no acquirer. This models
+    the contract an issuer operates under so decisioning can be built and measured against it.
+    """
+    from core.authorization import authorize
+
+    def _scorer(msg):
+        # The real scorer, on the real feature foundation. Injected rather than imported inside
+        # core/authorization so that module stays free of the ML stack and testable without it.
+        try:
+            feats = compute_features(msg)
+            p = ml_score_row(feats)
+            matches = score_transaction(feats)
+            top = matches[0] if matches else None
+            return combined_score(p, top["confidence"]) if top else p, {
+                "scored": True, "typology": (top or {}).get("name", ""),
+                "ml": round(float(p), 4)}
+        except Exception as e:                                    # noqa: BLE001
+            # A scorer failure must not stop an authorization: the network still needs an
+            # answer inside the window, and no score means fall through to policy on 0 risk
+            # rather than time out.
+            return 0.0, {"scored": False, "error": type(e).__name__}
+
+    return authorize(body or {}, score_fn=_scorer)
+
+
+@app.get("/authorize/contract")
+def authorization_contract():
+    """The response codes this issuer emits, and which of them permit a retry.
+
+    Soft versus hard is contractual: networks limit re-attempts on specific codes and fine
+    violations, so anything building a recovery flow needs to read this rather than guess.
+    """
+    from core.authorization import (AUTH_BUDGET_MS, HARD_DECLINES, RESPONSE_CODES,
+                                    SOFT_DECLINES, STIP_THRESHOLD_MS)
+    return {
+        "budget_ms": AUTH_BUDGET_MS, "stand_in_threshold_ms": STIP_THRESHOLD_MS,
+        "codes": [{"code": c, "text": t,
+                   "class": ("approved" if c == "00" else
+                             "soft" if c in SOFT_DECLINES else
+                             "hard" if c in HARD_DECLINES else "other"),
+                   "retry_allowed": c == "00" or c in SOFT_DECLINES}
+                  for c, t in sorted(RESPONSE_CODES.items())],
+        "note": ("modelled, not connected to a network. No ISO 8583 wire format and no "
+                 "acquirer; this is the contract an issuer operates under, so decisioning can "
+                 "be measured against it."),
+    }
+
+
 @app.get("/screening/status")
 def screening_status():
     """Is sanctions screening actually in force?
