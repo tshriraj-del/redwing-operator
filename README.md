@@ -89,6 +89,26 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
+### Decline Contracts
+
+A decline today is a dead end: the member sees "declined", the merchant sees `05 Do Not Honor`,
+and a good customer is lost without the issuer learning it was wrong. False declines cost US
+ecommerce more than card fraud does.
+
+`decline_contract.py` makes a decline an object carrying four things a bare code does not: our
+own **recoverability** judgement (`05` hides both a member who needs to verify and a card we
+will never approve), the **price** of getting it wrong for this member, a **remediation
+contract** at four disclosure levels, and an HMAC-bound, expiring **recovery token**.
+
+The token is what makes varying disclosure safe. Without it, "verify and retry" is advice an
+attacker can also follow; with it, the retry arrives carrying proof that the remediation was
+performed, by the member it was issued to, inside its window. Tokens are bound to the member,
+carry no reason text, and are never attached to the opaque disclosure level.
+
+The module deliberately does **not** choose a level. That choice is a priced trade between
+recovery uplift and information handed to an adversary, and it needs a causal estimate that does
+not exist yet.
+
 ### The Novelty Gate
 
 A supervised model is blind by construction to patterns unlike its training labels. An
