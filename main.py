@@ -234,6 +234,7 @@ from core.ingest_schema import validate_event, contract as ingest_contract
 from core.stream import DurableQueue, BackpressureError
 from core.connectors import FileConnector, DBConnector
 from core.webhook import WebhookReceiver
+from core.decision_policy import decide as decide_action
 from core.liability import expected_liability, price_decision
 from core.narrative import scam_narrative
 try:
@@ -384,6 +385,16 @@ def _network_view(row: dict, local_score: float):
         return None, local_score      # the network layer must never fail a score
 
 
+def _account_age(row) -> float:
+    """Account age in days, defaulting to established. Defaulting the OTHER way would put every
+    row with a missing field into the new-account tier and apply its harder floor to customers
+    who have been here for years."""
+    try:
+        return max(0.0, float(row.get("account_age_days", 365)))
+    except (TypeError, ValueError):
+        return 365.0
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -517,10 +528,26 @@ def build_event(row) -> dict:
     # observed, giving clean counterfactual ground truth. Decided BEFORE the durable trail is
     # written, so the backbone records the action actually enforced. (Deciding it after meant a
     # released case was still logged as an alert, and liability_at_risk counted it.)
+    # The PRICED action is what the money supports; the POLICY bounds it. Until now these eight
+    # actions collapsed into `"HOLD" if is_alert else "ALLOW"`, so a $12 card payment and a
+    # $40,000 push to a three-day-old payee resolved identically. The policy applies the
+    # institution's floor and ceiling per rail and risk band, and stamps the version of the
+    # table that produced the decision so an outcome change can later be attributed to the
+    # policy change that caused it.
+    _priced = event["decision_economics"].get("recommended_action") or (
+        "HOLD" if event["is_alert"] else "ALLOW")
+    _tier = "new_account" if _account_age(row) < 30 else ""
+    # Banded on network_score, the score that ACTUALLY drove the alert, not on cascade_score.
+    # cascade_score is taken before the consortium view and the novelty gate, so banding on it
+    # meant a payment those two had escalated to the alert line still got the low-band floor:
+    # the escalation reached the alert boolean and never reached the policy.
+    event["policy"] = decide_action(
+        _priced, network_score, rail=event["rail"], direction="outbound", tier=_tier)
+
     ho = None
     if STORE is not None:
         try:
-            proposed = "HOLD" if event["is_alert"] else "ALLOW"
+            proposed = event["policy"]["action"]
             ho = holdout_decision(event["transaction_id"], proposed, event["expected_liability"])
             if ho["release"]:
                 event["is_alert"] = False          # actually let through, and monitored
@@ -814,6 +841,18 @@ def score(body: dict):
 
     alert = is_alert(net_score)
 
+    # Same policy, same terms, on this path too. /score is a second decision path and a policy
+    # that lives on only one of them is a policy that disagrees with itself depending on how the
+    # payment arrived, which is exactly the drift _network_view was centralised to prevent.
+    _sc_priced = price_decision(
+        net_score, float(body.get("amount", 0) or 0), typology=(top or {}).get("name", ""),
+        rail=str(body.get("payment_rail", "")), action=("HOLD" if alert else "ALLOW"),
+        account_age_days=body.get("account_age_days", 365)).get("recommended_action") or (
+            "HOLD" if alert else "ALLOW")
+    policy = decide_action(
+        _sc_priced, net_score, rail=str(body.get("payment_rail", "")), direction="outbound",
+        tier=("new_account" if _account_age(body) < 30 else ""))
+
     # Training substrate: this endpoint is the what-if / sandbox path (the UI scores ad-hoc
     # transactions through it), so nothing here is enforced against a real customer. It is
     # still recorded, as a SHADOW decision: the point-in-time feature snapshot is exactly what
@@ -854,6 +893,10 @@ def score(body: dict):
         # that a payment reached them because it was UNUSUAL, not because the model was
         # confident. Those two justify very different next steps.
         "novelty":        novelty,
+        # The priced action, the policy that bounded it, and the version of the
+        # table that did the bounding. Reported together because a decision you
+        # cannot attribute to a policy is one you cannot defend later.
+        "policy":         policy,
         "network_codes":  [c["code"] for c in aiq["reason_codes"]] if aiq else [],
         "is_alert":       alert,
         "top_pattern":    top,

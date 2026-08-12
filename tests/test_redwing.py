@@ -436,6 +436,58 @@ def test_analyst_adjudication_becomes_gold_the_gate_can_use():
 
 
 # -- standalone runner (no pytest needed) --------------------------------------
+# -- Reimbursement posture (L0) ------------------------------------------------
+#
+# The rates in core/liability.py assume the institution reimburses scam losses on push rails.
+# That is correct under the UK PSR mandate and is NOT settled law in the US: Reg E covers
+# UNAUTHORIZED transfers, and a scam-induced push is legally authorized because the customer
+# pressed send. Whether US institutions bear it anyway is being decided in litigation. So it is
+# a policy choice the institution makes, and the module could only express one of them until
+# now: the false-positive side took a config override while the reimbursement side, the
+# contested one, was hardcoded.
+
+def test_posture_changes_the_bar_for_blocking_the_same_payment():
+    """THE point of L0. A bank that reimburses scam losses and one that follows Reg E only face
+    genuinely different economics on the identical transaction, and the platform has to be able
+    to price both."""
+    from core.liability import breakeven_p
+    reimburse = breakeven_p(9000, "app_scam", "zelle", "BLOCK", "medium", 400,
+                            {"posture": "reimburse_scams"})
+    reg_e = breakeven_p(9000, "app_scam", "zelle", "BLOCK", "medium", 400,
+                        {"posture": "reg_e_only"})
+    assert reg_e > reimburse * 2, (
+        f"posture barely moved the break-even ({reimburse} -> {reg_e}); the config is probably "
+        f"being dropped before it reaches reimbursement_rate()")
+
+
+def test_posture_does_not_discount_an_unauthorized_transfer():
+    """Reg E covers account takeover whatever posture the institution takes. Letting posture
+    discount it would price away an exposure the law imposes, which is the one thing a posture
+    setting must never be able to do."""
+    from core.liability import expected_liability
+    a = expected_liability(0.3, 9000, "account_takeover_ai", "zelle", {"posture": "reimburse_scams"})
+    b = expected_liability(0.3, 9000, "account_takeover_ai", "zelle", {"posture": "reg_e_only"})
+    assert a == b > 0
+
+
+def test_posture_reaches_the_priced_decision_not_just_the_raw_rate():
+    """price_decision() and breakeven_p() both re-derived the exposure internally and dropped
+    the config on the way. Posture looked configurable and did nothing where it mattered."""
+    from core.liability import price_decision
+    strict = price_decision(0.20, 9000, "app_scam", "zelle", "BLOCK", "medium", 400,
+                            {"posture": "reimburse_scams"})
+    lenient = price_decision(0.20, 9000, "app_scam", "zelle", "BLOCK", "medium", 400,
+                             {"posture": "reg_e_only"})
+    assert strict["cost_of_allowing"] > lenient["cost_of_allowing"] * 2
+
+
+def test_an_unknown_posture_falls_back_to_full_exposure():
+    """Failing safe on the fraud side means assuming you DO bear the loss. A typo in a config
+    must not quietly halve an institution's measured exposure."""
+    from core.liability import reimbursement_rate
+    assert (reimbursement_rate("app_scam", "zelle", {"posture": "typo"})
+            == reimbursement_rate("app_scam", "zelle", {"posture": "reimburse_scams"}))
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
