@@ -69,14 +69,68 @@ _TYPOLOGY_MULT = {
 }
 
 
-def reimbursement_rate(typology: str = "", rail: str = "") -> float:
-    """Fraction of a loss on this rail/typology the institution is exposed to."""
-    base = _RAIL_LIABILITY.get(str(rail).strip().lower(), 0.50)
-    mult = _TYPOLOGY_MULT.get(str(typology).strip().lower(), 1.00)
-    return round(min(1.0, base * mult), 4)
+# REIMBURSEMENT POSTURE. The rates above assume the institution reimburses scam losses on push
+# rails, which is correct under the UK PSR mandate and is NOT settled law in the United States.
+#
+# Regulation E covers UNAUTHORIZED transfers. A scam-induced push is legally AUTHORIZED, because
+# the customer pressed send, so no federal reimbursement right attaches to it. The UK named that
+# category and legislated for it; Congress has not. Whether US institutions bear it anyway is
+# being decided in litigation rather than rulemaking, most visibly the New York Attorney
+# General's Zelle suit after the CFPB dropped its own.
+#
+# So on a US book this is a POLICY CHOICE the institution makes and must defend, not a constant.
+# Two banks with different postures face genuinely different break-even thresholds on the
+# identical payment, and until now this module could only express one of them: the
+# false-positive side took a `config` override and documented its numbers as assumptions, while
+# the reimbursement side was hardcoded. That asymmetry had it backwards, because the hardcoded
+# side is the contested one.
+POSTURES = {
+    # Reimburses scam losses voluntarily or under mandate. The UK-style default, and the
+    # posture the original table encoded.
+    "reimburse_scams": 1.00,
+    # Reimburses only what Reg E requires: unauthorized transfers. Authorized-push scam losses
+    # fall on the customer, so the institution's own exposure on those is small but not zero,
+    # because reputational and goodwill costs survive the legal position.
+    "reg_e_only": 0.25,
+    # Decides per case. Priced between the two rather than pretending the exposure is knowable.
+    "case_by_case": 0.60,
+}
+DEFAULT_POSTURE = "reimburse_scams"
+
+# Typologies that are AUTHORIZED pushes, where the posture actually bites. An account takeover
+# is unauthorized under Reg E whatever the posture, so posture must not discount it.
+_AUTHORIZED_PUSH = ("pig_butchering", "app_scam", "deepfake_social_engineering",
+                    "invoice_redirection", "job_scam", "romance_scam")
 
 
-def expected_liability(p_fraud, amount, typology: str = "", rail: str = "") -> float:
+def reimbursement_rate(typology: str = "", rail: str = "",
+                       config: dict | None = None) -> float:
+    """Fraction of a loss on this rail/typology the institution is exposed to.
+
+    `config` accepts `posture` (a key of POSTURES or a float 0-1) and `rail_liability` /
+    `typology_multiplier` overrides, so an institution replaces these with its own book the
+    same way it already can on the false-positive side.
+    """
+    cfg = config or {}
+    rails = {**_RAIL_LIABILITY, **(cfg.get("rail_liability") or {})}
+    mults = {**_TYPOLOGY_MULT, **(cfg.get("typology_multiplier") or {})}
+    base = rails.get(str(rail).strip().lower(), 0.50)
+    mult = mults.get(str(typology).strip().lower(), 1.00)
+
+    posture = cfg.get("posture", DEFAULT_POSTURE)
+    try:
+        p_mult = float(posture)
+    except (TypeError, ValueError):
+        p_mult = POSTURES.get(str(posture).strip().lower(), 1.00)
+    # Posture only discounts AUTHORIZED pushes. Applying it to an account takeover would price
+    # away an exposure Reg E imposes regardless of what the institution has chosen.
+    if str(typology).strip().lower() not in _AUTHORIZED_PUSH:
+        p_mult = 1.00
+    return round(min(1.0, base * mult * p_mult), 4)
+
+
+def expected_liability(p_fraud, amount, typology: str = "", rail: str = "",
+                       config: dict | None = None) -> float:
     """Dollars of expected reimbursement liability from letting this payment through.
     Never raises - returns 0.0 on bad input so it can sit in the hot score path."""
     try:
@@ -84,7 +138,7 @@ def expected_liability(p_fraud, amount, typology: str = "", rail: str = "") -> f
         amt = max(0.0, float(amount))
     except (TypeError, ValueError):
         return 0.0
-    return round(p * amt * reimbursement_rate(typology, rail), 2)
+    return round(p * amt * reimbursement_rate(typology, rail, config), 2)
 
 
 # -- The false-positive side (WS10) --------------------------------------------
@@ -177,7 +231,7 @@ def breakeven_p(amount, typology: str = "", rail: str = "", action: str = "BLOCK
     to lose by blocking)."""
     fp = false_positive_cost(amount, action, ltv_band, account_age_days, config)["total"]
     try:
-        exposure = max(0.0, float(amount)) * reimbursement_rate(typology, rail)
+        exposure = max(0.0, float(amount)) * reimbursement_rate(typology, rail, config)
     except (TypeError, ValueError):
         exposure = 0.0
     if exposure + fp <= 0:
@@ -197,7 +251,7 @@ def price_decision(p_fraud, amount, typology: str = "", rail: str = "", action: 
     except (TypeError, ValueError):
         p = 0.0
 
-    cost_allow = expected_liability(p, amount, typology, rail)
+    cost_allow = expected_liability(p, amount, typology, rail, config)
     fp = false_positive_cost(amount, action, ltv_band, account_age_days, config)
     cost_block = round((1.0 - p) * fp["total"], 2)
     thr = breakeven_p(amount, typology, rail, action, ltv_band, account_age_days, config)
