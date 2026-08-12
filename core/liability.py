@@ -34,6 +34,20 @@ contact cost) are ASSUMPTIONS, not measurements. They are defaults an institutio
 to replace with its own retention data, they are all overridable, and every priced decision
 returns the assumptions it used so a number can never be quoted without its inputs.
 
+TWO OF THOSE ASSUMPTIONS TURNED OUT TO BE MEASURABLE, and both were wrong:
+
+  The card rail's liability was set at 0.15 on the reasoning quoted above, that card fraud is
+  "largely chargeback- and network-protected". Directionally right, quantitatively wrong by
+  half: the Federal Reserve puts the issuer's share of 2023 US debit fraud losses at 28.3%.
+  Understating it made blocking a card payment look cheaper relative to allowing one.
+
+  The revenue forgone on a decline was a flat 2% margin. On a card that revenue is interchange,
+  which is a two-part tariff, and on small tickets the fixed leg dominates. Both figures now
+  come from the Fed's Regulation II biennial report on 2023 and are cited at the constant.
+
+The distinction this file now keeps is between a number with a source and a number that is a
+considered guess. Both are legitimate; conflating them is not.
+
 Pure Python - unit-testable without the ML stack.
 """
 
@@ -51,7 +65,16 @@ _RAIL_LIABILITY = {
     "open_banking": 0.75,
     "ach":     0.60,
     "bnpl":    0.45,
-    "card":    0.15,
+    # MEASURED, not assumed, and it was assumed at 0.15 until it was checked. The Federal
+    # Reserve's Regulation II biennial report on calendar-year 2023 (published December 2025)
+    # puts the issuer's share of US debit card fraud losses at 28.3%, against 49.9% borne by
+    # merchants and the remainder by cardholders. Liability shift is why: unauthenticated
+    # card-not-present fraud lands mostly on the merchant, and chip card-present lands on the
+    # issuer. https://www.federalreserve.gov/paymentsystems/2023-interchange-fee.htm
+    #
+    # Understating this by half made blocking a card payment look cheaper than it is relative
+    # to allowing one, which is the opposite of the bias the rest of this section guards against.
+    "card":    0.283,
     "":        0.50,
 }
 
@@ -174,7 +197,29 @@ _CHURN_BY_ACTION = {
 _TENURE_CHURN_MULT = ((30, 2.0), (90, 1.5), (365, 1.0), (10**9, 0.7))
 
 _CONTACT_COST = 12.0     # one support contact to unwind a false decline
-_MARGIN_RATE = 0.02      # revenue margin forgone on the declined payment itself
+
+# Revenue forgone on the declined payment itself. Flat for rails where the institution's margin
+# genuinely is a percentage, and NOT flat on card, where it is interchange and interchange has a
+# fixed leg.
+#
+# The card figures are the Fed's published averages for a Durbin-exempt dual-message (signature)
+# debit programme: $0.62 per transaction and 1.41% of value in 2023, which pin the average ticket
+# they were measured at to $43.97. The two-part tariff below reproduces both at that ticket.
+# https://www.federalreserve.gov/paymentsystems/2023-interchange-fee.htm
+#
+# Why the shape matters and not just the level: on a $47 ticket the fixed leg is 8% of the fee
+# and on a $5 ticket it is 44%. A flat 2% says declining a $5 purchase costs a tenth of a cent
+# of margin, when it actually costs eleven cents. Small-ticket declines are where a risk policy
+# and the P&L disagree most, so flattening the fee hides exactly the disagreement this module
+# exists to price.
+#
+# Duplicated from pulseml_models/payment_economics.py rather than imported: these repositories
+# deploy independently and a cross-repo import would couple them for two constants. Both cite
+# the same source, and both carry a test that reproduces it.
+_MARGIN_RATE = 0.02
+_CARD_INTERCHANGE_FIXED = 0.05
+_CARD_INTERCHANGE_RATE = (0.62 - _CARD_INTERCHANGE_FIXED) / (0.62 / 0.0141)
+_CARD_RAILS = ("card", "debit", "credit")
 
 
 def _tenure_mult(account_age_days) -> float:
@@ -188,19 +233,49 @@ def _tenure_mult(account_age_days) -> float:
     return 1.0
 
 
+def forgone_revenue(amount, rail: str = "", config: dict | None = None) -> float:
+    """Revenue the institution loses by not completing this payment.
+
+    On a card rail this is INTERCHANGE, which is a two-part tariff, not a percentage. Everywhere
+    else it is a margin rate, which genuinely is proportional. Keeping them separate is the
+    difference between pricing a $5 decline at a tenth of a cent and pricing it at eleven cents.
+    """
+    cfg = config or {}
+    try:
+        amt = max(0.0, float(amount))
+    except (TypeError, ValueError):
+        return 0.0
+    if str(rail).strip().lower() in _CARD_RAILS:
+        rate = cfg.get("interchange_rate", _CARD_INTERCHANGE_RATE)
+        fixed = cfg.get("interchange_fixed", _CARD_INTERCHANGE_FIXED)
+        return float(rate) * amt + float(fixed)
+    return amt * float(cfg.get("margin_rate", _MARGIN_RATE))
+
+
 def false_positive_cost(amount, action: str = "BLOCK", ltv_band: str = "",
-                        account_age_days=365, config: dict | None = None) -> dict:
+                        account_age_days=365, config: dict | None = None,
+                        rail: str = "") -> dict:
     """Dollars of expected damage from wrongly actioning a legitimate customer.
 
-    Three components, because they behave differently: the margin forgone on this payment
+    Three components, because they behave differently: the revenue forgone on this payment
     scales with amount, the support contact is roughly fixed, and the attrition term dominates
     and scales with what the customer is worth. Returns the breakdown, not just a total, so a
-    decision can always be argued with rather than merely obeyed."""
+    decision can always be argued with rather than merely obeyed.
+
+    `rail` is new and defaults to empty, which keeps the previous flat-margin behaviour for every
+    caller that does not pass it. It exists because card revenue is interchange and interchange
+    has a fixed leg.
+
+    NOT CHANGED, deliberately: the support contact is still charged whenever churn is non-zero,
+    which assumes every wrongly-actioned customer generates one. That is certainly too high. It
+    stays because lowering it would REDUCE the cost of a false positive and therefore make the
+    system block more, and the only number available to justify that is another invented one.
+    Substituting one guess for another in the direction that harms members is not an improvement.
+    """
     cfg = config or {}
     ltv = cfg.get("ltv", _LTV_BAND.get(str(ltv_band).strip().lower(), _LTV_BAND[""]))
     churn = cfg.get("churn", _CHURN_BY_ACTION.get(str(action).strip().upper(), _CHURN_BY_ACTION[""]))
     contact = cfg.get("contact_cost", _CONTACT_COST)
-    margin = cfg.get("margin_rate", _MARGIN_RATE)
 
     try:
         amt = max(0.0, float(amount))
@@ -209,7 +284,7 @@ def false_positive_cost(amount, action: str = "BLOCK", ltv_band: str = "",
 
     p_churn = min(1.0, churn * _tenure_mult(account_age_days))
     attrition = p_churn * float(ltv)
-    lost_margin = amt * float(margin)
+    lost_margin = forgone_revenue(amt, rail, cfg)
     total = attrition + lost_margin + (float(contact) if churn > 0 else 0.0)
 
     return {
@@ -218,7 +293,11 @@ def false_positive_cost(amount, action: str = "BLOCK", ltv_band: str = "",
         "lost_margin": round(lost_margin, 2),
         "contact_cost": round(float(contact) if churn > 0 else 0.0, 2),
         "assumptions": {"ltv": float(ltv), "p_churn": round(p_churn, 4),
-                        "action": str(action).upper(), "tenure_mult": _tenure_mult(account_age_days)},
+                        "action": str(action).upper(), "rail": str(rail).strip().lower(),
+                        "revenue_model": ("interchange, two-part"
+                                          if str(rail).strip().lower() in _CARD_RAILS
+                                          else "flat margin rate"),
+                        "tenure_mult": _tenure_mult(account_age_days)},
     }
 
 
@@ -229,7 +308,7 @@ def breakeven_p(amount, typology: str = "", rail: str = "", action: str = "BLOCK
     Above it, block; below it, allow. This is the threshold, derived rather than tuned. It
     falls as the amount rises (more to lose by allowing) and rises with customer value (more
     to lose by blocking)."""
-    fp = false_positive_cost(amount, action, ltv_band, account_age_days, config)["total"]
+    fp = false_positive_cost(amount, action, ltv_band, account_age_days, config, rail)["total"]
     try:
         exposure = max(0.0, float(amount)) * reimbursement_rate(typology, rail, config)
     except (TypeError, ValueError):
@@ -252,7 +331,7 @@ def price_decision(p_fraud, amount, typology: str = "", rail: str = "", action: 
         p = 0.0
 
     cost_allow = expected_liability(p, amount, typology, rail, config)
-    fp = false_positive_cost(amount, action, ltv_band, account_age_days, config)
+    fp = false_positive_cost(amount, action, ltv_band, account_age_days, config, rail)
     cost_block = round((1.0 - p) * fp["total"], 2)
     thr = breakeven_p(amount, typology, rail, action, ltv_band, account_age_days, config)
 

@@ -296,6 +296,71 @@ def test_false_positive_cost_scales_with_how_hard_the_action_is():
     assert false_positive_cost(500, action="ALLOW")["attrition"] == 0.0
 
 
+def test_the_card_rails_liability_is_the_published_one_not_a_guess():
+    """It sat at 0.15 on the reasoning that card fraud is "largely chargeback- and
+    network-protected". Directionally right, quantitatively wrong by half. The Fed's Regulation
+    II report on 2023 puts the ISSUER's share of US debit fraud losses at 28.3%, with 49.9% on
+    merchants. Understating it made blocking a card payment look cheaper than allowing one."""
+    from core.liability import _RAIL_LIABILITY
+    assert abs(_RAIL_LIABILITY["card"] - 0.283) < 0.001, (
+        "the card liability drifted off the published figure")
+    # Still the lowest-liability rail, which was the original point and remains true.
+    assert _RAIL_LIABILITY["card"] < _RAIL_LIABILITY["ach"] < _RAIL_LIABILITY["zelle"]
+
+
+def test_forgone_revenue_on_a_card_is_interchange_and_has_a_fixed_leg():
+    """MUTATION GUARD. A flat margin rate says declining a $5 purchase costs a tenth of a cent,
+    when interchange on it is eleven cents. Small-ticket declines are where a risk policy and
+    the P&L disagree most, so flattening the fee hides exactly the disagreement this module
+    exists to price."""
+    from core.liability import forgone_revenue
+    small = forgone_revenue(5.0, rail="card") / 5.0
+    large = forgone_revenue(500.0, rail="card") / 500.0
+    assert small > large * 1.5, (
+        f"effective rate is {small:.4%} on $5 and {large:.4%} on $500; card revenue has "
+        "collapsed back to a flat percentage")
+    # Non-card rails genuinely are proportional, so they must stay that way.
+    assert abs(forgone_revenue(5.0, rail="zelle") / 5.0
+               - forgone_revenue(500.0, rail="zelle") / 500.0) < 1e-9
+
+
+def test_the_card_tariff_reproduces_the_published_averages():
+    """A constant fitted to a source that does not give the source back is a typo with a
+    citation attached. Fed 2023, Durbin-exempt dual-message: $0.62 per transaction and 1.41% of
+    value, which together pin the ticket they were measured at to $43.97."""
+    from core.liability import forgone_revenue
+    ticket = 0.62 / 0.0141
+    fee = forgone_revenue(ticket, rail="card")
+    assert abs(fee - 0.62) < 0.005, f"tariff gives ${fee:.4f} where the Fed published $0.62"
+    assert abs(fee / ticket - 0.0141) < 0.0002
+
+
+def test_the_rail_reaches_the_false_positive_side_and_not_only_the_fraud_side():
+    """The recurring defect in this codebase: a parameter threaded into one path and forgotten
+    on the other. Posture was dropped by breakeven_p and price_decision exactly this way. If
+    `rail` does not reach false_positive_cost, a card decline is priced on a flat margin while
+    the fraud side prices it as a card, and the two halves disagree silently."""
+    from core.liability import false_positive_cost
+    card = false_positive_cost(3.0, "DECLINE", "medium", 365, None, rail="card")
+    other = false_positive_cost(3.0, "DECLINE", "medium", 365, None, rail="zelle")
+    assert card["lost_margin"] > other["lost_margin"], (
+        "rail is not reaching the false-positive side; the fixed interchange leg is missing")
+    assert card["assumptions"]["revenue_model"] == "interchange, two-part"
+    assert other["assumptions"]["revenue_model"] == "flat margin rate"
+
+
+def test_a_decline_contract_prices_itself_as_a_card_because_that_is_all_it_handles():
+    """decline_contract works entirely on ISO 8583 response codes, so there is no other rail it
+    could be pricing. Leaving the default would have quietly valued every card decline on a flat
+    margin."""
+    from core.decline_contract import contract
+    c = contract(decline_id="d1", member_id="m1", code="05", cause="issuer_risk",
+                 amount=4.0, ltv_band="medium", account_age_days=365)
+    assert c["cost_detail"]["assumptions"]["rail"] == "card", (
+        "the rail parameter reaches the fraud side of the price but not the customer side")
+    assert c["cost_detail"]["assumptions"]["revenue_model"] == "interchange, two-part"
+
+
 def test_breakeven_threshold_moves_the_right_way():
     """The whole point of WS10: the bar is derived per transaction, not tuned globally."""
     from core.liability import breakeven_p

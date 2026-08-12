@@ -227,7 +227,13 @@ def contract(*, decline_id: str, member_id: str, code: str, cause: str,
     # pricing the block decision already uses, so a decline and a hold are valued on one scale.
     try:
         from .liability import false_positive_cost
-        cost = false_positive_cost(amount, "DECLINE", ltv_band, account_age_days, config)
+        # The rail is passed on, and it defaults to "card" here because this module works
+        # entirely on ISO 8583 response codes. It matters: on card the revenue forgone is
+        # interchange, which has a fixed leg, not a flat margin, so a small-ticket decline costs
+        # far more revenue than a percentage suggests. The parameter already existed on this
+        # function and was reaching the fraud side of the price but not the customer side.
+        cost = false_positive_cost(amount, "DECLINE", ltv_band, account_age_days, config,
+                                   rail=rail)
     except Exception:                                            # noqa: BLE001
         cost = {"total": 0.0, "unavailable": True}
 
