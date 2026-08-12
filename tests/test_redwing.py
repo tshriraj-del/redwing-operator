@@ -303,6 +303,69 @@ def test_serving_path_never_prices_or_narrates_from_ground_truth():
         "scam_narrative was written from the adjudicated label")
 
 
+def test_build_event_scores_a_card_row_with_the_card_model_not_the_push_model():
+    """THE gap /authorize's fix did not close. Every OTHER ingestion surface (/ingest,
+    /ingest/batch, the stream consumer, every source connector) calls build_event(), and it was
+    still scoring every card row with compute_features + ml_score_row, the push-payment path
+    that returns ~0.0 on a card message because the signal it wants (velocity, recipient
+    familiarity) is not there. Measured live before this fix: a $2,500 e-commerce authorization
+    with AVS fail, CVV fail and no 3DS scored identically to a $40 chip grocery purchase.
+
+    This does not assert a specific score (the model can retrain), only that the two messages
+    are now DIFFERENTIATED, and that a card row carries its own quality-graded score detail
+    rather than the push model's silent 0.0."""
+    _, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False) or getattr(main, "CARD", None) is None:
+        return
+
+    high_risk = main.build_event({
+        "transaction_id": "card_probe_hi", "user_id": "u_card", "amount": 2500.0,
+        "payment_rail": "card", "entry_mode": "ecom", "avs_result": "no_match",
+        "cvv_result": "no_match", "three_ds": "not_attempted", "mcc_code": 5999,
+        "account_age_days": 4,
+    })
+    low_risk = main.build_event({
+        "transaction_id": "card_probe_lo", "user_id": "u_card", "amount": 40.0,
+        "payment_rail": "card", "entry_mode": "chip", "mcc_code": 5411,
+        "account_age_days": 1100,
+    })
+    assert "card_score_detail" in high_risk and "card_score_detail" in low_risk
+    assert high_risk["card_score_detail"]["scored"] is True
+    assert high_risk["ml_score"] != low_risk["ml_score"], (
+        "a high-risk and a low-risk card authorization scored identically; build_event() is "
+        "still on the push-payment path for card rows")
+    assert high_risk["ml_score"] > low_risk["ml_score"]
+
+
+def test_build_event_leaves_non_card_rails_on_the_push_model():
+    """MUTATION GUARD, the other direction. The card branch must be rail-gated, not a blanket
+    replacement: a Zelle or wire event has no BIN, no entry mode, nothing card_message.py can
+    read, and must keep going through compute_features + ml_score_row exactly as before."""
+    _, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False):
+        return
+    event = main.build_event({
+        "transaction_id": "push_probe", "user_id": "u_push", "amount": 400.0,
+        "payment_rail": "zelle", "recipient_id": "r1", "device_id": "d1",
+    })
+    assert "card_score_detail" not in event
+
+
+def test_authorize_and_ingest_share_one_card_scoring_function():
+    """MUTATION GUARD against the exact defect this fix closes: /authorize's scorer and
+    build_event()'s card branch must be the SAME function, not two hand-copied versions of the
+    same logic. Two copies is how the calibration fix or the message-quality grading ends up
+    applied to one path and silently missing from the other, which is precisely how build_event()
+    was left behind the first time /authorize was fixed."""
+    _, main = _client_and_main()
+    if main is None:
+        return
+    import inspect
+    src = inspect.getsource(main.authorize_payment)
+    assert "score_card_message" in src, (
+        "/authorize no longer calls the shared scorer; a second inline copy may have crept back")
+
+
 def test_no_serving_function_reads_the_adjudicated_typology_column():
     """A source-level guard: the three serving functions must not mention the column at all.
     Analysis and display endpoints legitimately group historical data by it; these three

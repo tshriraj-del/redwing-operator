@@ -1197,6 +1197,100 @@ def test_ingest_schema_flags_label_leakage():
     assert any("leakage" in w["message"] for w in v["warnings"])   # do-not-feature warning
 
 
+def test_ingest_schema_normalises_card_fields_through_the_same_module_authorize_uses():
+    """Before this, `core/ingest_schema.py` knew "card" as a rail VALUE and nothing about the
+    message: no BIN, entry mode, AVS, CVV, 3DS or token status. Card fields rode through as
+    untyped passthrough on the general ingestion surface (POST /ingest, /ingest/batch, the
+    stream), even while /authorize had a real normaliser. Two independent notions of "a valid
+    card message" is the exact defect this codebase keeps producing."""
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 42.0, "user_id": "u1", "payment_rail": "card",
+                        "entry_mode": "chip", "bin": "400000", "merchant_id": "m1",
+                        "mcc_code": 5411, "tokenized": True})
+    assert v["valid"] is True
+    ev = v["event"]
+    assert ev["entry_mode"] == "chip"
+    assert ev["bin"] == "400000"
+    assert ev["tokenized"] == 1
+    assert "_card_quality" in ev
+
+
+def test_ingest_schema_field_aliases_resolve_through_the_shared_normaliser():
+    """A processor sending `avs` rather than `avs_result` must not silently produce an empty
+    field: alias resolution lives in one place (core/card_message.py) so it cannot drift between
+    the ingestion path and the authorization path."""
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 10.0, "user_id": "u1", "payment_rail": "card",
+                        "entry_mode": "ecom", "avs": "no_match", "cvv2_result": "no_match"})
+    ev = v["event"]
+    assert ev["avs_result"] == "no_match"
+    assert ev["cvv_result"] == "no_match"
+
+
+def test_ingest_schema_warns_on_a_card_message_missing_expected_fields():
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 10.0, "user_id": "u1", "payment_rail": "card",
+                        "entry_mode": "ecom"})   # no AVS/CVV/3DS on an ecom message
+    ev = v["event"]
+    assert ev["_card_quality"]["grade"] == "degraded"
+    assert "avs_result" in ev["_card_quality"]["decisive_missing"]
+    warned = {w["field"] for w in v["warnings"]}
+    assert "avs_result" in warned and "cvv_result" in warned
+
+
+def test_ingest_schema_does_not_flag_avs_missing_on_a_chip_message():
+    """A chip transaction cannot carry AVS or CVV; that absence is correct, not a defect, and
+    must not generate the same warning a genuine data-quality gap would. Only AVS/CVV/3DS are
+    exempt on card-present, so this message still reports OTHER unsupplied fields (channel, MCC,
+    ...) as missing; the assertion is specifically that the exempt ones are absent from both the
+    missing list and the warnings, not that the message is complete."""
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 10.0, "user_id": "u1", "payment_rail": "card",
+                        "entry_mode": "chip"})
+    ev = v["event"]
+    assert ev["_card_quality"]["grade"] != "degraded", (
+        "AVS/CVV/3DS absence on a card-present message must not read as a degraded score")
+    for f in ("avs_result", "cvv_result", "three_ds"):
+        assert f not in ev["_card_quality"]["missing_expected"]
+    warned = {w["field"] for w in v["warnings"]}
+    assert "avs_result" not in warned and "cvv_result" not in warned
+
+
+def test_ingest_schemas_own_amount_validation_is_not_overwritten_by_the_card_normaliser():
+    """MUTATION GUARD, on the case that is actually reachable. A negative or non-numeric amount
+    was the obvious worry, but it turns out already double-protected: this module short-circuits
+    `event` to None whenever `errors` is non-empty, and the amount check runs and appends to
+    `errors` BEFORE the card block, so a rejected amount never reaches the response regardless of
+    what the card merge does to `ev`. Reverting the exclusion does not fail on that case.
+
+    The real, always-reachable divergence is quieter: this module rounds amount to 2dp
+    (`round(amt, 2)`) and card_message.normalise() does not (`max(0.0, float(amount))`). On
+    every SUCCESSFUL card event, merging the card row's "amount" back in would silently replace
+    the rounded value with the unrounded one - a precision drift with no error to catch it.
+    """
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": "42.567", "user_id": "u1", "payment_rail": "card",
+                        "entry_mode": "chip"})
+    assert v["valid"] is True
+    assert v["event"]["amount"] == 42.57, (
+        f"got {v['event']['amount']!r}; the card normaliser's unrounded amount leaked back "
+        "into the validated event")
+
+
+def test_ingest_schema_leaves_non_card_rails_untouched_by_the_card_normaliser():
+    from core.ingest_schema import validate_event
+    v = validate_event({"amount": 10.0, "user_id": "u1", "payment_rail": "zelle"})
+    assert "_card_quality" not in v["event"]
+
+
+def test_the_ingest_contract_documents_card_fields():
+    from core.ingest_schema import contract
+    c = contract()
+    assert "card_fields" in c
+    assert "avs_result" in c["card_fields"]["categorical"]
+    assert "bin" in c["card_fields"]["identifiers"]
+
+
 def test_motive_is_inconclusive_on_weak_evidence():
     from core.motive import assess_actor
     # a whiff of hesitation must never escalate to enforcement

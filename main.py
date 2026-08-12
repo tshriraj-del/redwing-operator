@@ -468,6 +468,58 @@ def _account_age(row) -> float:
         return 365.0
 
 
+def score_card_message(msg: dict) -> tuple:
+    """THE CARD MODEL, not the push model. `(p_fraud, detail)`.
+
+    Extracted rather than left inline in /authorize's scorer, because build_event() needed the
+    identical logic: /ingest, /ingest/batch, the stream consumer and every source connector all
+    funnel a card-rail row through build_event(), and it was still scoring every one of them with
+    compute_features + ml_score_row, the PUSH-payment path. /authorize got fixed; this, the far
+    busier entry point, did not, so the same $2,500-scores-like-$40 blindness that /authorize had
+    for its whole life was still live on every other ingestion surface. One function now, so a
+    third entry point cannot repeat it a third time.
+    """
+    if CARD is None:
+        # NOT 0.0. A missing model is not a clean score, and the difference has to survive into
+        # the response or the next reader draws the same wrong conclusion this endpoint invited
+        # for the whole time it was mis-wired.
+        return 0.0, {"scored": False, "model_unavailable": True,
+                     "warning": "no card scorer loaded; this event was NOT risk-assessed and "
+                                "the score below is not a risk opinion"}
+    try:
+        from core.card_message import normalise, quality
+        art = CARD["art"]
+        norm = normalise(msg)
+        feats = CARD["featurise"](norm["row"], art["aggregates"])
+        X = art["vectorizer"].transform([feats])
+        p_raw = float(art["model"].predict_proba(X)[0][1])
+        # CALIBRATE. The raw XGBoost output is not a probability: scale_pos_weight is what makes
+        # a 0.26% base rate learnable and it inflates predicted p by 77x. Ranking is unaffected,
+        # which is why AUC and the frontier never showed it, but core/liability.py computes
+        # expected_liability = p x amount x rate, so an uncalibrated p over-blocks every card
+        # decision by two orders of magnitude.
+        cal = CARD.get("calibrator") or {}
+        if cal.get("a") is not None:
+            _z = math.log(min(max(p_raw, 1e-9), 1 - 1e-9) / (1 - min(max(p_raw, 1e-9), 1 - 1e-9)))
+            p = 1.0 / (1.0 + math.exp(-(float(cal["a"]) * _z + float(cal["b"]))))
+        else:
+            p = p_raw
+        return p, {"scored": True, "model": "card_scorer",
+                   "version": REGISTRY.version_of("card_scorer"),
+                   "ml": round(p, 6), "ml_raw": round(p_raw, 4),
+                   "calibrated": bool(cal.get("a") is not None),
+                   # What the message was missing travels WITH the score. A number computed
+                   # without AVS, CVV and 3DS is reading three of the model's top five features
+                   # as "not provided", and presenting it as the same number is how a
+                   # data-quality problem becomes a risk decision.
+                   "message_quality": quality(norm)}
+    except Exception as e:                                        # noqa: BLE001
+        # A scorer failure must not stop a decision. But it is reported as a failure, never as a
+        # zero risk.
+        return 0.0, {"scored": False, "error": type(e).__name__,
+                     "warning": "card scorer raised; this event was NOT risk-assessed"}
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -483,7 +535,22 @@ def build_event(row) -> dict:
                          member=str(row.get("user_name", "") or ""))
 
     features = compute_features(row)
-    ml  = ml_score_row(features)
+    # CARD ROWS GO THROUGH THE CARD MODEL, not the push-payment score below. features/matches
+    # still get computed either way, because the rule matcher and the graph/drift plumbing
+    # further down expect them to exist; only `ml`, the number everything downstream is DERIVED
+    # from (c_score, cascade_score, network_score, the priced decision), is replaced.
+    #
+    # This was the actual gap /authorize's fix did not close: every OTHER ingestion surface
+    # (/ingest, /ingest/batch, the stream consumer, every source connector) calls build_event(),
+    # and until this branch existed all of them still scored a card authorization with a model
+    # that looks for velocity and recipient familiarity a card message does not carry - the
+    # identical blindness /authorize had for its whole life, just on a busier door.
+    _is_card = str(row.get("payment_rail") or "").strip().lower() == "card"
+    card_detail = None
+    if _is_card:
+        ml, card_detail = score_card_message(row)
+    else:
+        ml = ml_score_row(features)
     matches = score_transaction(features)
     top = matches[0] if matches else None
 
@@ -567,6 +634,12 @@ def build_event(row) -> dict:
         "graph_risk_score":  graph_ctx["graph_risk_score"],
         "timestamp":         datetime.utcnow().isoformat() + "Z",
     }
+    if card_detail is not None:
+        # Rides alongside the score for the same reason it does on /authorize: a number
+        # computed on a degraded card message is not the same number as one computed on a
+        # complete one, and the caller must be able to see the difference rather than trust a
+        # score that looks identical either way.
+        event["card_score_detail"] = card_detail
 
     # WS4: price the decision in dollars of expected reimbursement liability, not just
     # probability - the number the buyer's P&L actually cares about post-regulation.
@@ -1497,60 +1570,9 @@ def authorize_payment(body: dict):
     """
     from core.authorization import authorize
 
-    def _scorer(msg):
-        # THE CARD MODEL, not the push model. Injected rather than imported inside
-        # core/authorization so that module stays free of the ML stack and testable without it.
-        #
-        # This used to call compute_features + ml_score_row, which is the PUSH-payment path. It
-        # returned 0.0 on every card message, because the features it wants (velocity, recipient
-        # familiarity, session telemetry) are not in an authorization. A $2,500 e-commerce
-        # purchase on a four-day-old account with AVS and CVV both failing scored the same as a
-        # $40 chip grocery purchase, and both were approved.
-        if CARD is None:
-            # NOT 0.0. A missing model is not a clean score, and the difference has to survive
-            # into the response or the next reader draws the same wrong conclusion this endpoint
-            # invited for the whole time it was mis-wired.
-            return 0.0, {"scored": False, "model_unavailable": True,
-                         "warning": "no card scorer loaded; this authorization was NOT "
-                                    "risk-assessed and the score below is not a risk opinion"}
-        try:
-            from core.card_message import normalise, quality
-            art = CARD["art"]
-            norm = normalise(msg)
-            feats = CARD["featurise"](norm["row"], art["aggregates"])
-            X = art["vectorizer"].transform([feats])
-            p_raw = float(art["model"].predict_proba(X)[0][1])
-            # CALIBRATE. The raw XGBoost output is not a probability: scale_pos_weight is what
-            # makes a 0.26% base rate learnable and it inflates predicted p by 77x. Ranking is
-            # unaffected, which is why AUC and the frontier never showed it, but core/liability.py
-            # computes expected_liability = p x amount x rate, so an uncalibrated p over-blocks
-            # every card decision by two orders of magnitude.
-            # Applied inline from two stored floats. The trainer saves coefficients, not a
-            # calibrator OBJECT, so this side needs no class definition and no sklearn version
-            # agreement with whatever trained the model.
-            cal = CARD.get("calibrator") or {}
-            if cal.get("a") is not None:
-                _z = math.log(min(max(p_raw, 1e-9), 1 - 1e-9) / (1 - min(max(p_raw, 1e-9), 1 - 1e-9)))
-                p = 1.0 / (1.0 + math.exp(-(float(cal["a"]) * _z + float(cal["b"]))))
-            else:
-                p = p_raw
-            return p, {"scored": True, "model": "card_scorer",
-                       "version": REGISTRY.version_of("card_scorer"),
-                       "ml": round(p, 6), "ml_raw": round(p_raw, 4),
-                       "calibrated": bool(cal.get("a") is not None),
-                       # What the message was missing travels WITH the score. A number computed
-                       # without AVS, CVV and 3DS is reading three of the model's top five
-                       # features as "not provided", and presenting it as the same number is
-                       # how a data-quality problem becomes a risk decision.
-                       "message_quality": quality(norm)}
-        except Exception as e:                                    # noqa: BLE001
-            # A scorer failure must not stop an authorization: the network still needs an answer
-            # inside the window. But it is reported as a failure, never as a zero risk.
-            return 0.0, {"scored": False, "error": type(e).__name__,
-                         "warning": "card scorer raised; this authorization was NOT "
-                                    "risk-assessed"}
-
-    return authorize(body or {}, score_fn=_scorer)
+    # score_card_message is shared with build_event() (the general ingestion path) rather than
+    # kept local to this endpoint - see its own docstring for why that consolidation mattered.
+    return authorize(body or {}, score_fn=score_card_message)
 
 
 @app.get("/authorize/contract")

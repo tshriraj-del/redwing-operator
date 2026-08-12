@@ -38,7 +38,9 @@ IDENTIFIERS = ("bin", "merchant_id")
 
 # Card-present forms genuinely cannot carry AVS or CVV: there is no address and no typed CVV in
 # a chip conversation. Absence there is correct, not a defect, and must not be reported as one.
-_CARD_PRESENT = ("chip", "contactless", "magstripe", "swipe", "fallback")
+# Public (not underscore-prefixed): core/ingest_schema.py documents this set in its self-served
+# contract, so callers outside this module have a real reason to read it.
+CARD_PRESENT_ENTRY_MODES = ("chip", "contactless", "magstripe", "swipe", "fallback")
 
 # Values that mean "we did not learn anything", chosen so a gap can never read as a pass.
 _UNKNOWN = {
@@ -85,7 +87,7 @@ def _entry_mode(msg: dict) -> str:
 
 
 def is_card_present(entry_mode: str) -> bool:
-    return str(entry_mode).strip().lower() in _CARD_PRESENT
+    return str(entry_mode).strip().lower() in CARD_PRESENT_ENTRY_MODES
 
 
 def normalise(msg: dict) -> dict:

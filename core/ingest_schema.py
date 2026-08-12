@@ -17,6 +17,14 @@ validate_event(raw):
   * WARNS (does not fail) on missing-but-recommended fields (rail, a subject id), so an
     operator sees degraded signal without dropping the event.
 
+CARD MESSAGES GET THE SAME TREATMENT, THROUGH THE SAME MODULE /authorize ALREADY USES. Before
+this, a card event on the general ingestion surface (POST /ingest, /ingest/batch, the stream)
+carried BIN, entry mode, AVS, CVV, 3DS and token status as unvalidated passthrough: the schema
+knew "card" as a RAIL VALUE and nothing about the message. core/card_message.py already does
+this normalisation for /authorize, so this module calls that one rather than re-deriving field
+handling a second time. Two independent notions of "a valid card message" is exactly the defect
+this codebase keeps producing when a control is wired into one decision path and not the other.
+
 Returns {valid, event, errors, warnings}. Pure stdlib, unit-testable without the ML stack.
 """
 
@@ -24,6 +32,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+
+from . import card_message as _card
 
 SCHEMA_VERSION = "1.0"
 
@@ -150,6 +160,23 @@ def validate_event(raw: dict, source: str = "") -> dict:
                 warnings.append(_warn(f"features.{k}", f"non-numeric feature dropped: {v!r}"))
         ev["features"] = clean
 
+    # -- card fields: normalise through the SAME module /authorize scores with --
+    if ev.get("payment_rail") == "card":
+        norm = _card.normalise(raw)
+        # "amount" is excluded deliberately. This module already validated and can REJECT it
+        # above (non-numeric, negative); card_message.normalise() has its own looser amount
+        # handling because /authorize is not the place that owns rejection. Copying it in here
+        # would let a stricter upstream error be silently overwritten by a permissive 0.0.
+        for k, v in norm["row"].items():
+            if k != "amount":
+                ev[k] = v
+        ev["_card_quality"] = _card.quality(norm)
+        for field in norm["missing_expected"]:
+            if field == "amount":
+                continue    # already reported, more precisely, by the amount block above
+            warnings.append(_warn(field, "expected on a card message and not present "
+                                         "(see _card_quality for what this does to score trust)"))
+
     # -- leakage guard: flag label-only fields (kept, but never to be used as features) --
     present_labels = [k for k in LABEL_FIELDS if raw.get(k) not in (None, "")]
     if present_labels:
@@ -185,4 +212,15 @@ def contract() -> dict:
                                  "merchant", "mcc", "ip", "geo"],
         "label_only_do_not_feature": list(LABEL_FIELDS),
         "rails": {canon: sorted(syns) for canon, syns in RAILS.items()},
+        "card_fields": {
+            "note": ("when payment_rail normalises to 'card', the message is additionally run "
+                     "through core/card_message.py: entry_mode, avs_result, cvv_result, "
+                     "three_ds, bin, merchant_id, mcc_code and tokenized are normalised (field "
+                     "aliases resolved) and graded present / absent_by_nature / absent_expected. "
+                     "The grading rides on the event as _card_quality, and any absent_expected "
+                     "field also produces a warning here."),
+            "categorical": list(_card.CATEGORICAL),
+            "identifiers": list(_card.IDENTIFIERS),
+            "card_present_entry_modes": list(_card.CARD_PRESENT_ENTRY_MODES),
+        },
     }
