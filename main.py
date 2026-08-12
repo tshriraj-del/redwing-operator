@@ -13,6 +13,7 @@ Loads the trained ML models from ~/pulseml_models and exposes:
 """
 
 import asyncio
+import math
 import json
 import hmac
 import os
@@ -175,6 +176,58 @@ try:
     except (FileNotFoundError, KeyError, TypeError, ValueError) as _e:
         print(f"⚠ novelty gate unavailable ({type(_e).__name__}); "
               f"supervised scoring continues unaffected")
+
+    # THE CARD SCORER. Separate from `supervised_scorer` because a card authorization is a
+    # different message: BIN, entry mode, AVS, CVV, 3DS outcome, MCC, token status. The push
+    # model looks for velocity, recipient familiarity and session telemetry that an auth does
+    # not carry, so it returned 0.0 on EVERY card message.
+    #
+    # That was not a degraded score, it was a blind one, and it read as "no risk". Measured on
+    # the live path before this was wired: a $2,500 e-commerce purchase on a four-day-old
+    # account with AVS failure, CVV failure and no 3DS scored IDENTICALLY to a $40 chip grocery
+    # purchase, and both were approved 00.
+    #
+    # `featurise` is imported from the trainer rather than reimplemented here. MODELS_DIR is
+    # already on sys.path, and sharing the function is the only way to guarantee the serving
+    # features are the training features. A second copy is how training-serving skew starts.
+    CARD = None
+    try:
+        import card_model as _cm
+        _card_art = MODELS_DIR / "card_xgb.pkl"
+        _card = pickle.load(open(_card_art, "rb"))
+        _card_features = list(_card["vectorizer"].feature_names_)
+        REGISTRY.register(ModelSpec(
+            model_id="card_scorer", purpose="card_authorization_risk", tier=TIER_1,
+            features=_card_features, state=CHAMPION, artifact=_card_art,
+            notes="XGBoost over the authorization message; drives /authorize. Trained by "
+                  "pulseml_models/card_model.py, featurised by that module's own function so "
+                  "train and serve cannot diverge."))
+        REGISTRY.load("card_scorer", lambda: _card["model"], features=_card_features)
+        CARD = {"art": _card, "featurise": _cm.featurise,
+                "calibrator": _card.get("calibrator")}
+        if not _card.get("calibrator"):
+            # Loud, because an uncalibrated score reaching liability.py is worse than a missing
+            # one: it is a confident number that is wrong by two orders of magnitude, and it
+            # over-blocks silently.
+            print("⚠ Card scorer has NO CALIBRATOR: predicted probabilities are inflated by "
+                  "scale_pos_weight and must not be used for priced decisions. Re-run "
+                  "pulseml_models/card_model.py.")
+        print(f"✓ Card scorer loaded ({len(_card_features)} features, "
+              f"{'calibrated' if _card.get('calibrator') else 'UNCALIBRATED'}) "
+              f"- /authorize can see an authorization")
+    except Exception as _e:                                       # noqa: BLE001
+        # DELIBERATELY BROAD, and it was not. The first version caught four named exception
+        # types; pickle raises AttributeError when an artifact references a class it cannot
+        # resolve, which is not in that list, so a card-scorer problem propagated out of the
+        # enclosing block and took supervised_scorer and the novelty gate down with it. A model
+        # this endpoint owns must never be able to unload the models it does not.
+        #
+        # Loud, and it must stay loud. An unavailable card model does not mean a card is safe;
+        # it means nothing here can judge one, and /authorize says so in its response rather
+        # than approving on a 0.0 that looks like a clean score.
+        print(f"⚠ CARD SCORER NOT LOADED ({type(_e).__name__}): /authorize cannot score a card "
+              f"message. Run pulseml_models/card_model.py.")
+
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
@@ -1445,21 +1498,57 @@ def authorize_payment(body: dict):
     from core.authorization import authorize
 
     def _scorer(msg):
-        # The real scorer, on the real feature foundation. Injected rather than imported inside
+        # THE CARD MODEL, not the push model. Injected rather than imported inside
         # core/authorization so that module stays free of the ML stack and testable without it.
+        #
+        # This used to call compute_features + ml_score_row, which is the PUSH-payment path. It
+        # returned 0.0 on every card message, because the features it wants (velocity, recipient
+        # familiarity, session telemetry) are not in an authorization. A $2,500 e-commerce
+        # purchase on a four-day-old account with AVS and CVV both failing scored the same as a
+        # $40 chip grocery purchase, and both were approved.
+        if CARD is None:
+            # NOT 0.0. A missing model is not a clean score, and the difference has to survive
+            # into the response or the next reader draws the same wrong conclusion this endpoint
+            # invited for the whole time it was mis-wired.
+            return 0.0, {"scored": False, "model_unavailable": True,
+                         "warning": "no card scorer loaded; this authorization was NOT "
+                                    "risk-assessed and the score below is not a risk opinion"}
         try:
-            feats = compute_features(msg)
-            p = ml_score_row(feats)
-            matches = score_transaction(feats)
-            top = matches[0] if matches else None
-            return combined_score(p, top["confidence"]) if top else p, {
-                "scored": True, "typology": (top or {}).get("name", ""),
-                "ml": round(float(p), 4)}
+            from core.card_message import normalise, quality
+            art = CARD["art"]
+            norm = normalise(msg)
+            feats = CARD["featurise"](norm["row"], art["aggregates"])
+            X = art["vectorizer"].transform([feats])
+            p_raw = float(art["model"].predict_proba(X)[0][1])
+            # CALIBRATE. The raw XGBoost output is not a probability: scale_pos_weight is what
+            # makes a 0.26% base rate learnable and it inflates predicted p by 77x. Ranking is
+            # unaffected, which is why AUC and the frontier never showed it, but core/liability.py
+            # computes expected_liability = p x amount x rate, so an uncalibrated p over-blocks
+            # every card decision by two orders of magnitude.
+            # Applied inline from two stored floats. The trainer saves coefficients, not a
+            # calibrator OBJECT, so this side needs no class definition and no sklearn version
+            # agreement with whatever trained the model.
+            cal = CARD.get("calibrator") or {}
+            if cal.get("a") is not None:
+                _z = math.log(min(max(p_raw, 1e-9), 1 - 1e-9) / (1 - min(max(p_raw, 1e-9), 1 - 1e-9)))
+                p = 1.0 / (1.0 + math.exp(-(float(cal["a"]) * _z + float(cal["b"]))))
+            else:
+                p = p_raw
+            return p, {"scored": True, "model": "card_scorer",
+                       "version": REGISTRY.version_of("card_scorer"),
+                       "ml": round(p, 6), "ml_raw": round(p_raw, 4),
+                       "calibrated": bool(cal.get("a") is not None),
+                       # What the message was missing travels WITH the score. A number computed
+                       # without AVS, CVV and 3DS is reading three of the model's top five
+                       # features as "not provided", and presenting it as the same number is
+                       # how a data-quality problem becomes a risk decision.
+                       "message_quality": quality(norm)}
         except Exception as e:                                    # noqa: BLE001
-            # A scorer failure must not stop an authorization: the network still needs an
-            # answer inside the window, and no score means fall through to policy on 0 risk
-            # rather than time out.
-            return 0.0, {"scored": False, "error": type(e).__name__}
+            # A scorer failure must not stop an authorization: the network still needs an answer
+            # inside the window. But it is reported as a failure, never as a zero risk.
+            return 0.0, {"scored": False, "error": type(e).__name__,
+                         "warning": "card scorer raised; this authorization was NOT "
+                                    "risk-assessed"}
 
     return authorize(body or {}, score_fn=_scorer)
 
