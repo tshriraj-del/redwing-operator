@@ -89,6 +89,39 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
+### Authorization
+
+The question a card network actually asks: approve or decline, inside the window, with a
+response code. Every other layer existed and none were reachable from an authorization, because
+there was no authorization.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/authorize` | One auth message in, a decision and a response code out |
+| GET | `/authorize/contract` | The codes this issuer emits and which permit a retry |
+
+Three things an issuer owes the network:
+
+**A latency budget.** Networks allow roughly two seconds. Miss it and the network answers under
+stand-in using rules configured in advance, so an issuer without a stand-in posture has let the
+network's default become its policy without choosing it.
+
+**A response code.** `HOLD` means nothing to an acquirer; `05` does. A step-up maps to `65`, not
+`05`, because the 65/1A family tells the merchant to re-attempt *with authentication* — sending
+`05` throws away the retry the step-up exists to enable. Insufficient funds is named, because
+the member can act on it; a risk decline stays deliberately vague, because an explanation is
+also a description of the control.
+
+**Soft versus hard.** Networks limit re-attempts on specific codes and fine violations, so this
+is contractual rather than cosmetic, and any recovery flow has to respect it.
+
+Screening runs first and a screening block returns `57`, not `05`, so a prohibition is
+distinguishable from a risk decision by anyone reading the response.
+
+**Modelled, not connected.** No ISO 8583 wire format, no acquirer, no stand-in agreement with
+anybody. This is the contract an issuer operates under, so decisioning can be built and measured
+against it.
+
 ### Screening
 
 Runs **before** the model, because it is not a risk opinion. A payment to a designated party
@@ -430,6 +463,7 @@ needs numpy and so wants the venv.
 | ML layer | `model_registry.py` | Model inventory, feature contracts, champion/challenger lifecycle, content-hash versions |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
+| Authorization | `authorization.py` | The auth decision path: latency budget, stand-in, response codes, soft vs hard |
 | Screening | `screening.py` | Sanctions and watchlist gate; runs before scoring, fails CLOSED |
 | Decisioning | `decline_contract.py`, `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
 
