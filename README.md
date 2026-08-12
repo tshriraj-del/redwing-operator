@@ -89,6 +89,25 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
+### Decision Policy
+
+The score is signal; the policy is what the institution will actually do with it.
+`liability.py` prices both sides and recommends the action the money supports;
+`decision_policy.py` bounds that recommendation by a **floor** (the least we will do at this
+risk on this rail) and a **ceiling** (the most we will do without a human), keyed by rail,
+direction, score band and customer tier.
+
+The policy never picks an action on its own. It only clamps a priced one, because a policy that
+could decide would be a second risk opinion with no evidence behind it. A ceiling **may** soften
+an action, since real policies do that, and when it does the decision carries
+`policy_deescalated` and the rule responsible.
+
+Every decision is stamped with a content hash of the policy table, which finally populates the
+`decisions.policy_version` column that has existed since the substrate was built and was never
+written. In the US the compliance target moves through litigation rather than rulemaking, so
+attributing an outcome change to the policy live at the time is not bookkeeping, it is the only
+way the change is explainable afterwards.
+
 ### The Novelty Gate
 
 A supervised model is blind by construction to patterns unlike its training labels. An
@@ -344,7 +363,7 @@ needs numpy and so wants the venv.
 | Agents | `investigator_agent.py` | An LLM investigator driven through `fraud_env.py` and graded by its verifiers, never by itself |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
-| Decisioning | `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
+| Decisioning | `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
 
 ## Part of the RedWing Platform
 
