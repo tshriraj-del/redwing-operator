@@ -1,0 +1,18 @@
+# RedWing screening list — ILLUSTRATIVE ONLY, NOT THE REAL OFAC SDN LIST.
+#
+# The real list is published by the US Treasury and must be downloaded and refreshed on a
+# schedule; screening against a stale list is a compliance failure in its own right. These
+# entries are invented so the gate is exercisable and testable without shipping a copy of a
+# government list into a demo repository.
+#
+# format:  canonical name | alias; alias | programme
+Vostok Marine Holdings | Vostok Marine; VMH Shipping | SDN
+Northstar Petrochemical Group | Northstar Petro; NPG Trading | SDN
+Halberd Aviation Services | Halberd Air | SDN
+Kestrel Precious Metals | Kestrel Metals; KPM Bullion | SDN
+Meridian Freight Partners | Meridian Freight | SSI
+Orient Star Logistics | Orient Star | SDN
+Blackwater Sands Trading | Blackwater Sands | SDN
+Caspian Energy Brokers | Caspian Energy | SSI
+Silverline Maritime | Silverline Shipping | SDN
+Anton Petrov Kuznetsov | A. P. Kuznetsov | SDN
