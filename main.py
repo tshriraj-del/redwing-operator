@@ -235,6 +235,7 @@ from core.stream import DurableQueue, BackpressureError
 from core.connectors import FileConnector, DBConnector
 from core.webhook import WebhookReceiver
 from core.decision_policy import decide as decide_action
+from core.screening import screen as screen_payment
 from core.liability import expected_liability, price_decision
 from core.narrative import scam_narrative
 try:
@@ -400,6 +401,15 @@ def build_event(row) -> dict:
     if isinstance(row, pd.Series):
         row = row.to_dict()
 
+    # SCREENING FIRST. Not a risk input: a payment to a designated party cannot be approved at
+    # any score, under any posture, past any policy ceiling. There is nothing to weigh it
+    # against, so it runs before there is a score to weigh. It fails CLOSED, unlike every
+    # advisory layer in this file, because approving unscreened traffic is a different class of
+    # mistake from scoring without a novelty view.
+    scr = screen_payment(counterparty=str(row.get("recipient_name", "")
+                                          or row.get("recipient_id", "")),
+                         member=str(row.get("user_name", "") or ""))
+
     features = compute_features(row)
     ml  = ml_score_row(features)
     matches = score_transaction(features)
@@ -534,6 +544,19 @@ def build_event(row) -> dict:
     # institution's floor and ceiling per rail and risk band, and stamps the version of the
     # table that produced the decision so an outcome change can later be attributed to the
     # policy change that caused it.
+    # A screening block is terminal and outranks the priced action entirely. Putting it into
+    # the policy floor instead would let a ceiling soften it, and no institutional appetite
+    # setting may soften a sanctions block.
+    if scr.get("blocked"):
+        event["screening"] = scr
+        event["is_alert"] = True
+        event["policy"] = {"action": "BLOCK", "priced_action": "BLOCK", "band": "screening",
+                           "bounded_by": "screening", "policy_escalated": True,
+                           "policy_deescalated": False, "rule": {"why": scr["reason"]},
+                           "terminal": True, "screening_code": scr["code"]}
+        return event
+    event["screening"] = scr
+
     _priced = event["decision_economics"].get("recommended_action") or (
         "HOLD" if event["is_alert"] else "ALLOW")
     _tier = "new_account" if _account_age(row) < 30 else ""
@@ -811,6 +834,14 @@ def score(body: dict):
     if not MODEL_OK:
         raise HTTPException(503, "ML models not loaded. Run the ML Fraud Engine notebook first.")
 
+    # Screening first here too. This is the THIRD control to need wiring on both paths
+    # (novelty gate, decision policy, now screening), which is a design smell rather than three
+    # separate oversights: build_event() and /score are two hand-maintained copies of one
+    # pipeline. See the note in the PR.
+    scr = screen_payment(counterparty=str(body.get("recipient_name", "")
+                                          or body.get("recipient_id", "")),
+                         member=str(body.get("user_name", "") or ""))
+
     features = compute_features(body)
     ml       = ml_score_row(features)
     matches  = score_transaction(features)
@@ -840,6 +871,14 @@ def score(body: dict):
     )
 
     alert = is_alert(net_score)
+
+    if scr.get("blocked"):
+        return {"transaction_id": str(body.get("transaction_id", "")),
+                "screening": scr, "is_alert": True,
+                "policy": {"action": "BLOCK", "bounded_by": "screening", "terminal": True,
+                           "screening_code": scr["code"],
+                           "rule": {"why": scr["reason"]}},
+                "local_score": None, "note": "screened before scoring; no risk score computed"}
 
     # Same policy, same terms, on this path too. /score is a second decision path and a policy
     # that lives on only one of them is a policy that disagrees with itself depending on how the
@@ -893,6 +932,7 @@ def score(body: dict):
         # that a payment reached them because it was UNUSUAL, not because the model was
         # confident. Those two justify very different next steps.
         "novelty":        novelty,
+        "screening":      scr,
         # The priced action, the policy that bounded it, and the version of the
         # table that did the bounding. Reported together because a decision you
         # cannot attribute to a policy is one you cannot defend later.
@@ -1358,6 +1398,19 @@ def substrate_next_questions(limit: int = 10):
         return next_questions(STORE, limit=max(1, min(50, limit)))
     except Exception as e:
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
+
+
+@app.get("/screening/status")
+def screening_status():
+    """Is sanctions screening actually in force?
+
+    The question `case_file.py` used to answer with a hardcoded `True` sitting above a coin
+    flip. This reads the loaded list, so "screened" is a fact rather than an assertion. Note
+    `fails: closed` - unlike every advisory layer here, an unavailable list blocks rather than
+    approving unscreened traffic.
+    """
+    from core.screening import status
+    return status()
 
 
 @app.get("/model/performance")

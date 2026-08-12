@@ -114,7 +114,17 @@ def build_customer(row, graph_ctx) -> dict:
 
     kyc_full = r.random() > 0.08
     pep = r.random() < 0.03
-    sanctions_hit = r.random() < 0.01
+
+    # SCREENING IS REAL NOW. This was `sanctions_hit = r.random() < 0.01` — a coin flip sitting
+    # a few lines above a field that reported `"sanctions_screened": True`. A panel asserting a
+    # control was applied while applying nothing is worse than a panel that says nothing, and an
+    # investigator reading "Sanctions/watchlist potential match" had no way to know it was noise.
+    from core import screening as _scr
+    _sc = _scr.screen(counterparty=str(row.get("recipient_name", "")
+                                       or row.get("recipient_id", "")),
+                      member=str(row.get("user_name", "") or ""))
+    sanctions_hit = _sc.get("result") in (_scr.CONFIRMED, _scr.POTENTIAL)
+    sanctions_screened = bool(_sc.get("screened"))
     nat = r.choice(["US", "US", "US", "GB", "CA", "IN", "NG", "DE", "BR"])
     loc = r.choice(["New York, US", "Austin, US", "London, GB", "Toronto, CA",
                     "Mumbai, IN", "Lagos, NG", "Berlin, DE", "São Paulo, BR"])
@@ -155,7 +165,7 @@ def build_customer(row, graph_ctx) -> dict:
         "nationality": nat,
         "location": loc,
         "pep": pep,
-        "sanctions_screened": True,
+        "sanctions_screened": sanctions_screened,
         "sanctions_match": sanctions_hit,
         "risk_rating": rating,
         "risk_drivers": drivers,

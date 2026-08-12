@@ -89,6 +89,32 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
+### Screening
+
+Runs **before** the model, because it is not a risk opinion. A payment to a designated party
+cannot be approved at any score, under any reimbursement posture, past any policy ceiling.
+There is no trade, so it does not belong inside anything that trades.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/screening/status` | Whether the control is actually in force, and how it fails |
+
+**It fails closed, and it is the only thing here that does.** The novelty gate, the consortium
+view and the actor layer all decline to speak rather than take down the money path, which is
+right for advisory signals. An unavailable screening list must not mean *approve unscreened*.
+It avoids turning that into an outage by screening a **local list** rather than a live API: the
+SDN list is published, so screening was never a good availability dependency.
+
+Three outcomes, not two: `clear`; `potential_match`, which blocks this attempt and needs a human
+because most potential matches on common names are innocent people; and `confirmed_match`,
+blocked with a reporting obligation. All are **terminal** — `decline_contract.py` refuses to
+dress them in remediation, because a system explaining how to get a sanctions match through
+would be doing something far worse than losing a sale.
+
+Before this, fifteen agency connectors existed and none of them touched a decision, and
+`case_file.py` decided sanctions with `r.random() < 0.01` a few lines above a field reporting
+`"sanctions_screened": True`.
+
 ### Decision Policy
 
 The score is signal; the policy is what the institution will actually do with it.
@@ -383,6 +409,7 @@ needs numpy and so wants the venv.
 | Agents | `investigator_agent.py` | An LLM investigator driven through `fraud_env.py` and graded by its verifiers, never by itself |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
+| Screening | `screening.py` | Sanctions and watchlist gate; runs before scoring, fails CLOSED |
 | Decisioning | `decline_contract.py`, `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
 
 ## Part of the RedWing Platform
