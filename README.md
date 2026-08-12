@@ -89,6 +89,26 @@ The autonomous SyntheticID agent starts automatically on startup (requires train
 | POST | `/authorization-iq` | Push-rail authorization signals (the AQF-equivalent pack) |
 | GET | `/observability/skew` | Training-serving skew: the delta between offline and served features |
 
+### The ML Layer
+
+Six `pickle.load` calls used to sit in `main.py`, each with its own glue, and
+`decisions.model_version` was set on **0 of 692 rows**. Workable with two models; not with the
+five this is heading for.
+
+`model_registry.py` is the only sanctioned load path, and it enforces four things rather than
+documenting them:
+
+| | |
+|---|---|
+| **contract** | a model declares the feature set it was fitted on; a mismatch refuses the load |
+| **lifecycle** | champion / challenger / shadow / retired. Only a champion may affect a decision, and a challenger cannot become one because a caller passed the wrong flag |
+| **version** | a content hash of the artifact bytes, so it cannot disagree with what actually scored |
+| **fail-safe** | a model that will not load is reported and skipped; the decision path continues |
+
+Risk tier is recorded per model (tier 1 moves money, tier 3 informs a human), so
+`GET /model/inventory` answers *what is in production and how closely is it watched* without a
+side spreadsheet that goes stale.
+
 ### Decision Policy
 
 The score is signal; the policy is what the institution will actually do with it.
@@ -381,6 +401,7 @@ needs numpy and so wants the venv.
 | Label supply | `outcome_ledger.py`, `label_maturity.py`, `backfill_outcome_labels.py` | Outcomes from chargebacks and recalls with source precedence; arrival-lag curve and maturity floor; recovering the machine's call onto historical decisions |
 | Learning | `holdout.py`, `graduation.py`, `train.py`, `seed_substrate.py`, `active_learning.py` | Monitored holdout, graduation gate, stdlib trainer, synthetic cohort, next-best-label queue |
 | Agents | `investigator_agent.py` | An LLM investigator driven through `fraud_env.py` and graded by its verifiers, never by itself |
+| ML layer | `model_registry.py` | Model inventory, feature contracts, champion/challenger lifecycle, content-hash versions |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
 | Decisioning | `decline_contract.py`, `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
