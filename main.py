@@ -128,6 +128,19 @@ try:
         xgb    = pickle.load(open(MODELS_DIR / "xgboost.pkl", "rb"))
         MODEL_TAG = "original"
     config  = json.load(open(MODELS_DIR  / "model_config.json"))
+
+    # THE ML LAYER. Every model that can touch a decision is registered, contract-checked and
+    # lifecycle-governed here rather than pickle-loaded ad hoc. Before this there were six
+    # scattered loads and `decisions.model_version` was set on 0 of 692 rows, which is workable
+    # with two models and not with the five this is heading for.
+    from core.model_registry import (REGISTRY, CHAMPION, TIER_1, TIER_2, ModelSpec)
+    _xgb_art = MODELS_DIR / ("xgboost_retrained.pkl" if MODEL_TAG == "retrained"
+                             else "xgboost.pkl")
+    REGISTRY.register(ModelSpec(
+        model_id="supervised_scorer", purpose="transaction_risk", tier=TIER_1,
+        features=config["features"], state=CHAMPION, artifact=_xgb_art,
+        notes="XGBoost over point-in-time features; drives the score directly"))
+    REGISTRY.load("supervised_scorer", lambda: xgb, features=config["features"])
     # The NOVELTY GATE. Trained by pulseml_models/anomaly_layer.py, saved to disk, and until
     # now never loaded by the operator: the README described it as 30% of an ML ensemble while
     # nothing in the live path had ever opened the file.
@@ -141,6 +154,12 @@ try:
         _acfg = config.get("anomaly") or {}
         _iso = pickle.load(open(MODELS_DIR / "anomaly_iforest.pkl", "rb"))
         _span = (float(_acfg["hi"]) - float(_acfg["lo"])) or 1.0
+        REGISTRY.register(ModelSpec(
+            model_id="novelty_gate", purpose="novelty", tier=TIER_2,
+            features=config["features"], state=CHAMPION,
+            artifact=MODELS_DIR / "anomaly_iforest.pkl",
+            notes="unsupervised isolation forest; escalate-only, capped at the alert line"))
+        REGISTRY.load("novelty_gate", lambda: _iso, features=config["features"])
         if not gate_is_compatible(_iso, config["features"]):
             # A stale gate is worse than none: it was trained on a different feature set, so
             # its notion of "unusual" describes a model that no longer exists. Refusing is the
@@ -596,7 +615,13 @@ def build_event(row) -> dict:
                 features=features,
                 rationale={**holdout_rationale(ho), "pattern": event.get("top_pattern")},
                 shadow=False, institution_id=str(row.get("institution_id", "") or ""),
-                model_version=str(config.get("version", "")),
+                # `config["version"]` does not exist in model_config.json, so this wrote
+                # "" on every one of 692 decisions. The registry's stamp is a content hash of
+                # the champion artifacts actually loaded, so it cannot disagree with what scored.
+                model_version=REGISTRY.decision_versions(),
+                # Same dead column, same fix: decision_policy already computes this and
+                # record_decision was never handed it.
+                policy_version=str((event.get("policy") or {}).get("policy_version", "")),
                 decision_id=did,
             )
 
@@ -912,7 +937,10 @@ def score(body: dict):
                 rationale={"pattern": top, "path": "score_endpoint", "enforced": False},
                 shadow=True,
                 institution_id=str(body.get("institution_id", "") or ""),
-                model_version=str(config.get("version", "")),
+                # `config["version"]` does not exist in model_config.json, so this wrote
+                # "" on every one of 692 decisions. The registry's stamp is a content hash of
+                # the champion artifacts actually loaded, so it cannot disagree with what scored.
+                model_version=REGISTRY.decision_versions(),
             )
         except Exception:
             pass          # a substrate failure must never fail scoring
@@ -1411,6 +1439,19 @@ def screening_status():
     """
     from core.screening import status
     return status()
+
+@app.get("/model/inventory")
+def model_inventory():
+    """Every model that can touch a decision: state, risk tier, version, and whether it loaded.
+
+    The artifact model-risk guidance asks for, and the reason the registry is the load path
+    rather than a catalogue describing loads that happen elsewhere. A model outside the registry
+    is where governance collapses in practice.
+    """
+    from core.model_registry import REGISTRY
+    inv = REGISTRY.inventory()
+    inv["decision_stamp"] = REGISTRY.decision_versions()
+    return inv
 
 
 @app.get("/model/performance")
