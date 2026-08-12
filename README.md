@@ -108,6 +108,26 @@ written. In the US the compliance target moves through litigation rather than ru
 attributing an outcome change to the policy live at the time is not bookkeeping, it is the only
 way the change is explainable afterwards.
 
+### Decline Contracts
+
+A decline today is a dead end: the member sees "declined", the merchant sees `05 Do Not Honor`,
+and a good customer is lost without the issuer learning it was wrong. False declines cost US
+ecommerce more than card fraud does.
+
+`decline_contract.py` makes a decline an object carrying four things a bare code does not: our
+own **recoverability** judgement (`05` hides both a member who needs to verify and a card we
+will never approve), the **price** of getting it wrong for this member, a **remediation
+contract** at four disclosure levels, and an HMAC-bound, expiring **recovery token**.
+
+The token is what makes varying disclosure safe. Without it, "verify and retry" is advice an
+attacker can also follow; with it, the retry arrives carrying proof that the remediation was
+performed, by the member it was issued to, inside its window. Tokens are bound to the member,
+carry no reason text, and are never attached to the opaque disclosure level.
+
+The module deliberately does **not** choose a level. That choice is a priced trade between
+recovery uplift and information handed to an adversary, and it needs a causal estimate that does
+not exist yet.
+
 ### The Novelty Gate
 
 A supervised model is blind by construction to patterns unlike its training labels. An
@@ -363,7 +383,7 @@ needs numpy and so wants the venv.
 | Agents | `investigator_agent.py` | An LLM investigator driven through `fraud_env.py` and graded by its verifiers, never by itself |
 | Measurement | `model_performance.py` | Did the model decay, did the population shift, or have the labels not arrived |
 | Tooling | `adjudication.py`, `replay.py`, `phase2_report.py`, `seed_from_csv.py`, `seed_consortium_demo.py` | Adjudication vocabularies, the replay harness, the evidence report, and the seeders |
-| Decisioning | `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
+| Decisioning | `decline_contract.py`, `decision_policy.py`, `liability.py`, `narrative.py`, `graph.py`, `consortium.py`, `authorization_iq.py`, `sar_draft.py` | Liability pricing, scam narrative, fraud graph, DP consortium, push-rail authorization signals, SAR drafting behind a grounding gate |
 
 ## Part of the RedWing Platform
 
