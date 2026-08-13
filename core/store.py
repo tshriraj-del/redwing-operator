@@ -306,6 +306,25 @@ CREATE TABLE IF NOT EXISTS telemetry (
 CREATE INDEX IF NOT EXISTS idx_tel_subject ON telemetry(subject_ref);
 CREATE INDEX IF NOT EXISTS idx_tel_ts      ON telemetry(ts);
 
+-- device_identity: the DERIVED device id for a subject, kept apart from telemetry on purpose.
+--
+-- An identity is a different kind of fact from a behavioural tell, and conflating them is what
+-- produced the silencing defect: get_telemetry returns the newest row for a subject, so any
+-- write on that table can shadow an earlier one. An identity must not be able to erase a duress
+-- signal, and a duress signal must not be able to change which device we think this is.
+--
+-- One row per subject, replaced in place: a subject has one derived device, not a history of
+-- claims. Only a fingerprint that CLEARED the entropy floor is ever written here (see
+-- core/fingerprint.derive), because one below it names a crowd rather than a device.
+CREATE TABLE IF NOT EXISTS device_identity (
+    subject_ref  TEXT PRIMARY KEY,
+    device_id    TEXT NOT NULL,
+    confidence   TEXT NOT NULL DEFAULT '',
+    anchor_bits  REAL NOT NULL DEFAULT 0,
+    ts           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_devid_device ON device_identity(device_id);
+
 -- checkpoints: how far a source connector has consumed a source. Durable so a connector
 -- resumes where it left off after a restart instead of re-reading from the beginning.
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -960,6 +979,39 @@ class Store:
             )
             self._commit()
         return telemetry_id
+
+    def record_device_identity(self, subject_ref: str, fingerprint: dict) -> bool:
+        """Persist a DERIVED device id for a subject. Returns whether it was written.
+
+        REFUSES anything that is not an identity, and that refusal is the point of the method.
+        A fingerprint below the entropy floor names a crowd (every hardened browser derives the
+        same one), so writing it would stack unrelated accounts onto a single device node, which
+        is exactly the many-accounts-used-thinly shape the device gate escalates on. The people
+        hardest to fingerprint would be the ones flagged, and the graph would look richer while
+        doing it.
+        """
+        fp = fingerprint or {}
+        if not fp.get("is_identity") or not fp.get("device_id"):
+            return False
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO device_identity "
+                "(subject_ref, device_id, confidence, anchor_bits, ts) VALUES (?,?,?,?,?)",
+                (str(subject_ref or ""), str(fp["device_id"]), str(fp.get("confidence", "")),
+                 float(fp.get("anchor_entropy_bits", 0) or 0), _now()),
+            )
+            self._commit()
+        return True
+
+    def get_device_identity(self, subject_ref: str) -> dict:
+        """The derived device for a subject, or {} if none was ever established."""
+        row = self._conn.execute(
+            "SELECT device_id, confidence, anchor_bits, ts FROM device_identity "
+            "WHERE subject_ref = ?", (str(subject_ref or ""),)).fetchone()
+        if not row:
+            return {}
+        return {"device_id": row[0], "confidence": row[1],
+                "anchor_entropy_bits": row[2], "ts": row[3]}
 
     def get_telemetry(self, subject_ref: str) -> dict:
         """The most recent raw telemetry for a subject, or {} if none was reported. Absence is

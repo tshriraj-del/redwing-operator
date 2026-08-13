@@ -183,6 +183,280 @@ def test_relink_refuses_to_judge_on_too_little_evidence():
     assert "too few" in r["why"]
 
 
+# --------------------------------------------------------------------- input bounds
+
+def test_an_oversized_payload_is_bounded_rather_than_derived_whole():
+    """REGRESSION. Every value here is attacker-controlled and this runs on a request path.
+    Unbounded, a 50,000-key payload with 1KB values was accepted and derived without complaint,
+    and the endpoint then persisted it."""
+    huge = {f"junk_{i}": "x" * 5000 for i in range(50_000)}
+    huge.update(_rich())
+    b = FP.bounded(huge)
+    # LITERAL, not FP.MAX_COMPONENTS. Asserting against the constant under test makes the test
+    # self-referential: it passed with the cap raised to 100,000. A security review
+    # mutation-tested it and both cap guards survived, which per non-negotiable 3 means they
+    # were evidence of nothing. The contract is closed at 30 known keys, so this bound is really
+    # asserting the closed contract; the cap assertion below is the one that tests the cap.
+    assert len(b) <= 64, f"{len(b)} components survived the bound"
+    assert FP.MAX_COMPONENTS <= 64, (
+        f"MAX_COMPONENTS is {FP.MAX_COMPONENTS}; the cap has been raised past what this test "
+        "was written to guarantee")
+    assert all(not k.startswith("junk_") for k in b), (
+        "undeclared keys survived; the component contract is supposed to be closed")
+    # the real components still made it through, so bounding did not cost the fingerprint
+    assert FP.derive(huge)["is_identity"] is True
+
+
+def test_over_long_values_are_truncated_not_rejected():
+    """A real browser on unusual hardware can report a long GPU string. Losing that device
+    entirely would be a worse outcome than trimming it."""
+    long_gpu = _rich(gpu_renderer="ANGLE (" + "Z" * 10_000 + ")")
+    b = FP.bounded(long_gpu)
+    # LITERAL again, same reason: `<= FP.MAX_VALUE_CHARS` passed with the cap at 10,000,000.
+    assert len(b["gpu_renderer"]) <= 512, (
+        f"a value survived at {len(b['gpu_renderer'])} chars")
+    assert FP.MAX_VALUE_CHARS <= 512, (
+        f"MAX_VALUE_CHARS is {FP.MAX_VALUE_CHARS}; the cap has been raised past the guard")
+    assert FP.derive(long_gpu)["device_id"], "an over-long value lost the whole fingerprint"
+
+
+def test_structured_values_cannot_become_components():
+    """str() on a dict yields a long repr that would otherwise be hashed in as a component
+    value. Only scalars can be components."""
+    fp = FP.derive({"gpu_renderer": {"nested": "dict"}, "cpu_cores": [1, 2],
+                    "screen_w": 1920, "screen_h": 1080, "platform": "Win32"})
+    assert fp["is_identity"] is False
+
+
+def test_a_clean_fingerprint_writes_no_telemetry_row():
+    """SAFEGUARDING REGRESSION, and the most consequential test in this file.
+
+    `Store.get_telemetry` returns the NEWEST row for a subject, and `to_telemetry` on a clean
+    fingerprint returns {}. So an empty write does not add nothing, it SHADOWS whatever a real
+    SDK reported. Verified before the fix: a subject carrying seven live coercion signals
+    (duress, coaching co-presence, script reading, remote access) was reduced to zero by one
+    unauthenticated fingerprint POST that returned HTTP 200.
+
+    The endpoint must therefore not write when there is nothing to report. This test pins the
+    precondition; the endpoint guard is `if STORE is not None and tel:`."""
+    assert FP.to_telemetry(FP.derive(_rich())) == {}, (
+        "a clean browser now produces telemetry; the endpoint guard must be rechecked, because "
+        "an empty write shadows a victim's real signals")
+    # and a dirty one still reports, so the guard cannot be satisfied by never writing at all
+    dirty = FP.to_telemetry(FP.derive({"cpu_cores": 8, "emulator": True, "webdriver": True}))
+    assert dirty, "an automated client must still reach the actor layer"
+
+
+# --------------------------------------------------- the identity floor, adversarially
+
+def test_drift_components_cannot_pay_the_entropy_bill_for_an_anchor_only_id():
+    """SEC-002. The id hashes ANCHOR components only, but the floor was checked against ANCHOR
+    PLUS DRIFT, and drift alone is 27.0 bits against a floor of 18.0. So canvas, fonts, timezone
+    and language bought an identity for an id they never enter, and three near-universal anchors
+    were enough to be certified.
+
+    Measured before the fix: two different people with different drift derived the SAME
+    device_id and both came back is_identity=True. That is the many-accounts-thin-usage shape
+    the device gate escalates on, which makes it the exact privacy-browser-as-fraud-farm failure
+    this module's docstring says it exists to prevent."""
+    common = {"cpu_cores": 8, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"}
+    a = dict(common, canvas_hash="aaaa1111", font_hash="bbbb2222",
+             webgl_params_hash="cccc3333", timezone="America/New_York", language="en-US")
+    b = dict(common, canvas_hash="zzzz9999", font_hash="yyyy8888",
+             webgl_params_hash="xxxx7777", timezone="Europe/Berlin", language="de-DE")
+    fa, fb = FP.derive(a), FP.derive(b)
+    assert fa["device_id"] == fb["device_id"], (
+        "these two payloads share every anchor, so they SHOULD share an id; the test is wrong "
+        "if they do not")
+    assert not fa["is_identity"], (
+        f"{fa['entropy_bits']} bits certified an identity on {fa['anchor_components_present']} "
+        "common anchors; drift is paying for an anchor-only id")
+    assert fa.get("anchor_entropy_bits", 0) < FP.MIN_ENTROPY_BITS_FOR_IDENTITY
+
+
+def test_an_identity_needs_at_least_one_high_entropy_anchor():
+    """cpu_cores, colour depth and touch points are near-universal. A device is only identified
+    by something that varies: the GPU string or the audio DSP characteristic."""
+    weak = {"cpu_cores": 8, "device_memory_gb": 8, "screen_w": 1920, "screen_h": 1080,
+            "color_depth": 24, "platform": "Win32", "touch_points": 0}
+    assert not FP.derive(weak)["is_identity"], (
+        "an identity was granted with no high-entropy anchor present")
+    strong = dict(weak, gpu_renderer="ANGLE (Apple, Apple M3, Metal)", audio_dsp_hash="a1b2c3d4")
+    assert FP.derive(strong)["is_identity"]
+
+
+def test_a_null_marker_is_not_defeated_by_one_extra_character():
+    """SEC-003. `_NULL_VALUES` was an exact-match set, so `blocked.` or `Blocked!` scored full
+    nominal entropy and got hashed into the id. Measured: 'blocked' gave 24.5 bits and
+    'blocked.' gave 43.5. Any extension returning a slightly different refusal string turned its
+    whole user base into one high-confidence device."""
+    base = {"cpu_cores": 8, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"}
+    honest = FP.entropy_bits({**base, "canvas_hash": "blocked"})
+    for variant in ("blocked.", "Blocked!", "unavailable (policy)", "blocked\u200b", "  BLOCKED  "):
+        got = FP.entropy_bits({**base, "canvas_hash": variant})
+        assert got == honest, (
+            f"{variant!r} scored {got} bits against {honest} for a plain 'blocked'; the null "
+            "check is still exact-match")
+
+
+def test_entropy_is_credited_for_a_well_formed_value_not_a_present_key():
+    """A single character is not eight bits of canvas. Entropy was scored by component NAME, so
+    seventeen one-character values certified a high-confidence identity at 52.3 bits."""
+    junk = {c: "x" for c in list(FP.ANCHOR_COMPONENTS) + list(FP.DRIFT_COMPONENTS)}
+    fp = FP.derive(junk)
+    assert not fp["is_identity"], (
+        f"seventeen single-character values scored {fp['entropy_bits']} bits and were certified")
+
+
+# --------------------------------------------------- the id hash, adversarially
+
+def test_a_component_value_cannot_impersonate_other_components():
+    """SEC-005. `_hash` joined `name=value` on `|` with no escaping, so a value containing
+    `|name=value` was indistinguishable from a separate component. Measured: an attacker
+    reporting ONLY audio_dsp_hash reproduced a victim's device_id byte-identically while
+    reporting neither cpu_cores nor gpu_renderer."""
+    victim = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8,
+              "audio_dsp_hash": "dead"}
+    forged = {"audio_dsp_hash": "dead|cpu_cores=8|gpu_renderer=GPU-X|gpu_vendor=V"}
+    assert FP.derive(victim)["device_id"] != FP.derive(forged)["device_id"], (
+        "a single crafted value reproduced a victim's device_id; the id encoding is ambiguous")
+
+
+# --------------------------------------------------- relink, adversarially
+
+def test_relink_denominator_is_the_known_device_not_the_candidates_choice():
+    """SEC-006. `comparable` was the INTERSECTION of non-null anchors, so a candidate drove the
+    denominator to 3 by nulling everything it could not guess, and the 0.72 threshold never
+    bound. Measured: platform + colour depth + screen width, three guessable values, scored
+    similarity 1.0 and re-linked."""
+    known = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8, "device_memory_gb": 16,
+             "screen_w": 2560, "screen_h": 1440, "color_depth": 24, "platform": "Win32",
+             "audio_dsp_hash": "dead", "touch_points": 0}
+    guess = {"platform": "Win32", "color_depth": 24, "screen_w": 2560}
+    r = FP.relink(guess, known)
+    assert not r["same_device"], (
+        f"a three-field guess re-linked at similarity {r['similarity']}; the candidate is still "
+        "choosing its own denominator")
+
+
+def test_relink_requires_a_high_entropy_anchor_to_agree():
+    """Agreeing on cores and colour depth is agreeing on nothing. Something that varies has to
+    match before two histories are merged, because a wrong merge joins two people."""
+    known = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8, "device_memory_gb": 16,
+             "screen_w": 2560, "screen_h": 1440, "color_depth": 24, "platform": "Win32",
+             "audio_dsp_hash": "dead", "touch_points": 0}
+    no_strong = dict(known, gpu_renderer="", audio_dsp_hash="")
+    assert not FP.relink(no_strong, known)["same_device"]
+
+
+def test_a_genuinely_drifted_device_still_relinks():
+    """The other direction, and the one that makes the fix useful rather than merely strict. A
+    driver update moves the renderer string and a new monitor moves the geometry; that device
+    must keep its history."""
+    known = {"gpu_renderer": "ANGLE (Apple M3, Metal 3.1)", "gpu_vendor": "Apple",
+             "cpu_cores": 8, "device_memory_gb": 16, "screen_w": 1512, "screen_h": 982,
+             "color_depth": 30, "platform": "macOS", "audio_dsp_hash": "876a7095",
+             "touch_points": 0}
+    drifted = dict(known, screen_w=3440, screen_h=1440)     # same machine, new monitor
+    assert FP.relink(drifted, known)["same_device"], (
+        "a real device that changed monitor lost its identity; the bar is now too high")
+
+
+# --------------------------------------------------- wiring the id into the graph
+
+def _store():
+    import tempfile
+    from core.store import Store
+    return Store(tempfile.mktemp(suffix=".db"))
+
+
+def test_only_an_identity_is_persisted_as_a_device():
+    """SEC-013. The derived device_id reached NOTHING: the endpoint returned it and persisted
+    only the automation booleans, while the live gate kept reading `row.get("device_id")` off
+    the request body. So the 126x control scored an id the client named, exactly as before this
+    module existed, and `is_identity` was referenced only at its own definition and in tests.
+
+    That is the seventh build-and-do-not-wire instance in ADR-001. Wiring it means one rule
+    above all others: a fingerprint below the entropy floor names a CROWD, so writing it as a
+    device would stack unrelated accounts onto one node, which is the shape the gate escalates
+    on."""
+    st = _store()
+    rich = FP.derive(_rich())
+    assert rich["is_identity"]
+    st.record_device_identity("sub_ok", rich)
+    got = st.get_device_identity("sub_ok")
+    assert got.get("device_id") == rich["device_id"]
+
+    weak = FP.derive({"cpu_cores": 4, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"})
+    assert not weak["is_identity"]
+    st.record_device_identity("sub_weak", weak)
+    assert st.get_device_identity("sub_weak") == {}, (
+        "a fingerprint that is NOT an identity was written as a device; it names a crowd, and "
+        "the graph would read that crowd as one shared device")
+
+
+def test_the_gate_prefers_the_derived_id_and_says_which_it_used():
+    """A derived id has passed validation and an entropy floor. A client-named id has passed
+    nothing. They cannot be treated as the same kind of fact, so the gate reports which one it
+    scored."""
+    import main
+    st = _store()
+    rich = FP.derive(_rich())
+    st.record_device_identity("txn_1", rich)
+    src = main.resolve_device_id({"transaction_id": "txn_1", "device_id": "client_says_this"}, st)
+    assert src["device_id"] == rich["device_id"]
+    assert src["source"] == "derived"
+
+    bare = main.resolve_device_id({"transaction_id": "txn_none", "device_id": "client_says"}, st)
+    assert bare["device_id"] == "client_says"
+    assert bare["source"] == "client_asserted", (
+        "a self-asserted id must be labelled as such; it has passed no validation")
+
+
+def test_the_gate_actually_uses_the_resolver():
+    """MUTATION GUARD ON THE WIRING ITSELF, and it is here because the first version of these
+    tests exercised `resolve_device_id` in isolation. Reverting the GATE to read
+    `row["device_id"]` directly broke nothing, because nothing asserted the gate CALLS the
+    resolver. A perfect resolver the gate ignores is the same defect this whole change fixes,
+    just moved into the test file.
+
+    Asserts BEHAVIOUR, not shape. A shape assertion ("is identity_source present?") is defeated
+    by any mutant that keeps the output shape while ignoring the resolver, which is exactly what
+    a careless refactor produces. So: store a derived identity, then ask the gate about a
+    transaction whose body claims a DIFFERENT device. If the gate is really resolving, it reports
+    the derived id and flags the contradiction; if it is reading the body, it cannot."""
+    import main
+    if getattr(main, "DEVICE_GRAPH", None) is None or main.STORE is None:
+        return
+    subject = "gate_wiring_probe"
+    rich = FP.derive(_rich())
+    assert rich["is_identity"]
+    main.STORE.record_device_identity(subject, rich)
+
+    _, view = main.apply_device_gate(
+        0.1, {"transaction_id": subject, "device_id": "dev_the_client_named"})
+    assert view.get("identity_source") == "derived", (
+        f"the gate reported identity_source={view.get('identity_source')!r} for a subject with a "
+        "stored derived identity; it is not going through resolve_device_id")
+    assert view.get("contradicts_client_device") is True, (
+        "the gate did not notice the body claiming a different device than the fingerprint "
+        "derived, which means it never consulted the derived identity at all")
+
+
+def test_a_client_naming_a_device_its_fingerprint_contradicts_is_flagged():
+    """Cheap and genuinely useful. If the fingerprint says one device and the transaction body
+    claims another, that disagreement is itself a signal: it is what an account-sharing or
+    session-replay attempt looks like from the server."""
+    import main
+    st = _store()
+    rich = FP.derive(_rich())
+    st.record_device_identity("txn_2", rich)
+    out = main.resolve_device_id({"transaction_id": "txn_2", "device_id": "some_other_device"}, st)
+    assert out["contradicts_client"] is True
+    agree = main.resolve_device_id({"transaction_id": "txn_2", "device_id": rich["device_id"]}, st)
+    assert agree["contradicts_client"] is False
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
