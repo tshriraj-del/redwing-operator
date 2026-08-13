@@ -1912,9 +1912,22 @@ def post_fingerprint(body: dict):
     # The automation and integrity tells feed the actor layer through the SAME path a client SDK
     # would use, rather than a second private channel. derive_signals() then fires only on what
     # was actually reported, which is what keeps the actor read honest.
-    if STORE is not None:
+    #
+    # ONLY WHEN THERE IS SOMETHING TO REPORT, and this guard is a safeguarding control rather
+    # than an optimisation. `get_telemetry` returns the NEWEST row for a subject, and
+    # `to_telemetry` on a clean fingerprint returns {}. Without the guard, one unauthenticated
+    # POST naming a victim's subject_ref wrote an empty row that became the newest, and the
+    # operator's duress, coaching and remote-access read for an in-flight scam went to nothing.
+    # Verified before the fix: a subject with 7 live coercion signals was reduced to 0 by a
+    # single benign fingerprint POST returning HTTP 200.
+    #
+    # This closes the SILENCING direction only. The injection direction, where an attacker
+    # ASSERTS integrity flags against someone else's subject_ref, needs the caller bound to the
+    # subject by a server-issued session token and is NOT fixed here.
+    tel = to_telemetry(fp)
+    if STORE is not None and tel:
         try:
-            STORE.record_telemetry(subject_ref, to_telemetry(fp),
+            STORE.record_telemetry(subject_ref, tel,
                                    entity_id=str(body.get("entity_id", "") or ""))
         except Exception:                                             # noqa: BLE001
             pass    # telemetry is never worth failing a fingerprint for

@@ -192,7 +192,15 @@ def test_an_oversized_payload_is_bounded_rather_than_derived_whole():
     huge = {f"junk_{i}": "x" * 5000 for i in range(50_000)}
     huge.update(_rich())
     b = FP.bounded(huge)
-    assert len(b) <= FP.MAX_COMPONENTS, f"{len(b)} components survived the bound"
+    # LITERAL, not FP.MAX_COMPONENTS. Asserting against the constant under test makes the test
+    # self-referential: it passed with the cap raised to 100,000. A security review
+    # mutation-tested it and both cap guards survived, which per non-negotiable 3 means they
+    # were evidence of nothing. The contract is closed at 30 known keys, so this bound is really
+    # asserting the closed contract; the cap assertion below is the one that tests the cap.
+    assert len(b) <= 64, f"{len(b)} components survived the bound"
+    assert FP.MAX_COMPONENTS <= 64, (
+        f"MAX_COMPONENTS is {FP.MAX_COMPONENTS}; the cap has been raised past what this test "
+        "was written to guarantee")
     assert all(not k.startswith("junk_") for k in b), (
         "undeclared keys survived; the component contract is supposed to be closed")
     # the real components still made it through, so bounding did not cost the fingerprint
@@ -204,7 +212,11 @@ def test_over_long_values_are_truncated_not_rejected():
     entirely would be a worse outcome than trimming it."""
     long_gpu = _rich(gpu_renderer="ANGLE (" + "Z" * 10_000 + ")")
     b = FP.bounded(long_gpu)
-    assert len(b["gpu_renderer"]) <= FP.MAX_VALUE_CHARS
+    # LITERAL again, same reason: `<= FP.MAX_VALUE_CHARS` passed with the cap at 10,000,000.
+    assert len(b["gpu_renderer"]) <= 512, (
+        f"a value survived at {len(b['gpu_renderer'])} chars")
+    assert FP.MAX_VALUE_CHARS <= 512, (
+        f"MAX_VALUE_CHARS is {FP.MAX_VALUE_CHARS}; the cap has been raised past the guard")
     assert FP.derive(long_gpu)["device_id"], "an over-long value lost the whole fingerprint"
 
 
@@ -214,6 +226,25 @@ def test_structured_values_cannot_become_components():
     fp = FP.derive({"gpu_renderer": {"nested": "dict"}, "cpu_cores": [1, 2],
                     "screen_w": 1920, "screen_h": 1080, "platform": "Win32"})
     assert fp["is_identity"] is False
+
+
+def test_a_clean_fingerprint_writes_no_telemetry_row():
+    """SAFEGUARDING REGRESSION, and the most consequential test in this file.
+
+    `Store.get_telemetry` returns the NEWEST row for a subject, and `to_telemetry` on a clean
+    fingerprint returns {}. So an empty write does not add nothing, it SHADOWS whatever a real
+    SDK reported. Verified before the fix: a subject carrying seven live coercion signals
+    (duress, coaching co-presence, script reading, remote access) was reduced to zero by one
+    unauthenticated fingerprint POST that returned HTTP 200.
+
+    The endpoint must therefore not write when there is nothing to report. This test pins the
+    precondition; the endpoint guard is `if STORE is not None and tel:`."""
+    assert FP.to_telemetry(FP.derive(_rich())) == {}, (
+        "a clean browser now produces telemetry; the endpoint guard must be rechecked, because "
+        "an empty write shadows a victim's real signals")
+    # and a dirty one still reports, so the guard cannot be satisfied by never writing at all
+    dirty = FP.to_telemetry(FP.derive({"cpu_cores": 8, "emulator": True, "webdriver": True}))
+    assert dirty, "an automated client must still reach the actor layer"
 
 
 if __name__ == "__main__":
