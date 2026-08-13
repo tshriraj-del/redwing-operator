@@ -1104,7 +1104,13 @@ def score(body: dict):
         model          = xgb,
         scaler         = scaler,
         feature_names  = FEATURES,
-        model_version  = config.get("version", "1.0.0"),
+        # The REGISTRY, not config. `config["version"]` does not exist and never has, so this
+        # read fell through to the "1.0.0" default and stamped a constant that tracks nothing:
+        # an explanation attributed to "1.0.0" cannot be matched to the artifact that produced
+        # it. Measured on the live store, 395 of 715 decisions (55.2%) carry no usable model
+        # version. The registry returns the content hash of every model that could affect this
+        # decision, which is the thing an outcome is later attributed to.
+        model_version  = REGISTRY.decision_versions(),
         transaction_id = transaction_id,
     )
 
@@ -1348,7 +1354,9 @@ def _assemble_case(row) -> dict:
         explanation = _xai_explain(
             features=features, ml_score=ml, pattern_match=top, combined_score=c_score,
             model=xgb, scaler=scaler, feature_names=FEATURES,
-            model_version=config.get("version", "1.0.0"),
+            # Registry, not config. See the note on the same call in `score`: the config key
+            # does not exist, so this stamped a constant "1.0.0" on every case-file explanation.
+            model_version=REGISTRY.decision_versions(),
             transaction_id=str(row.get("transaction_id", "")),
         )
     except Exception:

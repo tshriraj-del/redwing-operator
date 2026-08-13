@@ -421,6 +421,29 @@ def test_the_device_gate_never_lowers_a_score():
         assert out == score, f"the device gate moved an unflagged score from {score} to {out}"
 
 
+def test_no_serving_path_stamps_a_model_version_from_config():
+    """REGRESSION. `config["version"]` DOES NOT EXIST and never has, so every
+    `config.get("version", "1.0.0")` fell through to the default and stamped a constant that
+    tracks nothing. An explanation or a decision attributed to "1.0.0" cannot be matched back to
+    the artifact that produced it, which is the whole point of recording a version.
+
+    Measured on the live store when this was found: 395 of 715 decisions (55.2%) carried no
+    usable model version. The registry returns the content hash of every model that could affect
+    the decision, which is what an outcome is later attributed to."""
+    _, main = _client_and_main()
+    if main is None:
+        return
+    import inspect
+    src = inspect.getsource(main)
+    assert 'config.get("version"' not in src, (
+        'a serving path is reading model_version from config again; the key does not exist and '
+        'the call silently stamps its default')
+    from core.model_registry import REGISTRY
+    v = REGISTRY.decision_versions()
+    assert v and v != "1.0.0", f"the registry reported {v!r}, which is not a usable version stamp"
+    assert "@" in v, "a version stamp should carry an artifact content hash"
+
+
 def test_no_serving_function_reads_the_adjudicated_typology_column():
     """A source-level guard: the three serving functions must not mention the column at all.
     Analysis and display endpoints legitimately group historical data by it; these three
