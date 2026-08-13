@@ -247,6 +247,121 @@ def test_a_clean_fingerprint_writes_no_telemetry_row():
     assert dirty, "an automated client must still reach the actor layer"
 
 
+# --------------------------------------------------- the identity floor, adversarially
+
+def test_drift_components_cannot_pay_the_entropy_bill_for_an_anchor_only_id():
+    """SEC-002. The id hashes ANCHOR components only, but the floor was checked against ANCHOR
+    PLUS DRIFT, and drift alone is 27.0 bits against a floor of 18.0. So canvas, fonts, timezone
+    and language bought an identity for an id they never enter, and three near-universal anchors
+    were enough to be certified.
+
+    Measured before the fix: two different people with different drift derived the SAME
+    device_id and both came back is_identity=True. That is the many-accounts-thin-usage shape
+    the device gate escalates on, which makes it the exact privacy-browser-as-fraud-farm failure
+    this module's docstring says it exists to prevent."""
+    common = {"cpu_cores": 8, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"}
+    a = dict(common, canvas_hash="aaaa1111", font_hash="bbbb2222",
+             webgl_params_hash="cccc3333", timezone="America/New_York", language="en-US")
+    b = dict(common, canvas_hash="zzzz9999", font_hash="yyyy8888",
+             webgl_params_hash="xxxx7777", timezone="Europe/Berlin", language="de-DE")
+    fa, fb = FP.derive(a), FP.derive(b)
+    assert fa["device_id"] == fb["device_id"], (
+        "these two payloads share every anchor, so they SHOULD share an id; the test is wrong "
+        "if they do not")
+    assert not fa["is_identity"], (
+        f"{fa['entropy_bits']} bits certified an identity on {fa['anchor_components_present']} "
+        "common anchors; drift is paying for an anchor-only id")
+    assert fa.get("anchor_entropy_bits", 0) < FP.MIN_ENTROPY_BITS_FOR_IDENTITY
+
+
+def test_an_identity_needs_at_least_one_high_entropy_anchor():
+    """cpu_cores, colour depth and touch points are near-universal. A device is only identified
+    by something that varies: the GPU string or the audio DSP characteristic."""
+    weak = {"cpu_cores": 8, "device_memory_gb": 8, "screen_w": 1920, "screen_h": 1080,
+            "color_depth": 24, "platform": "Win32", "touch_points": 0}
+    assert not FP.derive(weak)["is_identity"], (
+        "an identity was granted with no high-entropy anchor present")
+    strong = dict(weak, gpu_renderer="ANGLE (Apple, Apple M3, Metal)", audio_dsp_hash="a1b2c3d4")
+    assert FP.derive(strong)["is_identity"]
+
+
+def test_a_null_marker_is_not_defeated_by_one_extra_character():
+    """SEC-003. `_NULL_VALUES` was an exact-match set, so `blocked.` or `Blocked!` scored full
+    nominal entropy and got hashed into the id. Measured: 'blocked' gave 24.5 bits and
+    'blocked.' gave 43.5. Any extension returning a slightly different refusal string turned its
+    whole user base into one high-confidence device."""
+    base = {"cpu_cores": 8, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"}
+    honest = FP.entropy_bits({**base, "canvas_hash": "blocked"})
+    for variant in ("blocked.", "Blocked!", "unavailable (policy)", "blocked\u200b", "  BLOCKED  "):
+        got = FP.entropy_bits({**base, "canvas_hash": variant})
+        assert got == honest, (
+            f"{variant!r} scored {got} bits against {honest} for a plain 'blocked'; the null "
+            "check is still exact-match")
+
+
+def test_entropy_is_credited_for_a_well_formed_value_not_a_present_key():
+    """A single character is not eight bits of canvas. Entropy was scored by component NAME, so
+    seventeen one-character values certified a high-confidence identity at 52.3 bits."""
+    junk = {c: "x" for c in list(FP.ANCHOR_COMPONENTS) + list(FP.DRIFT_COMPONENTS)}
+    fp = FP.derive(junk)
+    assert not fp["is_identity"], (
+        f"seventeen single-character values scored {fp['entropy_bits']} bits and were certified")
+
+
+# --------------------------------------------------- the id hash, adversarially
+
+def test_a_component_value_cannot_impersonate_other_components():
+    """SEC-005. `_hash` joined `name=value` on `|` with no escaping, so a value containing
+    `|name=value` was indistinguishable from a separate component. Measured: an attacker
+    reporting ONLY audio_dsp_hash reproduced a victim's device_id byte-identically while
+    reporting neither cpu_cores nor gpu_renderer."""
+    victim = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8,
+              "audio_dsp_hash": "dead"}
+    forged = {"audio_dsp_hash": "dead|cpu_cores=8|gpu_renderer=GPU-X|gpu_vendor=V"}
+    assert FP.derive(victim)["device_id"] != FP.derive(forged)["device_id"], (
+        "a single crafted value reproduced a victim's device_id; the id encoding is ambiguous")
+
+
+# --------------------------------------------------- relink, adversarially
+
+def test_relink_denominator_is_the_known_device_not_the_candidates_choice():
+    """SEC-006. `comparable` was the INTERSECTION of non-null anchors, so a candidate drove the
+    denominator to 3 by nulling everything it could not guess, and the 0.72 threshold never
+    bound. Measured: platform + colour depth + screen width, three guessable values, scored
+    similarity 1.0 and re-linked."""
+    known = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8, "device_memory_gb": 16,
+             "screen_w": 2560, "screen_h": 1440, "color_depth": 24, "platform": "Win32",
+             "audio_dsp_hash": "dead", "touch_points": 0}
+    guess = {"platform": "Win32", "color_depth": 24, "screen_w": 2560}
+    r = FP.relink(guess, known)
+    assert not r["same_device"], (
+        f"a three-field guess re-linked at similarity {r['similarity']}; the candidate is still "
+        "choosing its own denominator")
+
+
+def test_relink_requires_a_high_entropy_anchor_to_agree():
+    """Agreeing on cores and colour depth is agreeing on nothing. Something that varies has to
+    match before two histories are merged, because a wrong merge joins two people."""
+    known = {"gpu_renderer": "GPU-X", "gpu_vendor": "V", "cpu_cores": 8, "device_memory_gb": 16,
+             "screen_w": 2560, "screen_h": 1440, "color_depth": 24, "platform": "Win32",
+             "audio_dsp_hash": "dead", "touch_points": 0}
+    no_strong = dict(known, gpu_renderer="", audio_dsp_hash="")
+    assert not FP.relink(no_strong, known)["same_device"]
+
+
+def test_a_genuinely_drifted_device_still_relinks():
+    """The other direction, and the one that makes the fix useful rather than merely strict. A
+    driver update moves the renderer string and a new monitor moves the geometry; that device
+    must keep its history."""
+    known = {"gpu_renderer": "ANGLE (Apple M3, Metal 3.1)", "gpu_vendor": "Apple",
+             "cpu_cores": 8, "device_memory_gb": 16, "screen_w": 1512, "screen_h": 982,
+             "color_depth": 30, "platform": "macOS", "audio_dsp_hash": "876a7095",
+             "touch_points": 0}
+    drifted = dict(known, screen_w=3440, screen_h=1440)     # same machine, new monitor
+    assert FP.relink(drifted, known)["same_device"], (
+        "a real device that changed monitor lost its identity; the bar is now too high")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
