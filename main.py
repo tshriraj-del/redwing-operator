@@ -83,6 +83,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The fingerprint collector has to be servable to the client it runs in. Mounted best-effort so a
+# missing directory cannot stop the API booting - the collector is one surface, not the platform.
+try:
+    from fastapi.staticfiles import StaticFiles
+    _STATIC_DIR = Path(__file__).resolve().parent / "static"
+    if _STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+except Exception as _e:                                               # noqa: BLE001
+    print(f"⚠ static mount unavailable ({type(_e).__name__}); /static/redwing-fp.js will 404")
+
 # Auth is opt-in via REDWING_API_KEY. Set it and every request except /health (and CORS
 # preflight) must carry a matching X-API-Key. Leave it unset and the API stays open, which
 # is the right default for a laptop demo and is warned about loudly at startup, because it
@@ -1774,6 +1784,64 @@ def post_telemetry(body: dict):
     tel = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
     STORE.record_telemetry(subject_ref, tel, entity_id=str(body.get("entity_id", "") or ""))
     return {"ok": True, "subject_ref": subject_ref, "derived_signals": derive_signals(tel)}
+
+
+@app.post("/telemetry/fingerprint")
+def post_fingerprint(body: dict):
+    """Derive a device identity from components a client collector reported.
+
+    Body: {subject_ref, components:{...}}. `static/redwing-fp.js` is the collector; see
+    core/fingerprint.py for why identity comes from the ANCHOR components only and why a
+    low-entropy fingerprint is explicitly refused as an identity.
+
+    This is the producer the device layer was missing. core/telemetry.py has defined the
+    reporting contract since it was written and nothing filled it; the device graph counts
+    accounts per device_id and that id arrived assigned by nobody. This closes
+    collect -> derive -> graph.
+
+    NOT available on the card rail, and that is architectural rather than a gap: an ISO 8583
+    authorization reaches an issuer from the acquirer with no browser attached. Fingerprinting
+    only exists on surfaces where the institution owns the client.
+    """
+    from core.fingerprint import derive, to_telemetry
+
+    subject_ref = str(body.get("subject_ref", "")).strip()
+    if not subject_ref:
+        raise HTTPException(400, "subject_ref is required")
+    comps = body.get("components") if isinstance(body.get("components"), dict) else {}
+    fp = derive(comps)
+
+    # The automation and integrity tells feed the actor layer through the SAME path a client SDK
+    # would use, rather than a second private channel. derive_signals() then fires only on what
+    # was actually reported, which is what keeps the actor read honest.
+    if STORE is not None:
+        try:
+            STORE.record_telemetry(subject_ref, to_telemetry(fp),
+                                   entity_id=str(body.get("entity_id", "") or ""))
+        except Exception:                                             # noqa: BLE001
+            pass    # telemetry is never worth failing a fingerprint for
+
+    return {"ok": True, "subject_ref": subject_ref, "fingerprint": fp}
+
+
+@app.get("/telemetry/fingerprint/contract")
+def fingerprint_contract():
+    """What a collector must report, split by how fast each component drifts."""
+    from core.fingerprint import (ANCHOR_COMPONENTS, DRIFT_COMPONENTS,
+                                  MIN_ENTROPY_BITS_FOR_IDENTITY, RELINK_SIMILARITY)
+    return {
+        "collector": "/static/redwing-fp.js",
+        "anchor_components": list(ANCHOR_COMPONENTS),
+        "drift_components": list(DRIFT_COMPONENTS),
+        "min_entropy_bits_for_identity": MIN_ENTROPY_BITS_FOR_IDENTITY,
+        "relink_similarity": RELINK_SIMILARITY,
+        "note": ("identity is the ANCHOR hash only; DRIFT re-links a device whose anchor moved. "
+                 "A fingerprint below the entropy floor names a crowd rather than a device and "
+                 "is refused as an identity, because privacy-hardened browsers all collide onto "
+                 "one value and would otherwise read as a shared fraud device."),
+        "not_available_on": ("card authorization: an ISO 8583 message carries no client to "
+                             "fingerprint"),
+    }
 
 
 @app.get("/actor/{subject_ref}")
