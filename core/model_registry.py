@@ -241,6 +241,17 @@ class Registry:
             "by_tier": {t: sum(1 for d in specs if d["tier"] == t) for t in (1, 2, 3)},
         }
 
+    def version_of(self, model_id: str) -> str:
+        """The content-hash version of one model, or "" if it is not loaded.
+
+        `get()` deliberately returns the model OBJECT, so callers wanting the declaration had no
+        public way to reach it and were writing `REGISTRY.get(id).version`, which is an
+        AttributeError on an XGBClassifier rather than a missing-model error. A scorer stamping
+        its own output with its version is a routine need and deserves an accessor.
+        """
+        spec = self._specs.get(model_id)
+        return (spec.version or "") if spec and spec.loaded else ""
+
     def decision_versions(self) -> str:
         """The version stamp for `decisions.model_version`.
 

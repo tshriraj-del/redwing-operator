@@ -13,6 +13,7 @@ Loads the trained ML models from ~/pulseml_models and exposes:
 """
 
 import asyncio
+import math
 import json
 import hmac
 import os
@@ -81,6 +82,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The fingerprint collector has to be servable to the client it runs in. Mounted best-effort so a
+# missing directory cannot stop the API booting - the collector is one surface, not the platform.
+try:
+    from fastapi.staticfiles import StaticFiles
+    _STATIC_DIR = Path(__file__).resolve().parent / "static"
+    if _STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+except Exception as _e:                                               # noqa: BLE001
+    print(f"⚠ static mount unavailable ({type(_e).__name__}); /static/redwing-fp.js will 404")
 
 # Auth is opt-in via REDWING_API_KEY. Set it and every request except /health (and CORS
 # preflight) must carry a matching X-API-Key. Leave it unset and the API stays open, which
@@ -175,6 +186,58 @@ try:
     except (FileNotFoundError, KeyError, TypeError, ValueError) as _e:
         print(f"⚠ novelty gate unavailable ({type(_e).__name__}); "
               f"supervised scoring continues unaffected")
+
+    # THE CARD SCORER. Separate from `supervised_scorer` because a card authorization is a
+    # different message: BIN, entry mode, AVS, CVV, 3DS outcome, MCC, token status. The push
+    # model looks for velocity, recipient familiarity and session telemetry that an auth does
+    # not carry, so it returned 0.0 on EVERY card message.
+    #
+    # That was not a degraded score, it was a blind one, and it read as "no risk". Measured on
+    # the live path before this was wired: a $2,500 e-commerce purchase on a four-day-old
+    # account with AVS failure, CVV failure and no 3DS scored IDENTICALLY to a $40 chip grocery
+    # purchase, and both were approved 00.
+    #
+    # `featurise` is imported from the trainer rather than reimplemented here. MODELS_DIR is
+    # already on sys.path, and sharing the function is the only way to guarantee the serving
+    # features are the training features. A second copy is how training-serving skew starts.
+    CARD = None
+    try:
+        import card_model as _cm
+        _card_art = MODELS_DIR / "card_xgb.pkl"
+        _card = pickle.load(open(_card_art, "rb"))
+        _card_features = list(_card["vectorizer"].feature_names_)
+        REGISTRY.register(ModelSpec(
+            model_id="card_scorer", purpose="card_authorization_risk", tier=TIER_1,
+            features=_card_features, state=CHAMPION, artifact=_card_art,
+            notes="XGBoost over the authorization message; drives /authorize. Trained by "
+                  "pulseml_models/card_model.py, featurised by that module's own function so "
+                  "train and serve cannot diverge."))
+        REGISTRY.load("card_scorer", lambda: _card["model"], features=_card_features)
+        CARD = {"art": _card, "featurise": _cm.featurise,
+                "calibrator": _card.get("calibrator")}
+        if not _card.get("calibrator"):
+            # Loud, because an uncalibrated score reaching liability.py is worse than a missing
+            # one: it is a confident number that is wrong by two orders of magnitude, and it
+            # over-blocks silently.
+            print("⚠ Card scorer has NO CALIBRATOR: predicted probabilities are inflated by "
+                  "scale_pos_weight and must not be used for priced decisions. Re-run "
+                  "pulseml_models/card_model.py.")
+        print(f"✓ Card scorer loaded ({len(_card_features)} features, "
+              f"{'calibrated' if _card.get('calibrator') else 'UNCALIBRATED'}) "
+              f"- /authorize can see an authorization")
+    except Exception as _e:                                       # noqa: BLE001
+        # DELIBERATELY BROAD, and it was not. The first version caught four named exception
+        # types; pickle raises AttributeError when an artifact references a class it cannot
+        # resolve, which is not in that list, so a card-scorer problem propagated out of the
+        # enclosing block and took supervised_scorer and the novelty gate down with it. A model
+        # this endpoint owns must never be able to unload the models it does not.
+        #
+        # Loud, and it must stay loud. An unavailable card model does not mean a card is safe;
+        # it means nothing here can judge one, and /authorize says so in its response rather
+        # than approving on a 0.0 that looks like a clean score.
+        print(f"⚠ CARD SCORER NOT LOADED ({type(_e).__name__}): /authorize cannot score a card "
+              f"message. Run pulseml_models/card_model.py.")
+
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
@@ -415,6 +478,58 @@ def _account_age(row) -> float:
         return 365.0
 
 
+def score_card_message(msg: dict) -> tuple:
+    """THE CARD MODEL, not the push model. `(p_fraud, detail)`.
+
+    Extracted rather than left inline in /authorize's scorer, because build_event() needed the
+    identical logic: /ingest, /ingest/batch, the stream consumer and every source connector all
+    funnel a card-rail row through build_event(), and it was still scoring every one of them with
+    compute_features + ml_score_row, the PUSH-payment path. /authorize got fixed; this, the far
+    busier entry point, did not, so the same $2,500-scores-like-$40 blindness that /authorize had
+    for its whole life was still live on every other ingestion surface. One function now, so a
+    third entry point cannot repeat it a third time.
+    """
+    if CARD is None:
+        # NOT 0.0. A missing model is not a clean score, and the difference has to survive into
+        # the response or the next reader draws the same wrong conclusion this endpoint invited
+        # for the whole time it was mis-wired.
+        return 0.0, {"scored": False, "model_unavailable": True,
+                     "warning": "no card scorer loaded; this event was NOT risk-assessed and "
+                                "the score below is not a risk opinion"}
+    try:
+        from core.card_message import normalise, quality
+        art = CARD["art"]
+        norm = normalise(msg)
+        feats = CARD["featurise"](norm["row"], art["aggregates"])
+        X = art["vectorizer"].transform([feats])
+        p_raw = float(art["model"].predict_proba(X)[0][1])
+        # CALIBRATE. The raw XGBoost output is not a probability: scale_pos_weight is what makes
+        # a 0.26% base rate learnable and it inflates predicted p by 77x. Ranking is unaffected,
+        # which is why AUC and the frontier never showed it, but core/liability.py computes
+        # expected_liability = p x amount x rate, so an uncalibrated p over-blocks every card
+        # decision by two orders of magnitude.
+        cal = CARD.get("calibrator") or {}
+        if cal.get("a") is not None:
+            _z = math.log(min(max(p_raw, 1e-9), 1 - 1e-9) / (1 - min(max(p_raw, 1e-9), 1 - 1e-9)))
+            p = 1.0 / (1.0 + math.exp(-(float(cal["a"]) * _z + float(cal["b"]))))
+        else:
+            p = p_raw
+        return p, {"scored": True, "model": "card_scorer",
+                   "version": REGISTRY.version_of("card_scorer"),
+                   "ml": round(p, 6), "ml_raw": round(p_raw, 4),
+                   "calibrated": bool(cal.get("a") is not None),
+                   # What the message was missing travels WITH the score. A number computed
+                   # without AVS, CVV and 3DS is reading three of the model's top five features
+                   # as "not provided", and presenting it as the same number is how a
+                   # data-quality problem becomes a risk decision.
+                   "message_quality": quality(norm)}
+    except Exception as e:                                        # noqa: BLE001
+        # A scorer failure must not stop a decision. But it is reported as a failure, never as a
+        # zero risk.
+        return 0.0, {"scored": False, "error": type(e).__name__,
+                     "warning": "card scorer raised; this event was NOT risk-assessed"}
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -430,7 +545,22 @@ def build_event(row) -> dict:
                          member=str(row.get("user_name", "") or ""))
 
     features = compute_features(row)
-    ml  = ml_score_row(features)
+    # CARD ROWS GO THROUGH THE CARD MODEL, not the push-payment score below. features/matches
+    # still get computed either way, because the rule matcher and the graph/drift plumbing
+    # further down expect them to exist; only `ml`, the number everything downstream is DERIVED
+    # from (c_score, cascade_score, network_score, the priced decision), is replaced.
+    #
+    # This was the actual gap /authorize's fix did not close: every OTHER ingestion surface
+    # (/ingest, /ingest/batch, the stream consumer, every source connector) calls build_event(),
+    # and until this branch existed all of them still scored a card authorization with a model
+    # that looks for velocity and recipient familiarity a card message does not carry - the
+    # identical blindness /authorize had for its whole life, just on a busier door.
+    _is_card = str(row.get("payment_rail") or "").strip().lower() == "card"
+    card_detail = None
+    if _is_card:
+        ml, card_detail = score_card_message(row)
+    else:
+        ml = ml_score_row(features)
     matches = score_transaction(features)
     top = matches[0] if matches else None
 
@@ -514,6 +644,12 @@ def build_event(row) -> dict:
         "graph_risk_score":  graph_ctx["graph_risk_score"],
         "timestamp":         datetime.utcnow().isoformat() + "Z",
     }
+    if card_detail is not None:
+        # Rides alongside the score for the same reason it does on /authorize: a number
+        # computed on a degraded card message is not the same number as one computed on a
+        # complete one, and the caller must be able to see the difference rather than trust a
+        # score that looks identical either way.
+        event["card_score_detail"] = card_detail
 
     # WS4: price the decision in dollars of expected reimbursement liability, not just
     # probability - the number the buyer's P&L actually cares about post-regulation.
@@ -1444,24 +1580,13 @@ def authorize_payment(body: dict):
     """
     from core.authorization import authorize
 
-    def _scorer(msg):
-        # The real scorer, on the real feature foundation. Injected rather than imported inside
-        # core/authorization so that module stays free of the ML stack and testable without it.
-        try:
-            feats = compute_features(msg)
-            p = ml_score_row(feats)
-            matches = score_transaction(feats)
-            top = matches[0] if matches else None
-            return combined_score(p, top["confidence"]) if top else p, {
-                "scored": True, "typology": (top or {}).get("name", ""),
-                "ml": round(float(p), 4)}
-        except Exception as e:                                    # noqa: BLE001
-            # A scorer failure must not stop an authorization: the network still needs an
-            # answer inside the window, and no score means fall through to policy on 0 risk
-            # rather than time out.
-            return 0.0, {"scored": False, "error": type(e).__name__}
-
-    return authorize(body or {}, score_fn=_scorer)
+    # score_card_message is shared with build_event() (the general ingestion path) rather than
+    # kept local to this endpoint - see its own docstring for why that consolidation mattered.
+    #
+    # The version on main at merge time was the ORIGINAL push-payment scorer (compute_features +
+    # ml_score_row), which is the defect this branch exists to fix: it returns ~0.0 on every card
+    # message because the signal it wants is not in an authorization. Taking this side deliberately.
+    return authorize(body or {}, score_fn=score_card_message)
 
 
 @app.get("/authorize/contract")
@@ -1663,6 +1788,64 @@ def post_telemetry(body: dict):
     tel = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
     STORE.record_telemetry(subject_ref, tel, entity_id=str(body.get("entity_id", "") or ""))
     return {"ok": True, "subject_ref": subject_ref, "derived_signals": derive_signals(tel)}
+
+
+@app.post("/telemetry/fingerprint")
+def post_fingerprint(body: dict):
+    """Derive a device identity from components a client collector reported.
+
+    Body: {subject_ref, components:{...}}. `static/redwing-fp.js` is the collector; see
+    core/fingerprint.py for why identity comes from the ANCHOR components only and why a
+    low-entropy fingerprint is explicitly refused as an identity.
+
+    This is the producer the device layer was missing. core/telemetry.py has defined the
+    reporting contract since it was written and nothing filled it; the device graph counts
+    accounts per device_id and that id arrived assigned by nobody. This closes
+    collect -> derive -> graph.
+
+    NOT available on the card rail, and that is architectural rather than a gap: an ISO 8583
+    authorization reaches an issuer from the acquirer with no browser attached. Fingerprinting
+    only exists on surfaces where the institution owns the client.
+    """
+    from core.fingerprint import derive, to_telemetry
+
+    subject_ref = str(body.get("subject_ref", "")).strip()
+    if not subject_ref:
+        raise HTTPException(400, "subject_ref is required")
+    comps = body.get("components") if isinstance(body.get("components"), dict) else {}
+    fp = derive(comps)
+
+    # The automation and integrity tells feed the actor layer through the SAME path a client SDK
+    # would use, rather than a second private channel. derive_signals() then fires only on what
+    # was actually reported, which is what keeps the actor read honest.
+    if STORE is not None:
+        try:
+            STORE.record_telemetry(subject_ref, to_telemetry(fp),
+                                   entity_id=str(body.get("entity_id", "") or ""))
+        except Exception:                                             # noqa: BLE001
+            pass    # telemetry is never worth failing a fingerprint for
+
+    return {"ok": True, "subject_ref": subject_ref, "fingerprint": fp}
+
+
+@app.get("/telemetry/fingerprint/contract")
+def fingerprint_contract():
+    """What a collector must report, split by how fast each component drifts."""
+    from core.fingerprint import (ANCHOR_COMPONENTS, DRIFT_COMPONENTS,
+                                  MIN_ENTROPY_BITS_FOR_IDENTITY, RELINK_SIMILARITY)
+    return {
+        "collector": "/static/redwing-fp.js",
+        "anchor_components": list(ANCHOR_COMPONENTS),
+        "drift_components": list(DRIFT_COMPONENTS),
+        "min_entropy_bits_for_identity": MIN_ENTROPY_BITS_FOR_IDENTITY,
+        "relink_similarity": RELINK_SIMILARITY,
+        "note": ("identity is the ANCHOR hash only; DRIFT re-links a device whose anchor moved. "
+                 "A fingerprint below the entropy floor names a crowd rather than a device and "
+                 "is refused as an identity, because privacy-hardened browsers all collide onto "
+                 "one value and would otherwise read as a shared fraud device."),
+        "not_available_on": ("card authorization: an ISO 8583 message carries no client to "
+                             "fingerprint"),
+    }
 
 
 @app.get("/actor/{subject_ref}")
