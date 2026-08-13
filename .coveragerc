@@ -1,0 +1,26 @@
+# Coverage config.
+#
+# `source = .` deliberately, NOT a hand-listed set of modules. The first version listed
+# `source = core,main.py,...` and coverage silently ignored the `main.py` entry, because `source`
+# takes package/directory names rather than file paths. The result was a plausible-looking 88%
+# that excluded the 3,319-line file holding build_event, /score and /authorize: the largest and
+# most defect-prone surface in the repo. A coverage number that omits the hot path is worse than
+# no coverage number, because it is quotable.
+[run]
+branch = True
+source = .
+omit =
+    .venv/*
+    tests/*
+    */__pycache__/*
+    eval/*
+    setup.py
+parallel = True
+
+[report]
+show_missing = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    if TYPE_CHECKING:
