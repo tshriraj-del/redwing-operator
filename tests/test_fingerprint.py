@@ -362,6 +362,101 @@ def test_a_genuinely_drifted_device_still_relinks():
         "a real device that changed monitor lost its identity; the bar is now too high")
 
 
+# --------------------------------------------------- wiring the id into the graph
+
+def _store():
+    import tempfile
+    from core.store import Store
+    return Store(tempfile.mktemp(suffix=".db"))
+
+
+def test_only_an_identity_is_persisted_as_a_device():
+    """SEC-013. The derived device_id reached NOTHING: the endpoint returned it and persisted
+    only the automation booleans, while the live gate kept reading `row.get("device_id")` off
+    the request body. So the 126x control scored an id the client named, exactly as before this
+    module existed, and `is_identity` was referenced only at its own definition and in tests.
+
+    That is the seventh build-and-do-not-wire instance in ADR-001. Wiring it means one rule
+    above all others: a fingerprint below the entropy floor names a CROWD, so writing it as a
+    device would stack unrelated accounts onto one node, which is the shape the gate escalates
+    on."""
+    st = _store()
+    rich = FP.derive(_rich())
+    assert rich["is_identity"]
+    st.record_device_identity("sub_ok", rich)
+    got = st.get_device_identity("sub_ok")
+    assert got.get("device_id") == rich["device_id"]
+
+    weak = FP.derive({"cpu_cores": 4, "screen_w": 1920, "screen_h": 1080, "platform": "Win32"})
+    assert not weak["is_identity"]
+    st.record_device_identity("sub_weak", weak)
+    assert st.get_device_identity("sub_weak") == {}, (
+        "a fingerprint that is NOT an identity was written as a device; it names a crowd, and "
+        "the graph would read that crowd as one shared device")
+
+
+def test_the_gate_prefers_the_derived_id_and_says_which_it_used():
+    """A derived id has passed validation and an entropy floor. A client-named id has passed
+    nothing. They cannot be treated as the same kind of fact, so the gate reports which one it
+    scored."""
+    import main
+    st = _store()
+    rich = FP.derive(_rich())
+    st.record_device_identity("txn_1", rich)
+    src = main.resolve_device_id({"transaction_id": "txn_1", "device_id": "client_says_this"}, st)
+    assert src["device_id"] == rich["device_id"]
+    assert src["source"] == "derived"
+
+    bare = main.resolve_device_id({"transaction_id": "txn_none", "device_id": "client_says"}, st)
+    assert bare["device_id"] == "client_says"
+    assert bare["source"] == "client_asserted", (
+        "a self-asserted id must be labelled as such; it has passed no validation")
+
+
+def test_the_gate_actually_uses_the_resolver():
+    """MUTATION GUARD ON THE WIRING ITSELF, and it is here because the first version of these
+    tests exercised `resolve_device_id` in isolation. Reverting the GATE to read
+    `row["device_id"]` directly broke nothing, because nothing asserted the gate CALLS the
+    resolver. A perfect resolver the gate ignores is the same defect this whole change fixes,
+    just moved into the test file.
+
+    Asserts BEHAVIOUR, not shape. A shape assertion ("is identity_source present?") is defeated
+    by any mutant that keeps the output shape while ignoring the resolver, which is exactly what
+    a careless refactor produces. So: store a derived identity, then ask the gate about a
+    transaction whose body claims a DIFFERENT device. If the gate is really resolving, it reports
+    the derived id and flags the contradiction; if it is reading the body, it cannot."""
+    import main
+    if getattr(main, "DEVICE_GRAPH", None) is None or main.STORE is None:
+        return
+    subject = "gate_wiring_probe"
+    rich = FP.derive(_rich())
+    assert rich["is_identity"]
+    main.STORE.record_device_identity(subject, rich)
+
+    _, view = main.apply_device_gate(
+        0.1, {"transaction_id": subject, "device_id": "dev_the_client_named"})
+    assert view.get("identity_source") == "derived", (
+        f"the gate reported identity_source={view.get('identity_source')!r} for a subject with a "
+        "stored derived identity; it is not going through resolve_device_id")
+    assert view.get("contradicts_client_device") is True, (
+        "the gate did not notice the body claiming a different device than the fingerprint "
+        "derived, which means it never consulted the derived identity at all")
+
+
+def test_a_client_naming_a_device_its_fingerprint_contradicts_is_flagged():
+    """Cheap and genuinely useful. If the fingerprint says one device and the transaction body
+    claims another, that disagreement is itself a signal: it is what an account-sharing or
+    session-replay attempt looks like from the server."""
+    import main
+    st = _store()
+    rich = FP.derive(_rich())
+    st.record_device_identity("txn_2", rich)
+    out = main.resolve_device_id({"transaction_id": "txn_2", "device_id": "some_other_device"}, st)
+    assert out["contradicts_client"] is True
+    agree = main.resolve_device_id({"transaction_id": "txn_2", "device_id": rich["device_id"]}, st)
+    assert agree["contradicts_client"] is False
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
