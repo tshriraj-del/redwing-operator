@@ -1582,6 +1582,10 @@ def authorize_payment(body: dict):
 
     # score_card_message is shared with build_event() (the general ingestion path) rather than
     # kept local to this endpoint - see its own docstring for why that consolidation mattered.
+    #
+    # The version on main at merge time was the ORIGINAL push-payment scorer (compute_features +
+    # ml_score_row), which is the defect this branch exists to fix: it returns ~0.0 on every card
+    # message because the signal it wants is not in an authorization. Taking this side deliberately.
     return authorize(body or {}, score_fn=score_card_message)
 
 
