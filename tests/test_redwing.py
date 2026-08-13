@@ -366,6 +366,61 @@ def test_authorize_and_ingest_share_one_card_scoring_function():
         "/authorize no longer calls the shared scorer; a second inline copy may have crept back")
 
 
+def test_build_event_uses_the_rail_canonicaliser_not_a_literal_compare():
+    """REGRESSION. The card branch compared payment_rail to the literal "card", so `debit_card`
+    and `credit_card` - both already declared synonyms in ingest_schema.RAILS - silently routed
+    card traffic back to the PUSH model. Callers that reach build_event() without going through
+    validate_event() (/alerts, _assemble_case, replay) never had the rail normalised for them,
+    so they were the ones losing the card model this branch exists to wire in."""
+    _, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False) or getattr(main, "CARD", None) is None:
+        return
+    base = {"transaction_id": "rail_probe", "user_id": "u_rail", "amount": 2500.0,
+            "entry_mode": "ecom", "avs_result": "no_match", "cvv_result": "no_match",
+            "mcc_code": 5999}
+    for rail in ("card", "debit_card", "credit_card", "card_not_present", "CARD", " Card "):
+        ev = main.build_event(dict(base, payment_rail=rail))
+        assert "card_score_detail" in ev, (
+            f"payment_rail={rail!r} did not reach the card model; the rail check is comparing "
+            "to a literal instead of using ingest_schema.normalize_rail")
+    # and the negative case still holds
+    assert "card_score_detail" not in main.build_event(dict(base, payment_rail="zelle"))
+
+
+def test_the_device_gate_is_applied_on_every_scoring_path():
+    """REGRESSION, and the sixth instance of the defect ADR-001 is about. The gate was built in
+    the ML repo with mutation-verified tests and called from nowhere, so a measured 84x-precision
+    signal changed no outcome. Applying it to one path and not the other would have been the
+    seventh, so this asserts BOTH."""
+    client, main = _client_and_main()
+    if main is None or not getattr(main, "MODEL_OK", False):
+        return
+    import inspect
+    # `score` is the /score handler. NOT `score_payment`, which is /score/payment, the ULB
+    # real-data model: it takes V1..V28 PCA components and carries no device at all, so the
+    # device gate has nothing to read there and must not be asserted on it.
+    for fn_name, fn in (("build_event", main.build_event),
+                        ("/score", getattr(main, "score", None))):
+        assert fn is not None, f"{fn_name} not found; this test is pinned to the wrong name"
+        assert "apply_device_gate" in inspect.getsource(fn), (
+            f"{fn_name} does not apply the device gate")
+    ev = main.build_event({"transaction_id": "dg", "user_id": "u1", "amount": 100.0,
+                           "payment_rail": "zelle", "device_id": "dev_probe",
+                           "recipient_id": "r1"})
+    assert "device_gate" in ev, "the device gate view is not reported on the event"
+
+
+def test_the_device_gate_never_lowers_a_score():
+    """Escalate-only, same contract as the novelty gate. A clean device view is not evidence of
+    innocence, it is usually just a device nobody has seen."""
+    _, main = _client_and_main()
+    if main is None:
+        return
+    for score in (0.0, 0.42, 0.99):
+        out, _ = main.apply_device_gate(score, {"device_id": "dev_definitely_unseen"})
+        assert out == score, f"the device gate moved an unflagged score from {score} to {out}"
+
+
 def test_no_serving_function_reads_the_adjudicated_typology_column():
     """A source-level guard: the three serving functions must not mention the column at all.
     Analysis and display endpoints legitimately group historical data by it; these three

@@ -16,3 +16,9 @@ redwing.db-shm
 
 # Local audit / strategy docs (candid; kept out of the public repo)
 docs/
+
+# coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.json

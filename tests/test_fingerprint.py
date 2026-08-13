@@ -183,6 +183,39 @@ def test_relink_refuses_to_judge_on_too_little_evidence():
     assert "too few" in r["why"]
 
 
+# --------------------------------------------------------------------- input bounds
+
+def test_an_oversized_payload_is_bounded_rather_than_derived_whole():
+    """REGRESSION. Every value here is attacker-controlled and this runs on a request path.
+    Unbounded, a 50,000-key payload with 1KB values was accepted and derived without complaint,
+    and the endpoint then persisted it."""
+    huge = {f"junk_{i}": "x" * 5000 for i in range(50_000)}
+    huge.update(_rich())
+    b = FP.bounded(huge)
+    assert len(b) <= FP.MAX_COMPONENTS, f"{len(b)} components survived the bound"
+    assert all(not k.startswith("junk_") for k in b), (
+        "undeclared keys survived; the component contract is supposed to be closed")
+    # the real components still made it through, so bounding did not cost the fingerprint
+    assert FP.derive(huge)["is_identity"] is True
+
+
+def test_over_long_values_are_truncated_not_rejected():
+    """A real browser on unusual hardware can report a long GPU string. Losing that device
+    entirely would be a worse outcome than trimming it."""
+    long_gpu = _rich(gpu_renderer="ANGLE (" + "Z" * 10_000 + ")")
+    b = FP.bounded(long_gpu)
+    assert len(b["gpu_renderer"]) <= FP.MAX_VALUE_CHARS
+    assert FP.derive(long_gpu)["device_id"], "an over-long value lost the whole fingerprint"
+
+
+def test_structured_values_cannot_become_components():
+    """str() on a dict yields a long repr that would otherwise be hashed in as a component
+    value. Only scalars can be components."""
+    fp = FP.derive({"gpu_renderer": {"nested": "dict"}, "cpu_cores": [1, 2],
+                    "screen_w": 1920, "screen_h": 1080, "platform": "Win32"})
+    assert fp["is_identity"] is False
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0

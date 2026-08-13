@@ -111,8 +111,44 @@ _INTEGRITY_FLAGS = ("emulator", "rooted_jailbroken", "hooking_frida", "debugger_
                     "repackaged_app", "remote_access_tool_active")
 
 
+# INPUT BOUNDS. Every value here is attacker-controlled: the payload arrives from a client the
+# institution does not control, on a path meant to fire once per session. Unbounded, a 50,000-key
+# payload with 1KB values was accepted and derived without complaint, and the endpoint then
+# persisted it. These caps are generous against the real contract (17 declared components) and
+# hostile to anything else.
+MAX_COMPONENTS = 64
+MAX_VALUE_CHARS = 512
+
+
+def bounded(components: dict) -> dict:
+    """Clamp an untrusted component payload before anything reads it.
+
+    Truncates rather than rejects: a client sending one over-long GPU string is far more likely
+    to be a real browser on unusual hardware than an attack, and refusing the whole fingerprint
+    would lose a legitimate device. A payload with more keys than the contract declares is a
+    different matter, and the extras are dropped entirely - they cannot be components, because
+    the component list is closed.
+    """
+    if not isinstance(components, dict):
+        return {}
+    known = set(ANCHOR_COMPONENTS) | set(DRIFT_COMPONENTS) | set(_AUTOMATION_FLAGS) | \
+        set(_INTEGRITY_FLAGS)
+    out = {}
+    for k, v in components.items():
+        if len(out) >= MAX_COMPONENTS:
+            break
+        if k not in known:
+            continue          # closed contract: an undeclared key is not a component
+        out[k] = v[:MAX_VALUE_CHARS] if isinstance(v, str) else v
+    return out
+
+
 def _norm(v) -> str:
-    s = str(v).strip().lower() if v is not None else ""
+    # str() on a dict or list produces a long repr that would otherwise become a component
+    # value. Only scalars can be components, so anything else normalises to absent.
+    if isinstance(v, (dict, list, tuple, set, bytes)):
+        return ""
+    s = str(v).strip().lower()[:MAX_VALUE_CHARS] if v is not None else ""
     return "" if s in _NULL_VALUES else s
 
 
@@ -159,8 +195,12 @@ def derive(components: dict) -> dict:
     Returns the id, the confidence in it, the entropy behind that confidence, the drift vector
     for later re-linking, and the automation view. Never raises: a malformed or hostile payload
     yields a low-confidence result rather than an exception on the scoring path.
+
+    The payload is BOUNDED first. Every value in it is attacker-controlled and this runs on a
+    request path, so an unbounded dict is a resource-exhaustion surface before it is anything
+    else. See bounded().
     """
-    components = components or {}
+    components = bounded(components)
 
     anchor_present = [(c, _norm(components.get(c))) for c in ANCHOR_COMPONENTS]
     anchor_present = [(c, v) for c, v in anchor_present if v]

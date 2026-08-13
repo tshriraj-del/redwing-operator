@@ -238,6 +238,32 @@ try:
         print(f"⚠ CARD SCORER NOT LOADED ({type(_e).__name__}): /authorize cannot score a card "
               f"message. Run pulseml_models/card_model.py.")
 
+    # THE DEVICE GATE. Escalate-only, on the same terms as the novelty gate: it may RAISE a
+    # score the model was about to let through and may never lower one.
+    #
+    # It is a GATE and not a feature, and that was measured rather than assumed. Adding the
+    # device-graph columns to the model made it worse on every one (0.9082 -> 0.8432 together,
+    # 0.8547 from the per-device rate alone): a per-entity rate on a high-cardinality key gives a
+    # tree endless splits in mostly-noise and crowds out the features that generalise. The
+    # composite is sharp but fires on 0.013% of traffic, so it cannot move an aggregate metric
+    # and only offers a rare column to overfit. See pulseml_models/device_graph.py.
+    DEVICE_GRAPH = None
+    try:
+        import device_graph as _dg
+        DEVICE_GRAPH = _dg.DeviceGraph.load(MODELS_DIR / "device_graph.json")
+        _b = _dg.bands(DEVICE_GRAPH)
+        _thin = next((b for b in _b if b["band"].startswith("<=5")), None)
+        print(f"✓ Device gate loaded ({len(DEVICE_GRAPH.table):,} devices"
+              + (f", thin-shared band {_thin['vs_solo']}x base rate" if _thin else "")
+              + ", escalate-only)")
+    except Exception as _e:                                       # noqa: BLE001
+        # Advisory, unlike screening: an unavailable device graph means one escalation path is
+        # blind, not that traffic goes unscreened, so scoring continues. Stated rather than
+        # silent, because a gate that quietly stops firing looks exactly like a gate that has
+        # nothing to fire on.
+        print(f"⚠ device gate unavailable ({type(_e).__name__}); scoring continues without the "
+              f"device escalation. Run pulseml_models/device_graph.py.")
+
     df_all  = pd.read_csv(MODELS_DIR     / "transactions.csv")
     FEATURES = config["features"]
     MODEL_OK = True
@@ -312,7 +338,8 @@ from core.adjudication import schema as adjudication_schema, validate as adjudic
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
 from core.telemetry import assess_from_telemetry, derive_signals
-from core.ingest_schema import validate_event, contract as ingest_contract
+from core.ingest_schema import (validate_event, contract as ingest_contract,
+                                normalize_rail as _normalize_rail)
 from core.stream import DurableQueue, BackpressureError
 from core.connectors import FileConnector, DBConnector
 from core.webhook import WebhookReceiver
@@ -436,6 +463,35 @@ def apply_novelty_gate(score: float, features: dict) -> tuple:
     return raised, view
 
 
+def apply_device_gate(score: float, row: dict) -> tuple:
+    """Escalate-only composition of the device gate onto a score. Returns (score_after, view).
+
+    Shared by every scoring path DELIBERATELY, and defined next to apply_novelty_gate for the
+    same reason. This is the control that ADR-001 counts as the sixth instance of a defect class:
+    it was built in the ML repo with mutation-verified tests and then called from nowhere, so a
+    measured 84x-precision signal changed no outcome. Adding it to one path and not the other
+    would have been the seventh.
+
+    The rule the graph encodes: fan-out ALONE is worthless (devices on 8+ accounts measured 0.86x
+    the base rate, BELOW population, because a household device has high fan-out and far more
+    traffic than a fraud farm). Fan-out with THINNESS is the discriminator, and on held-out
+    traffic it fires on 0.013% of rows at 58.8% precision.
+    """
+    if DEVICE_GRAPH is None:
+        return score, {"available": False}
+    dev = str(row.get("device_id") or "")
+    if not dev:
+        return score, {"available": True, "fired": False, "why": "no device on this event"}
+    try:
+        import device_graph as _dg
+        raised, view = _dg.gate(DEVICE_GRAPH, dev, float(score))
+    except Exception as e:                                        # noqa: BLE001
+        return score, {"available": False, "error": type(e).__name__}
+    view["available"] = True
+    view["escalated"] = raised > float(score)
+    return raised, view
+
+
 def _network_view(row: dict, local_score: float):
     """Authorization IQ applied to one payment: returns (pack_or_None, score_after_network).
 
@@ -555,7 +611,14 @@ def build_event(row) -> dict:
     # and until this branch existed all of them still scored a card authorization with a model
     # that looks for velocity and recipient familiarity a card message does not carry - the
     # identical blindness /authorize had for its whole life, just on a busier door.
-    _is_card = str(row.get("payment_rail") or "").strip().lower() == "card"
+    # Canonicalise rather than compare to a literal. This line read
+    # `str(row.get("payment_rail") or "").strip().lower() == "card"`, which meant
+    # `debit_card` and `credit_card` - both already declared synonyms in
+    # ingest_schema.RAILS - silently routed card traffic back to the PUSH model, exactly the
+    # blindness this branch exists to remove. Callers that reach build_event() without going
+    # through validate_event() (/alerts, _assemble_case, replay) never had the rail normalised
+    # for them, so they were the ones losing the card model.
+    _is_card = _normalize_rail(row.get("payment_rail"))[0] == "card"
     card_detail = None
     if _is_card:
         ml, card_detail = score_card_message(row)
@@ -595,6 +658,12 @@ def build_event(row) -> dict:
     # through. That keeps "this is unusual" in its proper place, a reason to look rather than a
     # reason to be sure.
     network_score, novelty = apply_novelty_gate(network_score, features)
+
+    # The device gate, on the same escalate-only terms and applied AFTER the novelty gate. Order
+    # is deliberate and matches the rest of the ladder: the supervised model, the consortium and
+    # the unsupervised detector all speak first, and the device view only raises what those were
+    # about to let through.
+    network_score, device_view = apply_device_gate(network_score, row)
 
     # bool() on a CSV field is a trap: bool("False") is True, because a non-empty string is
     # truthy. Scoring a CSV-sourced row therefore flagged EVERY non-fraud transaction as an
@@ -639,6 +708,10 @@ def build_event(row) -> dict:
         # reason the network contribution is: an analyst must be able to see that a
         # payment was raised by an unsupervised detector rather than by the model.
         "novelty":           novelty,
+        # Reported separately for the same reason novelty and the network view are: an analyst
+        # must be able to see that a payment was raised by the device layer rather than by the
+        # model, and the gate fires rarely enough that every firing will be looked at.
+        "device_gate":       device_view,
         "matched_signals":   top["matched_signals"] if top else [],
         "graph_context":     graph_ctx,
         "graph_risk_score":  graph_ctx["graph_risk_score"],
@@ -1017,6 +1090,10 @@ def score(body: dict):
     # second decision path, and a control that lives on only one of them is a control that
     # disagrees with itself depending on how the payment arrived.
     net_score, novelty = apply_novelty_gate(net_score, features)
+    # Same gate, same order, same terms as build_event(). On BOTH paths from the first commit,
+    # because a control that lives on only one of them is a control that disagrees with itself
+    # depending on how the payment arrived - which is the whole subject of ADR-001.
+    net_score, device_view = apply_device_gate(net_score, body)
 
     transaction_id = str(body.get("transaction_id", f"txn_{uuid.uuid4().hex[:8]}"))
     explanation = _xai_explain(
@@ -1096,6 +1173,7 @@ def score(body: dict):
         # that a payment reached them because it was UNUSUAL, not because the model was
         # confident. Those two justify very different next steps.
         "novelty":        novelty,
+        "device_gate":    device_view,
         "screening":      scr,
         # The priced action, the policy that bounded it, and the version of the
         # table that did the bounding. Reported together because a decision you
@@ -1813,6 +1891,14 @@ def post_fingerprint(body: dict):
     if not subject_ref:
         raise HTTPException(400, "subject_ref is required")
     comps = body.get("components") if isinstance(body.get("components"), dict) else {}
+    # Cheap early rejection. derive() bounds the payload itself, but only after FastAPI has
+    # already parsed the whole body into memory, so this refuses an obviously hostile shape
+    # before it is read. The real ceiling belongs at the ASGI/proxy layer as a request-body
+    # limit; this is the application-level backstop, not a substitute for it.
+    from core.fingerprint import MAX_COMPONENTS
+    if len(comps) > MAX_COMPONENTS * 4:
+        raise HTTPException(413, f"components payload has {len(comps)} keys; the contract "
+                                 f"declares fewer than {MAX_COMPONENTS}")
     fp = derive(comps)
 
     # The automation and integrity tells feed the actor layer through the SAME path a client SDK
