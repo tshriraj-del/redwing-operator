@@ -77,6 +77,20 @@ def normalise_outcome(value) -> str | None:
     return None
 
 
+# What an outcome report is worth when the source does not say. Every source used to get this
+# unconditionally; it is now only the fallback.
+DEFAULT_CONFIDENCE = 0.95
+
+
+def _clamp_confidence(v) -> float:
+    """A confidence outside [0,1] is a bug in the caller, not a strong opinion."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_CONFIDENCE
+    return min(1.0, max(0.0, f))
+
+
 def validate(rec: dict) -> tuple:
     """(clean, error). Same shape as ingest_schema's validator, deliberately."""
     if not isinstance(rec, dict):
@@ -104,6 +118,14 @@ def validate(rec: dict) -> tuple:
         "recipient_id": str(rec.get("recipient_id") or "").strip(),
         "amount": rec.get("amount"),
         "reason_code": str(rec.get("reason_code") or "").strip(),
+        # A source that knows how sure it is may say so. This used to be hardcoded to 0.95 at
+        # write time for every source and every record, which flattened real differences: on the
+        # card rail a WITHDRAWN dispute and a contested win the merchant took on evidence are
+        # both "legit" and are emphatically not equally strong, and training weighted them the
+        # same. DEFAULT_CONFIDENCE preserves the old behaviour for every caller that says
+        # nothing, so this is additive.
+        "confidence": _clamp_confidence(rec.get("confidence")),
+        "notes": str(rec.get("notes") or "").strip(),
     }, ""
 
 
@@ -157,10 +179,12 @@ def record_outcome(store, rec: dict, *, override_reason: str = "") -> dict:
     outranked = bool(standing and not override_reason
                      and precedence_of(clean["source"]) < precedence_of(standing.source))
     label_id = store.add_label(
-        "outcome", "is_fraud", clean["outcome"], source=clean["source"], confidence=0.95,
+        "outcome", "is_fraud", clean["outcome"], source=clean["source"],
+        confidence=clean["confidence"],
         subject_ref=subj, entity_id=ent, effective_ts=clean["effective_ts"],
         annotator=f"outcome_ledger:{clean['source']}",
-        notes=json.dumps({k: clean[k] for k in ("reference", "reason_code", "amount")},
+        notes=json.dumps({k: clean[k] for k in
+                          ("reference", "reason_code", "amount", "notes") if clean[k]},
                          sort_keys=True),
         override_reason=override_reason,
     )
