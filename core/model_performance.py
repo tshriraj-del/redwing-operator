@@ -256,21 +256,24 @@ def _psi_between(store, a: dict, b: dict) -> dict:
     Reuses the drift monitor's estimator rather than writing a second one that could drift from
     it.
     """
-    out = {"score_psi": None, "feature_psi": None, "feature_psi_by_key": {}}
+    out = {"score_psi": None, "feature_psi": None, "feature_psi_by_key": {},
+           "min_per_side": None}
     try:
-        from drift_monitor import _compute_psi
+        from drift_monitor import MIN_PER_SIDE, _compute_psi
     except Exception:                                            # noqa: BLE001
         return out
+    out["min_per_side"] = MIN_PER_SIDE
     ra = _rows_with_features(store, a["start"], a["end"])
     rb = _rows_with_features(store, b["start"], b["end"])
-    if len(ra) < 50 or len(rb) < 50:
+    if len(ra) < MIN_PER_SIDE or len(rb) < MIN_PER_SIDE:
+        # The sample floor is the drift monitor's, imported rather than restated. Two copies of
+        # a threshold is how one window gets called shifted by this module and steady by the
+        # monitor, and a reviewer then has to work out which view to believe.
         return out
 
     def psi(xs, ys):
-        try:
-            return round(float(_compute_psi(xs, ys)), 4)
-        except Exception:                                        # noqa: BLE001
-            return None
+        p = _compute_psi(xs, ys)
+        return round(float(p), 4) if p is not None else None
 
     out["score_psi"] = psi([r["score"] for r in ra], [r["score"] for r in rb])
 
@@ -279,45 +282,67 @@ def _psi_between(store, a: dict, b: dict) -> dict:
     for k in sorted(keys):
         xs = [float(r["features"][k]) for r in ra if k in r["features"]]
         ys = [float(r["features"][k]) for r in rb if k in r["features"]]
-        if len(xs) >= 50 and len(ys) >= 50:
-            p = psi(xs, ys)
-            if p is not None:
-                out["feature_psi_by_key"][k] = p
+        p = psi(xs, ys)
+        if p is not None:
+            out["feature_psi_by_key"][k] = p
     if out["feature_psi_by_key"]:
         out["feature_psi"] = max(out["feature_psi_by_key"].values())
     return out
 
 
-def diagnose(store, *, window_days: int = 30, as_of=None) -> dict:
-    """Model degraded, population shifted, or labels still arriving? THE question this exists for.
+# The differential, in the order diagnose() tests it. These are not severity levels, they are
+# competing EXPLANATIONS for the same observation, and they demand opposite responses. The order
+# is the order in which one can be excluded: cheapest and most common first, so the expensive
+# conclusion (the model decayed, go retrain) is only reached once the cheap ones are gone.
+REASON_LADDER = (
+    ("unmeasurable",
+     "Have enough outcomes arrived to measure this window at all?"),
+    ("no_baseline",
+     "Is there an earlier measurable window to compare against?"),
+    ("stable",
+     "Did anything actually fall, by more than sampling noise?"),
+    ("population_shift",
+     "Did the INPUT distribution move, so the model is being asked a different question?"),
+    ("degraded",
+     "Input steady and performance down: what is left is the model."),
+)
 
-    Returns one verdict and the evidence for it. `unmeasurable` is a first-class answer and the
-    most common one on a young substrate: a window with too few outcomes is not a bad month, it
-    is an empty one, and calling it a regression would send somebody to retrain against noise.
+RULED_IN = "ruled_in"
+RULED_OUT = "ruled_out"
+NOT_REACHED = "not_reached"
+
+
+def _differential(steps: dict) -> list:
+    """The ladder as an ordered list, with every rung the procedure never reached marked as such.
+
+    WHY THIS IS ASSEMBLED HERE AND NOT IN THE CONSOLE. diagnose() already walks this ladder and
+    then throws away every rung it passed, leaving the caller a verdict with no way to show what
+    was excluded to reach it. Rebuilding the ladder in the frontend would be a second copy of the
+    decision procedure, free to disagree with this one after the next edit to either. So the
+    procedure reports its own work.
+
+    `not_reached` is a THIRD status and the distinction from `ruled_out` is the whole value. An
+    untested explanation has not been excluded, it is simply unknown. A view that greys both out
+    the same way tells a reviewer three reasons were considered when the procedure stopped after
+    one, which is the specific false assurance this module exists to refuse.
     """
-    t = trend(store, windows=4, window_days=window_days, as_of=as_of)
-    ws = t["windows"]
-    recent = ws[-1]
-    priors = [w for w in ws[:-1] if w.get("measurable")]
+    out = []
+    for reason, question in REASON_LADDER:
+        s = steps.get(reason)
+        out.append({
+            "reason": reason,
+            "question": question,
+            "status": s[0] if s else NOT_REACHED,
+            "evidence": s[1] if s else "not tested: the procedure stopped before this rung",
+        })
+    return out
 
-    base = {"recent": recent["window"], "window_days": window_days,
-            "maturity_known": recent["maturity"]["known"]}
 
-    if not recent.get("measurable"):
-        why = recent.get("reason", "the recent window carries too few outcomes").rstrip(". ")
-        return {**base, "verdict": "unmeasurable",
-                "reason": (f"{why}. "
-                           f"This is a statement about the label supply, not about the model. "
-                           f"Do not retrain on it."),
-                "label_coverage": recent["label_coverage"]}
-    if not priors:
-        return {**base, "verdict": "no_baseline",
-                "reason": ("no earlier window has enough outcomes to compare against, so the "
-                           "recent figures stand alone and a direction cannot be read from one "
-                           "point"),
-                "metrics": recent["metrics"]}
+def _attribute(store, prev: dict, recent: dict, base: dict, steps: dict) -> dict:
+    """Rungs 3 to 5, once a measurable window and a baseline both exist.
 
-    prev = priors[-1]
+    Split out of diagnose() only for length. The ladder is one procedure; this is its tail.
+    """
     psi = _psi_between(store, prev["window"], recent["window"])
     base["score_psi_vs_previous"] = psi["score_psi"]
     base["feature_psi_vs_previous"] = psi["feature_psi"]
@@ -330,37 +355,127 @@ def diagnose(store, *, window_days: int = 30, as_of=None) -> dict:
             drops[k] = round(b - a, 4)
     worst = min(drops.values()) if drops else 0.0
     base["deltas_vs_previous"] = drops
+    moves = ", ".join(f"{k.split('_on_')[0]} {v:+}" for k, v in drops.items()) or "no comparable metric"
 
     if worst > -MATERIAL_DROP:
-        return {**base, "verdict": "stable",
+        steps["stable"] = (RULED_IN,
+                           f"{moves} against the previous window, none past the {MATERIAL_DROP} "
+                           f"materiality bar on {recent['metrics']['n_labelled']} labelled rows")
+        return {**base, "verdict": "stable", "differential": _differential(steps),
                 "reason": (f"no metric fell by more than {MATERIAL_DROP} against the previous "
                            f"window; moves this size on {recent['metrics']['n_labelled']} "
                            f"labelled rows are sampling noise")}
 
+    steps["stable"] = (RULED_OUT, f"{moves}, past the {MATERIAL_DROP} materiality bar")
+
     fpsi = psi["feature_psi"]
     if fpsi is not None and fpsi >= 0.20:
         worst_key = max(psi["feature_psi_by_key"], key=psi["feature_psi_by_key"].get)
-        return {**base, "verdict": "population_shift",
+        steps["population_shift"] = (RULED_IN,
+                                     f"feature PSI {fpsi} on {worst_key!r}, past the 0.20 "
+                                     f"drift threshold; the traffic moved")
+        return {**base, "verdict": "population_shift", "differential": _differential(steps),
                 "reason": (f"performance fell (worst delta {worst}) AND the INPUT distribution "
                            f"moved materially (feature PSI {fpsi} on {worst_key!r}). The model "
                            f"may be unchanged and simply being asked a different question. "
                            f"Investigate the mix before retraining, because retraining on a "
                            f"shifted population bakes the shift in")}
 
-    if not recent["maturity"]["known"]:
-        return {**base, "verdict": "degraded_unconfirmed",
-                "reason": (f"performance fell (worst delta {worst}) with a stable input "
-                           f"distribution, which points at the model. It is NOT confirmed, "
-                           f"because maturity is not derivable and a recent window short of its "
-                           f"late-arriving frauds shows a falling recall for a reason that has "
-                           f"nothing to do with the model. Treat as a signal to watch, not a "
-                           f"finding")}
+    # fpsi is None means the PSI never ran, which is NOT the same as the inputs holding still.
+    # The verdict falls through to the model either way, and saying so is the point: a
+    # `not_reached` here tells the reader this conclusion rests on an exclusion nobody performed.
+    if fpsi is None:
+        steps["population_shift"] = (
+            NOT_REACHED,
+            "no feature PSI could be computed (under 50 rows carrying numeric features on one "
+            "side of the comparison), so the inputs are UNTESTED rather than steady")
+        held = "the input distribution was never tested"
+    else:
+        steps["population_shift"] = (
+            RULED_OUT,
+            f"worst feature PSI {fpsi}, under the 0.20 threshold; the inputs held still")
+        held = f"a steady input distribution (feature PSI {fpsi})"
 
-    return {**base, "verdict": "degraded",
+    # `degraded` is the verdict that authorises a retrain, so it requires BOTH competing
+    # explanations to have actually been excluded, not merely to have been skipped. An
+    # uncomputable PSI and an underivable maturity curve are the same kind of gap: something the
+    # conclusion rests on that nobody measured. Either one downgrades this to unconfirmed.
+    unconfirmed = []
+    if fpsi is None:
+        unconfirmed.append(
+            "the input distribution was never tested, so a population shift is not excluded")
+    if not recent["maturity"]["known"]:
+        unconfirmed.append(
+            "maturity is not derivable, and a window short of its late-arriving frauds shows a "
+            "falling recall for a reason that has nothing to do with the model")
+
+    if unconfirmed:
+        steps["degraded"] = (RULED_IN,
+                             f"worst delta {worst} with {held}. NOT confirmed: "
+                             + "; ".join(unconfirmed))
+        return {**base, "verdict": "degraded_unconfirmed", "differential": _differential(steps),
+                "reason": (f"performance fell (worst delta {worst}), which points at the model. "
+                           f"It is NOT confirmed, because " + "; and ".join(unconfirmed)
+                           + ". Treat as a signal to watch, not a finding")}
+
+    steps["degraded"] = (RULED_IN,
+                         f"worst delta {worst} on a MATURE window with {held}. Late labels are "
+                         f"excluded and so is the population")
+    return {**base, "verdict": "degraded", "differential": _differential(steps),
             "reason": (f"performance fell (worst delta {worst}) on a MATURE window whose INPUT "
                        f"distribution is stable (feature PSI {fpsi}). Population shift and label "
                        f"lag are both excluded, which leaves the model. This is the one that "
                        f"justifies a retrain")}
+
+
+def diagnose(store, *, window_days: int = 30, as_of=None) -> dict:
+    """Model degraded, population shifted, or labels still arriving? THE question this exists for.
+
+    Returns one verdict, the evidence for it, and under `differential` the full ladder of
+    competing explanations with each one marked ruled in, ruled out, or never reached.
+    `unmeasurable` is a first-class answer and the most common one on a young substrate: a window
+    with too few outcomes is not a bad month, it is an empty one, and calling it a regression
+    would send somebody to retrain against noise.
+    """
+    t = trend(store, windows=4, window_days=window_days, as_of=as_of)
+    ws = t["windows"]
+    recent = ws[-1]
+    priors = [w for w in ws[:-1] if w.get("measurable")]
+    steps: dict = {}
+
+    base = {"recent": recent["window"], "window_days": window_days,
+            "maturity_known": recent["maturity"]["known"],
+            "n_decisions": recent["n_decisions"], "n_labelled": recent["n_labelled"],
+            "censoring": recent.get("censoring", {})}
+
+    if not recent.get("measurable"):
+        why = recent.get("reason", "the recent window carries too few outcomes").rstrip(". ")
+        steps["unmeasurable"] = (RULED_IN, why)
+        return {**base, "verdict": "unmeasurable", "differential": _differential(steps),
+                "reason": (f"{why}. "
+                           f"This is a statement about the label supply, not about the model. "
+                           f"Do not retrain on it."),
+                "label_coverage": recent["label_coverage"]}
+
+    steps["unmeasurable"] = (RULED_OUT,
+                             f"{recent['n_labelled']} of {recent['n_decisions']} decisions carry "
+                             f"an outcome, at or above the {MIN_LABELLED} needed to measure")
+
+    if not priors:
+        steps["no_baseline"] = (RULED_IN,
+                                "no earlier window clears the label floor, so the recent figures "
+                                "are a single point and a point has no direction")
+        return {**base, "verdict": "no_baseline", "differential": _differential(steps),
+                "reason": ("no earlier window has enough outcomes to compare against, so the "
+                           "recent figures stand alone and a direction cannot be read from one "
+                           "point"),
+                "metrics": recent["metrics"]}
+
+    prev = priors[-1]
+    steps["no_baseline"] = (RULED_OUT,
+                            f"comparing against {prev['window']['start'][:10]} to "
+                            f"{prev['window']['end'][:10]}, {prev['n_labelled']} labelled rows")
+    return _attribute(store, prev, recent, base, steps)
 
 
 def main():
