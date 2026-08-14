@@ -79,10 +79,10 @@ KNOWN_GAPS = {
     ("authorize", "device_gate"):
         "an ISO 8583 message carries no device, so the gate has nothing to read. This is "
         "arguably PROFILE rather than a gap; kept here until the card device story is settled.",
-    ("authorize", "durable_decision"):
-        "card authorizations are never written to the substrate, so the card rail produces no "
-        "labels, no outcome-ledger entries and no holdout membership. THE most consequential "
-        "entry in this list. ADR-001 action item 2.",
+    # ("authorize", "durable_decision") CLOSED 2026-08-14. Card authorizations now write through
+    # to the substrate keyed on the ARN/RRN, with holdout membership decided in the decision
+    # path by a pure hash rather than at write time. Deleted from the list by the two-way
+    # ratchet, which failed this file the moment the gap stopped being observed. ADR-001 item 2.
     ("score", "card_model"):
         "/score does not branch to the card scorer, so a card-rail payment arriving there is "
         "scored by the push model. build_event and /authorize both branch correctly.",
@@ -177,10 +177,14 @@ def _probe_score(client):
 
 
 def _probe_authorize(client):
+    # The RRN is DE 37 and is present on every real authorization. The probe omitted it, which
+    # made this path look permanently unable to produce a durable decision when what it actually
+    # lacked was the join key that a durable decision requires.
     r = client.post("/authorize", json={
         "amount": 900.0, "merchant_name": "Acme Supplies", "cardholder_name": "Jane Roe",
         "entry_mode": "ecom", "mcc_code": 5999, "account_age_days": 30,
-        "available_balance": 9000.0, "bin": "400000", "merchant_id": "m_conf"})
+        "available_balance": 9000.0, "bin": "400000", "merchant_id": "m_conf",
+        "rrn": "conf_rrn_0001"})
     if r.status_code != 200:
         return None
     d = r.json()

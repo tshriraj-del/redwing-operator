@@ -13,6 +13,7 @@ Loads the trained ML models from ~/pulseml_models and exposes:
 """
 
 import asyncio
+import hashlib
 import math
 import json
 import hmac
@@ -1709,6 +1710,67 @@ def substrate_next_questions(limit: int = 10):
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
 
 
+def _persist_authorization(msg: dict, decision: dict) -> dict:
+    """Write the authorization to the substrate and stamp the decision_id onto the response.
+
+    ADR-001 action item 2. Before this, /authorize was the one decision path that recorded
+    nothing, so the card rail had no labels, no outcome-ledger entries and no holdout membership,
+    and its model could never be measured for decay or graduated.
+
+    THE ORDER MATTERS AND IT IS NOT THE OBVIOUS ONE. `durable_record` runs FIRST and computes
+    everything, including holdout membership, from the message alone. Only then does the store
+    get touched. That is what makes the record safe to write behind a network deadline: if the
+    write is slow, deferred, or fails outright, the sampling decision has already been made by a
+    pure hash of the ARN and cannot drift. A holdout whose membership depends on whether a write
+    succeeded is not a randomised holdout.
+
+    The decision_id is deterministic on the ARN for the same reason, so a retried authorization
+    overwrites its own row rather than creating a second decision for one payment, and so the id
+    can be returned even when the substrate is unavailable.
+
+    A substrate failure degrades LOUDLY into the response (`recorded: false`) rather than
+    silently, because a caller that believes its decision was recorded when it was not is exactly
+    how a rail ends up unmeasurable again.
+    """
+    from core.authorization import durable_record
+
+    rec = durable_record(msg, decision, holdout_fn=holdout_decision)
+    if not rec:
+        decision["recorded"] = False
+        decision["not_recorded_reason"] = (
+            "no acquirer reference number on the message, so an outcome could never be joined "
+            "back to this decision; pass arn, rrn or transaction_id")
+        return decision
+
+    # Deterministic and idempotent: one payment, one decision row, however many retries.
+    decision["decision_id"] = "auth:" + hashlib.sha256(
+        rec["subject_ref"].encode()).hexdigest()[:24]
+    decision["holdout"] = rec["holdout"]
+    if rec["released"]:
+        # A released would-be-decline is actually let through and monitored. The response has to
+        # reflect what was ENFORCED, not what was proposed, or the holdout is a fiction.
+        decision["action"] = rec["action"]
+        decision["monitored"] = True
+
+    if STORE is None:
+        decision["recorded"] = False
+        decision["not_recorded_reason"] = "substrate unavailable"
+        return decision
+    try:
+        record_decision(
+            STORE, subject_ref=rec["subject_ref"], action=rec["action"], module="card_scorer",
+            score=rec["score"], expected_liability=rec["expected_liability"],
+            features=rec["features"], rationale=rec["rationale"],
+            model_version=REGISTRY.decision_versions(),
+            decision_id=decision["decision_id"],
+        )
+        decision["recorded"] = True
+    except Exception as e:                                        # noqa: BLE001
+        decision["recorded"] = False
+        decision["not_recorded_reason"] = f"{type(e).__name__}: {str(e)[:120]}"
+    return decision
+
+
 @app.post("/authorize")
 def authorize_payment(body: dict):
     """A card authorization. Approve or decline, inside the window, with a response code.
@@ -1731,7 +1793,105 @@ def authorize_payment(body: dict):
     # The version on main at merge time was the ORIGINAL push-payment scorer (compute_features +
     # ml_score_row), which is the defect this branch exists to fix: it returns ~0.0 on every card
     # message because the signal it wants is not in an authorization. Taking this side deliberately.
-    return authorize(body or {}, score_fn=score_card_message)
+    msg = body or {}
+    decision = authorize(msg, score_fn=score_card_message)
+    return _persist_authorization(msg, decision)
+
+
+@app.post("/disputes")
+def post_dispute(body: dict):
+    """Ingest dispute events for one authorization and settle the label they imply.
+
+    Body: {"subject_ref": "<arn or rrn>", "events": [{stage|terminal, ts, reason_code, amount,
+    compelling_evidence}, ...]}. The full event list is accepted every time and re-folded, so
+    re-posting a file is idempotent rather than double-counting.
+
+    THE POINT OF THIS ENDPOINT IS WHAT IT REFUSES. A chargeback is a claim, not an adjudication,
+    so an open dispute emits no label. A service dispute (13.1, 4853) is not fraud and never
+    reaches the fraud label space. A fraud claim the merchant wins INVERTS to legit rather than
+    disappearing. Every refusal is returned with its reason instead of being silently dropped,
+    because a caller that cannot see what was withheld will assume everything was recorded.
+
+    NOT connected to a network. There is no VROL or Mastercom feed; this is the contract those
+    rails present, so the label pipeline can be built and measured against it.
+    """
+    from core.dispute import advance, derive_outcome, to_ledger_record
+
+    subject_ref = str((body or {}).get("subject_ref", "") or "").strip()
+    events = (body or {}).get("events") or []
+    if not subject_ref:
+        raise HTTPException(422, "subject_ref is required: it is the key that joins this "
+                                 "dispute back to the authorization that caused it")
+    if not isinstance(events, list):
+        raise HTTPException(422, "events must be a list")
+
+    state = advance(events)
+    verdict = derive_outcome(state)
+    out = {
+        "subject_ref": subject_ref,
+        "stage": state["stage"], "terminal": state["terminal"], "settled": state["settled"],
+        "reason_code": state["reason_code"], "classification": state["classification"],
+        "n_events": state["n_events"],
+        "label": verdict,
+        "recorded": False,
+    }
+
+    if STORE is None:
+        out["not_recorded_reason"] = "substrate unavailable"
+        return out
+
+    try:
+        STORE.append_event(
+            event_type="dispute", payload={"subject_ref": subject_ref, "events": events},
+            derived={"stage": state["stage"], "terminal": state["terminal"],
+                     "reason_code": state["reason_code"], "emitted": verdict["emit"]},
+        )
+    except Exception as e:                                        # noqa: BLE001
+        out["not_recorded_reason"] = f"event log failed: {type(e).__name__}"
+        return out
+
+    rec = to_ledger_record(state, subject_ref)
+    if rec is None:
+        # Withheld on purpose. Say so, and say why, rather than returning a bare success.
+        out["recorded"] = True
+        out["label_written"] = False
+        out["withheld_because"] = verdict["reason"]
+        return out
+
+    from core.outcome_ledger import record_outcome
+    try:
+        out["ledger"] = record_outcome(STORE, rec)
+        out["recorded"] = True
+        out["label_written"] = True
+    except Exception as e:                                        # noqa: BLE001
+        out["not_recorded_reason"] = f"ledger write failed: {type(e).__name__}"
+    return out
+
+
+@app.get("/disputes/contract")
+def dispute_contract():
+    """The reason-code taxonomy this rail understands, and which codes may become fraud labels.
+
+    The load-bearing column is `fraud_eligible`. Only the fraud family can ever reach
+    `outcome.is_fraud`; a consumer dispute recorded as fraud trains the model that a late parcel
+    is fraud, and consumer disputes are a large share of all chargebacks.
+    """
+    from core.dispute import (AMBIGUOUS_FRAUD_CODES, REASON_CODES, STAGES,
+                              STAGE_WINDOW_DAYS, TERMINAL, classify)
+    return {
+        "stages": list(STAGES),
+        "terminal_outcomes": TERMINAL,
+        "stage_window_days": STAGE_WINDOW_DAYS,
+        "window_note": ("ASSUMPTION, not sourced. Typical network windows used to compute a "
+                        "maturity floor; a real deployment substitutes the operative rulebook."),
+        "ambiguous_fraud_codes": list(AMBIGUOUS_FRAUD_CODES),
+        "ambiguity_note": ("these codes span true fraud, friendly fraud and merchant error by "
+                           "definition, so the code alone cannot separate them and they settle "
+                           "at lower confidence"),
+        "codes": [{"code": c, **classify(c)} for c in sorted(REASON_CODES)],
+        "note": ("modelled, not connected to a network. No VROL or Mastercom feed; this is the "
+                 "contract those rails present so the label pipeline can be measured."),
+    }
 
 
 @app.get("/authorize/contract")

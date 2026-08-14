@@ -223,3 +223,87 @@ def authorize(msg: dict, *, score_fn=None, budget_ms: int = AUTH_BUDGET_MS,
     return respond(code, action=pol["action"], reason=reason,
                    extra={"screening": scr, "priced": priced, "policy": pol,
                           "score_detail": detail})
+
+
+# ── the durable record ───────────────────────────────────────────────────────
+#
+# ADR-001 action item 2, and the most consequential gap the conformance test tracked: this path
+# wrote nothing, so the card rail produced no labels, no outcome-ledger entries and no holdout
+# membership. It could never be measured for decay and could never graduate.
+
+def card_subject_ref(msg: dict) -> str:
+    """The key a chargeback will arrive under, months later.
+
+    THIS IS THE WHOLE JOIN, and the two identifiers involved live at different moments. At
+    authorization the message carries the RRN (DE 37) and STAN; the ARN is assembled at
+    CLEARING and is what the dispute file references. An issuer keeps the mapping between them,
+    so either is a usable key here and the ARN is preferred when present because it is the one
+    the outcome will arrive under.
+
+    Filing the decision under a purely internal id would make the outcome unjoinable to the
+    decision that caused it, which is exactly the failure this record exists to prevent, so an
+    internal id is accepted only as a last resort.
+    """
+    for key in ("arn", "acquirer_reference_number", "rrn", "retrieval_reference_number",
+                "auth_id", "transaction_id"):
+        v = str(msg.get(key, "") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def durable_record(msg: dict, decision: dict, *, holdout_fn=None) -> dict:
+    """Everything needed to persist one authorization, computed WITHOUT touching a store.
+
+    WHY THE SPLIT. A card authorization answers against a network deadline, so the write cannot
+    sit in the response path. That forces the record to be built here and persisted after the
+    response, which is only safe because two properties hold:
+
+      the subject_ref is the ARN, so a dispute months later joins to this exact decision, and
+      the holdout call is a pure hash of that ref, so membership is decided IN the decision and
+      not by whoever gets around to writing it. Deciding holdout at write time would let a
+      delayed or dropped write silently change which cases were sampled, and the holdout is only
+      unbiased if nothing downstream can influence membership.
+
+    `holdout_fn` is injected so this stays free of import cycles and the tests can drive it.
+    Returns {} when there is no usable subject_ref, because a decision nobody can join an
+    outcome to is not worth a row and would inflate coverage denominators with dead weight.
+    """
+    ref = card_subject_ref(msg)
+    if not ref:
+        return {}
+
+    action = str(decision.get("action") or "")
+    priced = decision.get("priced") or {}
+    liability = float(priced.get("expected_liability") or 0.0)
+
+    ho = {"release": False, "enforced_action": action, "holdout": False, "reason": ""}
+    if holdout_fn:
+        ho = holdout_fn(ref, action, liability)
+
+    return {
+        "subject_ref": ref,
+        "action": ho.get("enforced_action") or action,
+        "score": float((decision.get("score_detail") or {}).get("p_fraud",
+                       priced.get("p_fraud", 0.0)) or 0.0),
+        "expected_liability": liability,
+        "features": (decision.get("score_detail") or {}).get("features") or {},
+        "holdout": bool(ho.get("holdout")),
+        "released": bool(ho.get("release")),
+        "rationale": {
+            "path": "authorize",
+            "rail": "card",
+            "response_code": decision.get("response_code"),
+            "proposed_action": action,
+            "enforced": True,
+            "holdout": bool(ho.get("holdout")),
+            "released": bool(ho.get("release")),
+            "holdout_reason": ho.get("reason", ""),
+            "stand_in": bool(decision.get("stand_in")),
+            "within_budget": decision.get("within_budget"),
+            # The dispute rail reads these back to compute a maturity floor per authorization.
+            "entry_mode": str(msg.get("entry_mode", "") or ""),
+            "mcc_code": msg.get("mcc_code"),
+            "bin": str(msg.get("bin", "") or ""),
+        },
+    }
