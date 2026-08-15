@@ -273,9 +273,23 @@ def durable_record(msg: dict, decision: dict, *, holdout_fn=None) -> dict:
     if not ref:
         return {}
 
+    # THE CARD, as opposed to the transaction. `subject_ref` is the ARN and identifies one
+    # authorization; `entity_id` identifies the card across all of them, which is what makes a
+    # per-card trailing window queryable at all. Filed under the already-indexed entity column,
+    # and it is a salted hash: the PAN is never stored. See core/card_identity.py.
+    from .card_identity import card_key
+    from .store import eid
+    ckey = card_key(msg)
+    entity = eid("card", ckey) if ckey else ""
+
     action = str(decision.get("action") or "")
     priced = decision.get("priced") or {}
-    liability = float(priced.get("expected_liability") or 0.0)
+    # `price_decision` returns `cost_of_allowing`, which IS the expected liability; there is no
+    # `expected_liability` key and reading one wrote 0.0 on every card decision. That silently
+    # disabled the holdout's liability ceiling too, since nothing could exceed a limit when
+    # every case reported zero. Found by watching the sequence gate never fire.
+    liability = float(priced.get("cost_of_allowing") or 0.0)
+    amount = float(msg.get("amount", 0.0) or 0.0)
 
     ho = {"release": False, "enforced_action": action, "holdout": False, "reason": ""}
     if holdout_fn:
@@ -283,11 +297,19 @@ def durable_record(msg: dict, decision: dict, *, holdout_fn=None) -> dict:
 
     return {
         "subject_ref": ref,
+        "entity_id": entity,
+        "card_key": ckey,
         "action": ho.get("enforced_action") or action,
         "score": float((decision.get("score_detail") or {}).get("p_fraud",
                        priced.get("p_fraud", 0.0)) or 0.0),
         "expected_liability": liability,
-        "features": (decision.get("score_detail") or {}).get("features") or {},
+        # AMOUNT IS PERSISTED SEPARATELY FROM LIABILITY and the two are not interchangeable.
+        # Liability is p x amount x reimbursement rate (dollars at risk); amount is dollars
+        # transacted. The sequence gate compares this authorization's amount to the card's own
+        # recent AMOUNTS, exactly as the training pass does, and comparing it to liability
+        # instead is a units error that silently produces a meaningless ratio.
+        "features": {**((decision.get("score_detail") or {}).get("features") or {}),
+                     "amount": amount},
         "holdout": bool(ho.get("holdout")),
         "released": bool(ho.get("release")),
         "rationale": {

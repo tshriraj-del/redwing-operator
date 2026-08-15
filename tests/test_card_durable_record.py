@@ -142,6 +142,30 @@ def test_a_hostile_or_empty_message_degrades_rather_than_raising():
         durable_record(bad, {"action": "ALLOW"}, holdout_fn=holdout_decision)
 
 
+def test_the_expected_liability_is_the_priced_one_and_not_zero():
+    """A BUG THAT SHIPPED. durable_record read `priced["expected_liability"]`, a key
+    price_decision does not return, so every card decision recorded 0.0. Silent, and worse than
+    cosmetic: the holdout's max_liability ceiling can never trigger when every case reports zero,
+    so high-stakes authorizations became eligible for release. Found by watching the sequence
+    gate never fire, not by reading the code."""
+    msg, dec = _decide(amount=5000.0)
+    rec = durable_record(msg, dec, holdout_fn=holdout_decision)
+    priced = dec.get("priced") or {}
+    assert priced.get("cost_of_allowing") is not None, "fixture did not reach pricing"
+    assert rec["expected_liability"] > 0.0, "card decisions are recording zero liability again"
+    assert abs(rec["expected_liability"] - float(priced["cost_of_allowing"])) < 1e-9
+
+
+def test_the_amount_is_persisted_separately_from_the_liability():
+    """Liability is p x amount x rate; amount is what was transacted. The sequence gate compares
+    amount to the card's own recent AMOUNTS, so storing only liability makes that comparison a
+    units error producing a meaningless ratio."""
+    msg, dec = _decide(amount=250.0)
+    rec = durable_record(msg, dec, holdout_fn=holdout_decision)
+    assert rec["features"].get("amount") == 250.0
+    assert rec["features"]["amount"] != rec["expected_liability"]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
