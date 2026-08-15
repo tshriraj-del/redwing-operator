@@ -37,6 +37,15 @@ barely stronger than reading the source: stub the control out to `scr = None` an
 still there, so the probe still says yes. Every probe below asserts the value has the SHAPE a
 real result has, so a stub reads as absent.
 
+AND SHAPE IS NECESSARY BUT NOT SUFFICIENT, which is the limit of this file and is recorded here
+rather than left for someone to discover. A probe reads the RESPONSE, so it can prove a control
+RAN and cannot prove its answer was USED. Measured 2026-08-15 by mutation: a `score_by_rail` that
+called the card scorer, kept its detail block, and returned `ml_score_row`'s number instead passed
+this file 5/5, because `card_score_detail.model` was still "card_scorer". Catching that needs a
+test that computes both models independently and compares, which is what
+tests/test_score_card_rail.py does. Do not strengthen the probes to chase it: a probe that needs
+a reference implementation is no longer a conformance check.
+
 AND A BROKEN PATH IS A FAILURE, NOT A SKIP. The second version silently dropped any path whose
 probe returned None, which is what happens when the endpoint 500s. Nulling screening on /score
 made that endpoint crash, the probe returned None, the path vanished from the matrix, and the
@@ -83,15 +92,13 @@ KNOWN_GAPS = {
     # to the substrate keyed on the ARN/RRN, with holdout membership decided in the decision
     # path by a pure hash rather than at write time. Deleted from the list by the two-way
     # ratchet, which failed this file the moment the gap stopped being observed. ADR-001 item 2.
-    ("score", "card_model"):
-        "/score does not branch to the card scorer, so a card-rail payment arriving there is "
-        "scored by the push model. build_event and /authorize both branch correctly.",
-    ("score", "sequence_gate"):
-        "downstream of ('score', 'card_model') and closes with it, not separately. The sequence "
-        "gate lives inside score_card_message_gated, which is the card scorer's entry point; a "
-        "path that never reaches the card scorer cannot reach its gate. Wiring the gate here "
-        "independently would apply a control priced on card authorizations to push payments "
-        "scored by the push model, which is worse than the gap.",
+    # ("score", "card_model") CLOSED 2026-08-15, and ("score", "sequence_gate") with it exactly
+    # as the entry predicted: the gate lives inside score_card_message_gated, so the path that
+    # reaches the card scorer reaches its gate. The rail branch that had lived inline in
+    # build_event() is now score_by_rail(), called by both, because a third hand-written copy
+    # would have closed this gap and guaranteed the eighth. Worth recording what the gap actually
+    # cost: the push model returns 0.0 on a card message, so a card payment arriving at /score
+    # was not scored badly, it was reported as no risk at all. ADR-001 item 3.
 }
 
 

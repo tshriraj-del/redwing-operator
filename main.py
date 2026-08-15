@@ -646,6 +646,35 @@ def score_card_message(msg: dict) -> tuple:
                      "warning": "card scorer raised; this event was NOT risk-assessed"}
 
 
+def score_by_rail(row: dict, features: dict) -> tuple:
+    """Pick the model the RAIL calls for. Returns `(score, card_detail_or_None)`.
+
+    ADR-001, and the seventh instance of its recurring failure. This branch lived inline in
+    `build_event()` while `/score` computed `ml_score_row(features)` unconditionally, so a card
+    authorization arriving at `/score` was scored by the push model. That is not a degraded
+    number, it is a number about a different question: the push model reads velocity and
+    recipient familiarity, and an ISO 8583 message carries neither. MEASURED on the conformance
+    fixture, the push model returns 0.0 on a card message, so the endpoint reported no risk at
+    all and the payment sailed through.
+
+    EXTRACTED RATHER THAN COPIED. `/score` and `build_event()` are already two hand-maintained
+    copies of one pipeline, which is why six controls have been wired to one and forgotten on the
+    other. Adding a third hand-written branch would have closed this gap and guaranteed the
+    eighth. One function, both callers.
+
+    THE RAIL IS CANONICALISED, NEVER COMPARED TO A LITERAL. `debit_card` and `credit_card` are
+    declared synonyms of `card` in ingest_schema.RAILS. `build_event` shipped with
+    `rail.strip().lower() == "card"` and silently routed both back to the push model, which is
+    the identical blindness this branch exists to remove.
+
+    The GATED card scorer, which is the same entry point `/authorize` uses. Calling the ungated
+    `score_card_message` here is exactly how a control ends up on one door and not the other.
+    """
+    if _normalize_rail(row.get("payment_rail"))[0] == "card":
+        return score_card_message_gated(row)
+    return ml_score_row(features), None
+
+
 def build_event(row) -> dict:
     """Score a row and return a full event payload for SSE or REST."""
     if isinstance(row, pd.Series):
@@ -661,31 +690,20 @@ def build_event(row) -> dict:
                          member=str(row.get("user_name", "") or ""))
 
     features = compute_features(row)
-    # CARD ROWS GO THROUGH THE CARD MODEL, not the push-payment score below. features/matches
-    # still get computed either way, because the rule matcher and the graph/drift plumbing
-    # further down expect them to exist; only `ml`, the number everything downstream is DERIVED
-    # from (c_score, cascade_score, network_score, the priced decision), is replaced.
+    # CARD ROWS GO THROUGH THE CARD MODEL, not the push-payment score. features/matches still get
+    # computed either way, because the rule matcher and the graph/drift plumbing further down
+    # expect them to exist; only `ml`, the number everything downstream is DERIVED from (c_score,
+    # cascade_score, network_score, the priced decision), is replaced.
     #
     # This was the actual gap /authorize's fix did not close: every OTHER ingestion surface
     # (/ingest, /ingest/batch, the stream consumer, every source connector) calls build_event(),
     # and until this branch existed all of them still scored a card authorization with a model
     # that looks for velocity and recipient familiarity a card message does not carry - the
     # identical blindness /authorize had for its whole life, just on a busier door.
-    # Canonicalise rather than compare to a literal. This line read
-    # `str(row.get("payment_rail") or "").strip().lower() == "card"`, which meant
-    # `debit_card` and `credit_card` - both already declared synonyms in
-    # ingest_schema.RAILS - silently routed card traffic back to the PUSH model, exactly the
-    # blindness this branch exists to remove. Callers that reach build_event() without going
-    # through validate_event() (/alerts, _assemble_case, replay) never had the rail normalised
-    # for them, so they were the ones losing the card model.
-    _is_card = _normalize_rail(row.get("payment_rail"))[0] == "card"
-    card_detail = None
-    if _is_card:
-        # The GATED scorer, which is the same function /authorize uses. Calling the ungated
-        # score_card_message here is exactly how a control ends up on one door and not the other.
-        ml, card_detail = score_card_message_gated(row)
-    else:
-        ml = ml_score_row(features)
+    #
+    # The branch itself now lives in score_by_rail() because /score needed the same one and a
+    # second hand-written copy is how this codebase got six controls on one path and not another.
+    ml, card_detail = score_by_rail(row, features)
     matches = score_transaction(features)
     top = matches[0] if matches else None
 
@@ -1139,7 +1157,13 @@ def score(body: dict):
                          member=str(body.get("user_name", "") or ""))
 
     features = compute_features(body)
-    ml       = ml_score_row(features)
+    # The SAME rail branch build_event() uses, from the same function. /score computed
+    # ml_score_row() unconditionally for its whole life, so a card payment arriving here was
+    # scored by the push model, which returns 0.0 on a card message: no risk reported, payment
+    # through. That was ("score", "card_model") in the conformance test's KNOWN_GAPS, and
+    # ("score", "sequence_gate") closes with it, because the gate lives inside the card scorer's
+    # entry point and a path that reaches one reaches the other.
+    ml, card_detail = score_by_rail(body, features)
     matches  = score_transaction(features)
     top      = matches[0] if matches else None
     c_score  = combined_score(ml, top["confidence"]) if top else ml
@@ -1226,7 +1250,7 @@ def score(body: dict):
         except Exception:
             pass          # a substrate failure must never fail scoring
 
-    return {
+    out = {
         "transaction_id": transaction_id,
         "ml_score":       round(ml, 4),
         "local_score":    round(c_score, 4),        # this institution's own book alone
@@ -1253,6 +1277,14 @@ def score(body: dict):
         "all_patterns":   matches,
         "explanation":    explanation,
     }
+    if card_detail is not None:
+        # Rides alongside the score for the same reason it does on build_event() and /authorize:
+        # a number computed on a degraded card message is not the same number as one computed on
+        # a complete one, and the caller must be able to see the difference rather than trust a
+        # score that looks identical either way. It also carries the sequence gate's view, which
+        # is what makes the gate observable on this path rather than merely present in the code.
+        out["card_score_detail"] = card_detail
+    return out
 
 
 # -- XAI / Explainability Endpoints -------------------------------------------
