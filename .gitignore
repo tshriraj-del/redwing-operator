@@ -22,3 +22,7 @@ docs/
 .coverage.*
 htmlcov/
 coverage.json
+
+# Local agent-harness state written by plugins installed 2026-08-14, not project code.
+.claude-flow/
+.claude/

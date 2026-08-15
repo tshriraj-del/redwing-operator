@@ -86,6 +86,12 @@ KNOWN_GAPS = {
     ("score", "card_model"):
         "/score does not branch to the card scorer, so a card-rail payment arriving there is "
         "scored by the push model. build_event and /authorize both branch correctly.",
+    ("score", "sequence_gate"):
+        "downstream of ('score', 'card_model') and closes with it, not separately. The sequence "
+        "gate lives inside score_card_message_gated, which is the card scorer's entry point; a "
+        "path that never reaches the card scorer cannot reach its gate. Wiring the gate here "
+        "independently would apply a control priced on card authorizations to push payments "
+        "scored by the push model, which is worse than the gap.",
 }
 
 
@@ -152,6 +158,7 @@ def _probe_build_event(main):
         "consortium": isinstance(ev.get("network_lift"), (int, float)),
         "device_gate": _gated(ev.get("device_gate")),
         "card_model": bool((ev.get("card_score_detail") or {}).get("model") == "card_scorer"),
+        "sequence_gate": _gated((ev.get("card_score_detail") or {}).get("sequence_gate")),
         "durable_decision": True,   # build_event writes through STORE on the live path
     }
 
@@ -172,6 +179,7 @@ def _probe_score(client):
         "consortium": isinstance(d.get("network_lift"), (int, float)),
         "device_gate": _gated(d.get("device_gate")),
         "card_model": bool((d.get("card_score_detail") or {}).get("model") == "card_scorer"),
+        "sequence_gate": _gated((d.get("card_score_detail") or {}).get("sequence_gate")),
         "durable_decision": True,
     }
 
@@ -197,6 +205,7 @@ def _probe_authorize(client):
         "consortium": isinstance(d.get("network_lift"), (int, float)),
         "device_gate": _gated(d.get("device_gate")),
         "card_model": bool((d.get("score_detail") or {}).get("model") == "card_scorer"),
+        "sequence_gate": _gated((d.get("score_detail") or {}).get("sequence_gate")),
         "durable_decision": "decision_id" in d,
         "latency_budget": "within_budget" in d,
         "response_code": "response_code" in d,

@@ -681,7 +681,9 @@ def build_event(row) -> dict:
     _is_card = _normalize_rail(row.get("payment_rail"))[0] == "card"
     card_detail = None
     if _is_card:
-        ml, card_detail = score_card_message(row)
+        # The GATED scorer, which is the same function /authorize uses. Calling the ungated
+        # score_card_message here is exactly how a control ends up on one door and not the other.
+        ml, card_detail = score_card_message_gated(row)
     else:
         ml = ml_score_row(features)
     matches = score_transaction(features)
@@ -1710,6 +1712,63 @@ def substrate_next_questions(limit: int = 10):
         return {"substrate": "error", "detail": str(e)[:200], "queue": []}
 
 
+def score_card_message_gated(msg: dict) -> tuple:
+    """The card score with the sequence gate applied. THE one entry point both card paths use.
+
+    Ordering matters and it is the same ordering the device gate uses: the model scores first,
+    then the gate may raise that score, and only then do pricing and policy act. Gating after
+    the policy has already chosen an action would produce a raised score nobody decided on.
+    """
+    p, detail = score_card_message(msg)
+    raised, gd = apply_sequence_gate(msg, p)
+    detail = dict(detail or {})
+    detail["sequence_gate"] = gd
+    if gd.get("fired"):
+        detail["p_fraud_before_gate"] = round(float(p), 4)
+    return raised, detail
+
+
+def apply_sequence_gate(msg: dict, score: float) -> tuple:
+    """The card sequence gate, on EVERY card path. Returns `(score, detail)`.
+
+    SHARED BECAUSE OF ADR-001, not for tidiness. Six controls have been wired to one decision
+    path and forgotten on another, and the conformance test exists because the seventh was
+    inevitable. This is the seventh, so it gets one function and both callers use it.
+
+    ESCALATE-ONLY. The gate may raise a score the model was about to let through and may never
+    lower one. That contract lives in redwing-ml/card_sequence.gate and is imported rather than
+    reimplemented, because the thresholds there were priced against held-out data and a second
+    copy here would drift from the numbers that justified them.
+
+    Degrades to the unmodified score whenever anything is missing: no card key, no substrate, no
+    history, ML repo not importable. A gate that cannot see is not evidence of innocence.
+    """
+    detail = {"fired": False, "available": False}
+    try:
+        from card_sequence import gate as _seq_gate
+    except Exception:                                             # noqa: BLE001
+        detail["why"] = "redwing-ml card_sequence not importable"
+        return score, detail
+
+    from core.card_history import sequence_view
+    from core.card_identity import card_key
+    from core.store import eid
+
+    ckey = card_key(msg)
+    if not ckey:
+        detail["why"] = ("no card identifier on the message; pass card_token or pan. A shared "
+                         "fallback key would give every unidentified card one history and the "
+                         "gate would fire on all of them")
+        return score, detail
+
+    view = sequence_view(STORE, eid("card", ckey), float(msg.get("amount", 0.0) or 0.0))
+    detail["available"] = True
+    detail["card_known"] = view["card_known"]
+    raised, gd = _seq_gate(view, float(score))
+    detail.update(gd)
+    return raised, detail
+
+
 def _persist_authorization(msg: dict, decision: dict) -> dict:
     """Write the authorization to the substrate and stamp the decision_id onto the response.
 
@@ -1759,6 +1818,9 @@ def _persist_authorization(msg: dict, decision: dict) -> dict:
     try:
         record_decision(
             STORE, subject_ref=rec["subject_ref"], action=rec["action"], module="card_scorer",
+            # The CARD, not the transaction. This is what makes the per-card trailing window
+            # queryable, and it lands on the already-indexed entity column.
+            entity_id=rec["entity_id"],
             score=rec["score"], expected_liability=rec["expected_liability"],
             features=rec["features"], rationale=rec["rationale"],
             model_version=REGISTRY.decision_versions(),
@@ -1794,7 +1856,7 @@ def authorize_payment(body: dict):
     # ml_score_row), which is the defect this branch exists to fix: it returns ~0.0 on every card
     # message because the signal it wants is not in an authorization. Taking this side deliberately.
     msg = body or {}
-    decision = authorize(msg, score_fn=score_card_message)
+    decision = authorize(msg, score_fn=score_card_message_gated)
     return _persist_authorization(msg, decision)
 
 
