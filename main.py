@@ -61,7 +61,17 @@ import feedback
 # operator computes features identically to training. Override for non-default deploys.
 MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_models"))
 
-app = FastAPI(title="SyntheticID Operator", version="1.0.0")
+import secrets  # noqa: E402  (used by the webhook demo-secret guard below)
+
+# docs/redoc/openapi are OFF by default. `GET /openapi.json` returned all 96 routes with their
+# body schemas in one unauthenticated response, which is the first request an automated scanner
+# makes and the cheapest possible map of the attack surface. They are genuinely useful in
+# development, so they are a flag rather than a deletion.
+_DOCS = os.environ.get("REDWING_DOCS") == "1"
+app = FastAPI(title="SyntheticID Operator", version="1.0.0",
+              docs_url=("/docs" if _DOCS else None),
+              redoc_url=("/redoc" if _DOCS else None),
+              openapi_url=("/openapi.json" if _DOCS else None))
 
 # -- API surface protection ----------------------------------------------------
 # This process serves 75 endpoints over customer case data, an endpoint that spends real
@@ -94,21 +104,54 @@ try:
 except Exception as _e:                                               # noqa: BLE001
     print(f"⚠ static mount unavailable ({type(_e).__name__}); /static/redwing-fp.js will 404")
 
-# Auth is opt-in via REDWING_API_KEY. Set it and every request except /health (and CORS
-# preflight) must carry a matching X-API-Key. Leave it unset and the API stays open, which
-# is the right default for a laptop demo and is warned about loudly at startup, because it
-# is only safe while the socket is bound to localhost.
+# Auth FAILS CLOSED. This was opt-in, and opt-in auth is not auth.
+#
+# THE BUG THIS FIXES, and it is a one-word bug. The predicate read `if _API_KEY and ...`, so an
+# UNSET key did not mean "reject everything", it meant "skip the check". The single most common
+# misconfiguration silently disabled authentication on all 96 routes rather than making them
+# unreachable, which is exactly backwards: a missing credential must fail closed.
+#
+# It mattered more than a laptop demo. The `__main__` entry point bound 0.0.0.0, so the comment
+# claiming this was "only safe while bound to localhost" described a mitigation the code did not
+# implement. That combination put an unauthenticated decision engine, a case-file API over
+# customer data, live rule and threshold controls, and a paid LLM credential on every interface.
+#
+# The escape hatch is deliberately ugly to type and impossible to set by accident, because the
+# failure mode of a pleasant one is that it ends up in a deploy script.
 _API_KEY = os.environ.get("REDWING_API_KEY", "").strip()
+_ALLOW_OPEN = os.environ.get("REDWING_ALLOW_OPEN", "") == "i-understand-this-is-open"
 _OPEN_PATHS = {"/health"}
+
+if not _API_KEY and not _ALLOW_OPEN:
+    raise SystemExit(
+        "REDWING_API_KEY is not set.\n"
+        "This process serves customer case files, live rule and threshold controls, and a paid\n"
+        "LLM credential. Refusing to start without authentication.\n"
+        "  export REDWING_API_KEY=...                              (correct)\n"
+        "  export REDWING_ALLOW_OPEN=i-understand-this-is-open     (local only, no real data)")
+if not _API_KEY:
+    print("⚠ RUNNING WITH NO AUTHENTICATION (REDWING_ALLOW_OPEN). Never expose this socket.")
 
 
 @app.middleware("http")
 async def _require_api_key(request: Request, call_next):
     # OPTIONS is skipped explicitly rather than relying on middleware ordering, so CORS
     # preflight still succeeds when a key is set.
-    if _API_KEY and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
-        # compare_digest, not ==, so a wrong key cannot be recovered by timing the response
-        if not hmac.compare_digest(request.headers.get("X-API-Key", ""), _API_KEY):
+    #
+    # `_API_KEY` is NOT part of this predicate. That is the whole fix: whether a key happens to
+    # be configured must never decide whether the check runs. An empty key reaches
+    # compare_digest and fails, which is the correct answer to "no credential exists".
+    if _ALLOW_OPEN:
+        return await call_next(request)
+    if request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
+        # `not _API_KEY` FIRST, and it is not redundant with the startup guard.
+        # compare_digest("", "") returns True, so an unset key matched a request that simply
+        # omitted the header, and the API opened again through a second door. The inverted test
+        # in test_redwing.py caught this in the first fix of the original bug, which is the
+        # argument for inverting a test rather than deleting it.
+        # No configured credential means nothing can authenticate. That is the whole point.
+        supplied = request.headers.get("X-API-Key", "")
+        if not _API_KEY or not hmac.compare_digest(supplied, _API_KEY):
             return JSONResponse({"detail": "invalid or missing X-API-Key"}, status_code=401)
     return await call_next(request)
 
@@ -389,7 +432,19 @@ try:
         _wh_secrets = {}
 except Exception:
     _wh_secrets = {}
-_wh_secrets.setdefault("demo_processor", "whsec_demo_do_not_use_in_prod")
+# A HARDCODED SECRET IS A PUBLISHED SECRET. This line read
+# `_wh_secrets.setdefault("demo_processor", "whsec_demo_do_not_use_in_prod")`, and `setdefault`
+# meant it registered on EVERY boot, including a correctly-configured one. The literal is in git,
+# so anyone with the source could sign a valid payload for `demo_processor` and push events that
+# are scored, written to `decisions`, and recorded as TRAINING LABELS. That is precisely the
+# attack core/webhook.py's own docstring says the HMAC exists to prevent: the cryptography was
+# right and the key was public.
+#
+# The demo source now gets a per-process random secret, printed once, and only when asked for.
+if os.environ.get("REDWING_DEMO_WEBHOOK") == "1":
+    _demo_secret = secrets.token_urlsafe(24)
+    _wh_secrets.setdefault("demo_processor", _demo_secret)
+    print(f"⚠ demo webhook source registered; secret for this process only: {_demo_secret}")
 WEBHOOK = WebhookReceiver(TRANSPORT, _wh_secrets) if TRANSPORT is not None else None
 if WEBHOOK is not None:
     print(f"✓ Webhook receiver online; authenticated sources: {WEBHOOK.sources()}")
@@ -3664,4 +3719,12 @@ def report_fraud(body: dict):
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # LOCALHOST BY DEFAULT. This was 0.0.0.0, which put every route on every interface while the
+    # auth comment 3,600 lines above claimed the design was "only safe while bound to localhost".
+    # The mitigation the comment relied on was never in the code. Binding elsewhere is now an
+    # explicit act.
+    #
+    # reload=True is gone: it watches and re-executes source on change, which is a code-execution
+    # path keyed to filesystem writes and has no place in anything reachable from a network.
+    uvicorn.run("main:app", host=os.environ.get("REDWING_BIND", "127.0.0.1"),
+                port=int(os.environ.get("REDWING_PORT", "8000")))

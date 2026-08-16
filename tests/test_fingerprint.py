@@ -28,6 +28,8 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+
+os.environ.setdefault("REDWING_ALLOW_OPEN", "i-understand-this-is-open")  # auth fails closed; these tests import the app in-process
 from core import fingerprint as FP  # noqa: E402
 
 
