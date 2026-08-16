@@ -253,6 +253,74 @@ def test_a_non_card_event_is_untouched():
     assert float(body.get("amount")) == 100.0
 
 
+# ── caller-supplied parameters are bounded ───────────────────────────────────
+
+def test_the_graph_node_limit_is_clamped():
+    """`limit_nodes` was an unbounded int, and the sampler only engages when
+    `len(df) > limit_nodes * 3`. A large enough value DISABLED the sampler and dropped into
+    df.iterrows() over 914,127 rows of a 126MB frame."""
+    from core.ratelimit import clamp
+    assert clamp(99999999, 10, 2000, default=400) == 2000
+    assert clamp(-5, 10, 2000, default=400) == 10
+    assert clamp("not-a-number", 10, 2000, default=400) == 400
+    assert clamp(float("nan"), 10, 2000, default=400) == 400
+    assert clamp(400, 10, 2000, default=400) == 400          # the ordinary case is untouched
+
+
+def test_the_stream_pacing_has_a_floor():
+    """`speed=0` removed the sleep and turned an SSE endpoint into a tight build_event() loop,
+    which scores AND writes per iteration."""
+    from core.ratelimit import clamp
+    assert clamp(0, 0.05, 5.0, default=0.25) == 0.05
+    assert clamp(-1, 0.05, 5.0, default=0.25) == 0.05
+
+
+def test_an_identifier_is_length_bounded():
+    from core.ratelimit import bounded_text
+    assert len(bounded_text("x" * 100_000, 128)) == 128
+    assert bounded_text("arn_123", 128) == "arn_123"
+    assert bounded_text(None, 128) == ""
+
+
+def test_an_oversized_subject_ref_is_rejected_not_truncated():
+    """Truncating silently would produce a ref that joins to nothing: orphan rows, which is a
+    data bug wearing the costume of a fix. The endpoint must refuse."""
+    try:
+        from fastapi.testclient import TestClient
+    except Exception:                                         # noqa: BLE001
+        return
+    os.environ.setdefault("REDWING_ALLOW_OPEN", "i-understand-this-is-open")
+    try:
+        import main
+    except SystemExit:
+        return
+    if not getattr(main, "STORE", None):
+        return
+    c = TestClient(main.app, raise_server_exceptions=False)
+    r = c.post("/telemetry", json={"subject_ref": "x" * 5000, "telemetry": {}})
+    assert r.status_code == 400, f"an oversized subject_ref was accepted ({r.status_code})"
+    r2 = c.post("/telemetry", json={"subject_ref": "ok_ref", "telemetry": {"a": "y" * 200_000}})
+    assert r2.status_code == 413, f"an oversized telemetry blob was accepted ({r2.status_code})"
+
+
+def test_a_normal_telemetry_post_still_works():
+    """The bound must not break the feature."""
+    try:
+        from fastapi.testclient import TestClient
+    except Exception:                                         # noqa: BLE001
+        return
+    os.environ.setdefault("REDWING_ALLOW_OPEN", "i-understand-this-is-open")
+    try:
+        import main
+    except SystemExit:
+        return
+    if not getattr(main, "STORE", None):
+        return
+    c = TestClient(main.app, raise_server_exceptions=False)
+    r = c.post("/telemetry", json={"subject_ref": "ref_ok", "telemetry": {"typing_speed": 3.2}})
+    assert r.status_code == 200, r.text
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0

@@ -62,6 +62,7 @@ import feedback
 MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_models"))
 
 import secrets  # noqa: E402  (used by the webhook demo-secret guard below)
+from core import ratelimit as _rl_defaults  # noqa: E402
 
 # docs/redoc/openapi are OFF by default. `GET /openapi.json` returned all 96 routes with their
 # body schemas in one unauthenticated response, which is the first request an automated scanner
@@ -131,6 +132,54 @@ if not _API_KEY and not _ALLOW_OPEN:
         "  export REDWING_ALLOW_OPEN=i-understand-this-is-open     (local only, no real data)")
 if not _API_KEY:
     print("⚠ RUNNING WITH NO AUTHENTICATION (REDWING_ALLOW_OPEN). Never expose this socket.")
+
+
+# Rate limiting. CLAUDE.md has mandated it as a pre-commit rule since it was written and the
+# measured implementation count was zero. Several routes do heavy work per request, so an
+# unauthenticated (now authenticated) caller could spend minutes of CPU with a single GET.
+#
+# In-process, so the budget is PER WORKER. Stated rather than hidden: run more than one worker
+# and the effective limit multiplies by the worker count, at which point this has to move to
+# shared storage. Single process today, which is what makes it correct today.
+_RL_RATE = int(os.environ.get("REDWING_RATE_LIMIT", str(_rl_defaults.DEFAULT_RATE)))
+_RL_TRUST_PROXY = os.environ.get("REDWING_TRUST_PROXY") == "1"
+_LIMITER = _rl_defaults.RateLimiter(rate=_RL_RATE)
+
+# Routes whose per-request cost is large enough to need their own, tighter budget. /network/graph
+# and /rule-factory/test each read a 126MB CSV; /alerts runs build_event() per row, which WRITES
+# to SQLite, making it a write amplifier; /backbone/graph?refresh=true rebuilds under a global
+# lock and can starve the threadpool.
+_HEAVY_ROUTES = {
+    "/network/graph": 6, "/rule-factory/test": 6, "/backbone/graph": 10,
+    "/alerts": 20, "/monitor/stream": 6, "/xai/explanations": 20,
+}
+_HEAVY_LIMITERS = {p: _rl_defaults.RateLimiter(rate=r) for p, r in _HEAVY_ROUTES.items()}
+
+# Ceilings for caller-supplied identifiers and blobs that reach a bare-TEXT column. Chosen, not
+# measured: an ARN is 23 characters and a UUID is 36, so 128 is generous for anything legitimate
+# while removing the storage-exhaustion vector. 16KB of telemetry is far more than any real
+# client SDK reports in one call.
+_MAX_REF_LEN = 128
+_MAX_TELEMETRY_BYTES = 16 * 1024
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return await call_next(request)
+    key = _rl_defaults.client_key(request, trust_proxy=_RL_TRUST_PROXY)
+    for path, limiter in _HEAVY_LIMITERS.items():
+        if request.url.path.startswith(path):
+            ok, retry = limiter.allow(key)
+            if not ok:
+                return JSONResponse({"detail": "rate limit exceeded for this endpoint"},
+                                    status_code=429, headers={"Retry-After": str(int(retry) + 1)})
+            break
+    ok, retry = _LIMITER.allow(key)
+    if not ok:
+        return JSONResponse({"detail": "rate limit exceeded"}, status_code=429,
+                            headers={"Retry-After": str(int(retry) + 1)})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -1416,6 +1465,11 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
         async def error_stream():
             yield f"data: {json.dumps({'error': 'Models not loaded'})}\n\n"
         return StreamingResponse(error_stream(), media_type="text/event-stream")
+    # `speed` is the pacing sleep. `speed=0` removed it entirely and turned an SSE endpoint into
+    # a tight build_event() loop, which both scores and WRITES per iteration. The floor is what
+    # keeps this a stream rather than a scoring flood.
+    speed = _rl_defaults.clamp(speed, 0.05, 5.0, default=0.25)
+    limit = _rl_defaults.clamp(limit, 1, 1000, default=300)
 
     # Snapshot the injection buffer before building the historical fallback
     injected = list(_ingest_buffer)
@@ -1468,6 +1522,11 @@ def get_alerts(limit: int = 30):
     """Return the most recent high-confidence alerts from the transaction dataset."""
     if not MODEL_OK:
         return []
+    # A WRITE amplifier, which is why the ceiling is low. Each row here goes through
+    # build_event(), which is not read-only: it runs model inference and then writes via
+    # record_scored_event, record_decision and STORE.add_label. `?limit=200000` was an
+    # unauthenticated write flood against a 1.3GB WAL database.
+    limit = _rl_defaults.clamp(limit, 1, 500, default=30)
 
     # Prioritize confirmed fraud rows for alert demo
     if "is_fraud" in df_all.columns:
@@ -2239,7 +2298,18 @@ def post_telemetry(body: dict):
     subject_ref = str(body.get("subject_ref", "")).strip()
     if not subject_ref:
         raise HTTPException(400, "subject_ref is required")
+    # BOUNDED, because nothing else is. Every column in the decisions/telemetry schema is bare
+    # TEXT with no length constraint, and there is no ASGI body-size limit, so a loop of
+    # oversized posts writes megabytes per request into a 1.3GB database until the volume fills.
+    # Once it does, every SQLite write in the process starts failing into `except Exception:
+    # pass` handlers, so the durable trail is lost silently while the API still returns 200.
+    # REJECTED rather than truncated: a silently shortened subject_ref would join to nothing and
+    # produce orphan rows, which is a data bug wearing the costume of a fix.
+    if len(subject_ref) > _MAX_REF_LEN:
+        raise HTTPException(400, f"subject_ref exceeds {_MAX_REF_LEN} characters")
     tel = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
+    if len(json.dumps(tel, default=str)) > _MAX_TELEMETRY_BYTES:
+        raise HTTPException(413, f"telemetry exceeds {_MAX_TELEMETRY_BYTES} bytes")
     STORE.record_telemetry(subject_ref, tel, entity_id=str(body.get("entity_id", "") or ""))
     return {"ok": True, "subject_ref": subject_ref, "derived_signals": derive_signals(tel)}
 
@@ -2768,6 +2838,13 @@ def get_network_graph(
     """
     if not MODEL_OK:
         return {"nodes": [], "links": [], "stats": {}}
+    # CLAMPED, and this one is not cosmetic. The sampler below only engages when
+    # `len(df) > limit_nodes * 3`, so a large enough value DISABLES it and drops into
+    # `df.iterrows()` over all 914,127 rows of a 126MB frame, the slowest pandas iteration there
+    # is, building unbounded Python lists. One GET, no body, minutes of CPU and hundreds of MB.
+    limit_nodes = _rl_defaults.clamp(limit_nodes, 10, 2000, default=400)
+    days = _rl_defaults.clamp(days, 1, 3650, default=90)
+    min_score = _rl_defaults.clamp(min_score, 0.0, 1.0, default=0.0)
 
     try:
         df = pd.read_csv(MODELS_DIR / "transactions.csv")
