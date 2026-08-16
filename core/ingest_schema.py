@@ -59,6 +59,15 @@ LABEL_FIELDS = ("fraud_typology", "is_fraud", "label")
 # A subject id is needed for entity linkage and reputation; at least one is recommended.
 SUBJECT_FIELDS = ("user_id", "account_id")
 
+# Cardholder data that must never be persisted or echoed. Stripped in validate_event, which is
+# the single chokepoint every ingestion surface funnels through. The PAN spellings match
+# card_identity.PAN_FIELDS; the rest are the authentication elements PCI DSS forbids storing
+# after authorization at all, even encrypted.
+_CARD_SECRET_FIELDS = ("pan", "card_number", "primary_account_number",
+                       "cvv", "cvv2", "cvc", "cid", "card_security_code",
+                       "track1", "track2", "track_data", "magstripe",
+                       "expiry", "exp_date", "expiration_date", "pin", "pin_block")
+
 
 def _now() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -100,6 +109,33 @@ def validate_event(raw: dict, source: str = "") -> dict:
     warnings: list = []
     raw = raw if isinstance(raw, dict) else {}
     ev = dict(raw)                                        # normalise onto a copy; preserve passthrough
+
+    # -- CARDHOLDER DATA DIES HERE, before anything can persist or echo it ------------------
+    #
+    # THE ONE CHOKEPOINT. `/authorize` was already clean, because card_message.normalise builds
+    # an allowlisted row and no PAN field survives it. Every OTHER ingestion surface (/ingest,
+    # /ingest/batch, /stream/publish, the webhook receiver, the source connectors) funnels
+    # through here instead, and `ev = dict(raw)` above deliberately preserves passthrough
+    # fields, so a `pan` rode all the way into stream.db as cleartext JSON and came back out of
+    # /stream/dead_letter to any caller. This is ADR-001's rule applied to a compliance control:
+    # one chokepoint, not five hand-maintained strips.
+    #
+    # The IDENTITY is preserved while the PAN is destroyed: card_key() is a salted, one-way
+    # digest, so the sequence gate still has something to join on. Without that, stripping the
+    # PAN would blind every per-card control on the ingestion rail.
+    _pan_seen = any(str(raw.get(f, "") or "").strip() for f in _CARD_SECRET_FIELDS)
+    if _pan_seen:
+        try:
+            from .card_identity import card_key as _card_key
+            _ck = _card_key(raw)
+            if _ck:
+                ev["card_key"] = _ck
+        except Exception:                                 # noqa: BLE001
+            pass                                          # identity is best-effort; the strip is not
+        for _f in _CARD_SECRET_FIELDS:
+            ev.pop(_f, None)
+        warnings.append(_warn("pan", "cardholder data was removed at the ingestion boundary; "
+                                     "the card is identified by a salted card_key"))
 
     # -- transaction id (idempotency key) --
     tid = str(raw.get("transaction_id") or raw.get("txn_id") or "").strip()

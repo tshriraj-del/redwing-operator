@@ -2575,6 +2575,20 @@ def connectors_db_poll(body: dict):
     table = str(body.get("table", "")).strip()
     if not db_path or not table:
         raise HTTPException(400, "db_path and table are required")
+
+    # CONFINEMENT, answered here as well as in the connector so the caller gets a reason instead
+    # of a silent empty poll. `db_path` is caller-supplied, and unconfined it made this endpoint
+    # a read primitive against any SQLite file the process could open: point it at the decision
+    # store, map four of its columns onto canonical fields, and read them back out of
+    # /monitor/stream. Repeat with a new field_map for the rest.
+    from core.connectors import connector_root, path_is_confined  # noqa: PLC0415
+    if connector_root() is None:
+        raise HTTPException(503, "the DB source connector is disabled; set REDWING_CONNECTOR_ROOT "
+                                 "to the directory that holds source databases")
+    if not path_is_confined(db_path):
+        # The root is NOT echoed back. Telling an unauthorised caller where the allowed
+        # directory is turns a refusal into reconnaissance.
+        raise HTTPException(400, "db_path is outside the configured connector root")
     conn = DBConnector(
         connector_id=str(body.get("connector_id") or f"db:{table}"),
         transport=TRANSPORT, checkpoints=STORE, db_path=db_path, table=table,

@@ -75,6 +75,21 @@ def card_key(msg: dict) -> str:
     for f in PAN_FIELDS:
         raw = _DIGITS.sub("", str(msg.get(f, "") or ""))
         if len(raw) >= 12:                       # shortest real PAN is 12 digits
+            # AN UNSALTED PAN HASH IS A REVERSIBLE PAN, so refuse rather than write a weak key.
+            #
+            # `salt_configured()` existed for exactly this and had ZERO production callers, so
+            # nothing ever stopped it. Unsalted, `_hash` is a global constant function of the card
+            # number: an attacker with the table precomputes sha256 over the Luhn-valid space for
+            # the BINs they care about, and the BIN is stored in the clear in the same rationale
+            # block. That turns a database leak into a cardholder-data breach, which is precisely
+            # what this module's docstring promises is impossible.
+            #
+            # Returning "" rather than raising: this sits on a live authorization path, and every
+            # caller already handles "no card identifier" (it is a real and common case). The
+            # sequence gate degrades and says so. A raise here would fail the authorization, and
+            # a misconfiguration must not decline a customer's payment.
+            if not salt_configured():
+                return ""
             key = _hash("pan_", raw)
             del raw                              # not a security control, a statement of intent
             return key
