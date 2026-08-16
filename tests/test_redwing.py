@@ -24,6 +24,12 @@ for p in (OP, ML):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# main.py now refuses to import without auth configured. A KEY, not the open-mode flag: this
+# file tests the auth gate itself, so open mode would neuter it. The pop() matters under pytest,
+# where another test file's os.environ.setdefault would otherwise leak open mode into here.
+os.environ.setdefault("REDWING_API_KEY", "redwing-test-suite-key")
+os.environ.pop("REDWING_ALLOW_OPEN", None)
+
 import case_file
 import fraud_env
 import adversary
@@ -239,8 +245,8 @@ def test_api_key_gates_every_route_but_health():
     client, main = _client_and_main()
     if main is None:
         return
-    original = main._API_KEY
-    main._API_KEY = "test-secret-key"
+    original, o_open = main._API_KEY, main._ALLOW_OPEN
+    main._API_KEY, main._ALLOW_OPEN = "test-secret-key", False
     try:
         assert client.get("/health").status_code == 200        # probe stays open
 
@@ -251,20 +257,45 @@ def test_api_key_gates_every_route_but_health():
         # the endpoint that spends real Anthropic credit must not be reachable unauthenticated
         assert client.post("/rule-factory/run", json={}).status_code == 401
     finally:
-        main._API_KEY = original
+        main._API_KEY, main._ALLOW_OPEN = original, o_open
 
 
-def test_unset_api_key_leaves_the_api_open_for_local_dev():
-    """Default stays open so a laptop demo needs no configuration."""
+def test_an_unset_api_key_locks_the_api_rather_than_opening_it():
+    """THE INVERTED TEST, and the reason the hole survived an audit-shaped test suite.
+
+    This previously asserted the opposite: `_API_KEY = ""` -> 200, documented as "default stays
+    open so a laptop demo needs no configuration". So the suite was not blind to the behaviour,
+    it CERTIFIED it. The middleware predicate read `if _API_KEY and ...`, which meant the single
+    most likely misconfiguration, forgetting to set the key, silently disabled authentication on
+    all 96 routes instead of making them unreachable.
+
+    A missing credential must fail closed. Opening the API is now an explicit act
+    (REDWING_ALLOW_OPEN), not the consequence of an unset variable.
+    """
     client, main = _client_and_main()
     if main is None:
         return
-    original = main._API_KEY
-    main._API_KEY = ""
+    o_key, o_open = main._API_KEY, main._ALLOW_OPEN
+    main._API_KEY, main._ALLOW_OPEN = "", False
+    try:
+        assert client.get("/patterns").status_code == 401, (
+            "an unset API key left the API open; this is the fail-open bug returning")
+        assert client.get("/health").status_code == 200, "liveness probe must stay reachable"
+    finally:
+        main._API_KEY, main._ALLOW_OPEN = o_key, o_open
+
+
+def test_open_mode_is_reachable_but_only_when_explicitly_requested():
+    """The escape hatch exists for local work and must be the ONLY way to serve unauthenticated."""
+    client, main = _client_and_main()
+    if main is None:
+        return
+    o_key, o_open = main._API_KEY, main._ALLOW_OPEN
+    main._API_KEY, main._ALLOW_OPEN = "", True
     try:
         assert client.get("/patterns").status_code == 200
     finally:
-        main._API_KEY = original
+        main._API_KEY, main._ALLOW_OPEN = o_key, o_open
 
 # -- no serving path may read the adjudicated typology --------------------------
 
@@ -474,9 +505,12 @@ def test_score_endpoint_records_a_shadow_decision():
     from core.store import Store
 
     tmp = Store(os.path.join(tempfile.mkdtemp(), "substrate.db"))
-    original_store, original_key = main.STORE, main._API_KEY
+    original_store, original_open = main.STORE, main._ALLOW_OPEN
     main.STORE = tmp                                      # keep the real redwing.db clean
-    main._API_KEY = ""                                    # this test is about scoring, not auth
+    # This test is about scoring, not auth. It used to say so with `_API_KEY = ""`, which worked
+    # only because an unset key meant "open"; that is the fail-open bug and it is now fixed, so
+    # an empty key returns 401. Opening the API is an explicit act now, so say it explicitly.
+    main._ALLOW_OPEN = True
     try:
         before = tmp.labeling_stats()
         assert before["decisions_total"] == 0
@@ -497,7 +531,7 @@ def test_score_endpoint_records_a_shadow_decision():
         assert dec is not None
         assert dec.features, "decision recorded without its feature snapshot"
     finally:
-        main.STORE, main._API_KEY = original_store, original_key
+        main.STORE, main._ALLOW_OPEN = original_store, original_open
 
 
 # -- adjudication capture: the only path to intent gold labels ------------------

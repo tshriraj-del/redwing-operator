@@ -37,6 +37,7 @@ if ROOT not in sys.path:
 
 os.environ.setdefault("REDWING_RECOVERY_SECRET", "score-card-rail-test")
 os.environ.setdefault("REDWING_CARD_SALT", "score-card-rail-salt")
+os.environ.setdefault("REDWING_ALLOW_OPEN", "i-understand-this-is-open")  # auth fails closed; tests run the app in-process
 
 CARD_BODY = {
     "transaction_id": "sc_card_0001", "user_id": "user_00001", "amount": 900.0,

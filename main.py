@@ -61,7 +61,18 @@ import feedback
 # operator computes features identically to training. Override for non-default deploys.
 MODELS_DIR = Path(os.environ.get("REDWING_MODELS_DIR", Path.home() / "pulseml_models"))
 
-app = FastAPI(title="SyntheticID Operator", version="1.0.0")
+import secrets  # noqa: E402  (used by the webhook demo-secret guard below)
+from core import ratelimit as _rl_defaults  # noqa: E402
+
+# docs/redoc/openapi are OFF by default. `GET /openapi.json` returned all 96 routes with their
+# body schemas in one unauthenticated response, which is the first request an automated scanner
+# makes and the cheapest possible map of the attack surface. They are genuinely useful in
+# development, so they are a flag rather than a deletion.
+_DOCS = os.environ.get("REDWING_DOCS") == "1"
+app = FastAPI(title="SyntheticID Operator", version="1.0.0",
+              docs_url=("/docs" if _DOCS else None),
+              redoc_url=("/redoc" if _DOCS else None),
+              openapi_url=("/openapi.json" if _DOCS else None))
 
 # -- API surface protection ----------------------------------------------------
 # This process serves 75 endpoints over customer case data, an endpoint that spends real
@@ -94,21 +105,102 @@ try:
 except Exception as _e:                                               # noqa: BLE001
     print(f"⚠ static mount unavailable ({type(_e).__name__}); /static/redwing-fp.js will 404")
 
-# Auth is opt-in via REDWING_API_KEY. Set it and every request except /health (and CORS
-# preflight) must carry a matching X-API-Key. Leave it unset and the API stays open, which
-# is the right default for a laptop demo and is warned about loudly at startup, because it
-# is only safe while the socket is bound to localhost.
+# Auth FAILS CLOSED. This was opt-in, and opt-in auth is not auth.
+#
+# THE BUG THIS FIXES, and it is a one-word bug. The predicate read `if _API_KEY and ...`, so an
+# UNSET key did not mean "reject everything", it meant "skip the check". The single most common
+# misconfiguration silently disabled authentication on all 96 routes rather than making them
+# unreachable, which is exactly backwards: a missing credential must fail closed.
+#
+# It mattered more than a laptop demo. The `__main__` entry point bound 0.0.0.0, so the comment
+# claiming this was "only safe while bound to localhost" described a mitigation the code did not
+# implement. That combination put an unauthenticated decision engine, a case-file API over
+# customer data, live rule and threshold controls, and a paid LLM credential on every interface.
+#
+# The escape hatch is deliberately ugly to type and impossible to set by accident, because the
+# failure mode of a pleasant one is that it ends up in a deploy script.
 _API_KEY = os.environ.get("REDWING_API_KEY", "").strip()
+_ALLOW_OPEN = os.environ.get("REDWING_ALLOW_OPEN", "") == "i-understand-this-is-open"
 _OPEN_PATHS = {"/health"}
+
+if not _API_KEY and not _ALLOW_OPEN:
+    raise SystemExit(
+        "REDWING_API_KEY is not set.\n"
+        "This process serves customer case files, live rule and threshold controls, and a paid\n"
+        "LLM credential. Refusing to start without authentication.\n"
+        "  export REDWING_API_KEY=...                              (correct)\n"
+        "  export REDWING_ALLOW_OPEN=i-understand-this-is-open     (local only, no real data)")
+if not _API_KEY:
+    print("⚠ RUNNING WITH NO AUTHENTICATION (REDWING_ALLOW_OPEN). Never expose this socket.")
+
+
+# Rate limiting. CLAUDE.md has mandated it as a pre-commit rule since it was written and the
+# measured implementation count was zero. Several routes do heavy work per request, so an
+# unauthenticated (now authenticated) caller could spend minutes of CPU with a single GET.
+#
+# In-process, so the budget is PER WORKER. Stated rather than hidden: run more than one worker
+# and the effective limit multiplies by the worker count, at which point this has to move to
+# shared storage. Single process today, which is what makes it correct today.
+_RL_RATE = int(os.environ.get("REDWING_RATE_LIMIT", str(_rl_defaults.DEFAULT_RATE)))
+_RL_TRUST_PROXY = os.environ.get("REDWING_TRUST_PROXY") == "1"
+_LIMITER = _rl_defaults.RateLimiter(rate=_RL_RATE)
+
+# Routes whose per-request cost is large enough to need their own, tighter budget. /network/graph
+# and /rule-factory/test each read a 126MB CSV; /alerts runs build_event() per row, which WRITES
+# to SQLite, making it a write amplifier; /backbone/graph?refresh=true rebuilds under a global
+# lock and can starve the threadpool.
+_HEAVY_ROUTES = {
+    "/network/graph": 6, "/rule-factory/test": 6, "/backbone/graph": 10,
+    "/alerts": 20, "/monitor/stream": 6, "/xai/explanations": 20,
+}
+_HEAVY_LIMITERS = {p: _rl_defaults.RateLimiter(rate=r) for p, r in _HEAVY_ROUTES.items()}
+
+# Ceilings for caller-supplied identifiers and blobs that reach a bare-TEXT column. Chosen, not
+# measured: an ARN is 23 characters and a UUID is 36, so 128 is generous for anything legitimate
+# while removing the storage-exhaustion vector. 16KB of telemetry is far more than any real
+# client SDK reports in one call.
+_MAX_REF_LEN = 128
+_MAX_TELEMETRY_BYTES = 16 * 1024
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return await call_next(request)
+    key = _rl_defaults.client_key(request, trust_proxy=_RL_TRUST_PROXY)
+    for path, limiter in _HEAVY_LIMITERS.items():
+        if request.url.path.startswith(path):
+            ok, retry = limiter.allow(key)
+            if not ok:
+                return JSONResponse({"detail": "rate limit exceeded for this endpoint"},
+                                    status_code=429, headers={"Retry-After": str(int(retry) + 1)})
+            break
+    ok, retry = _LIMITER.allow(key)
+    if not ok:
+        return JSONResponse({"detail": "rate limit exceeded"}, status_code=429,
+                            headers={"Retry-After": str(int(retry) + 1)})
+    return await call_next(request)
 
 
 @app.middleware("http")
 async def _require_api_key(request: Request, call_next):
     # OPTIONS is skipped explicitly rather than relying on middleware ordering, so CORS
     # preflight still succeeds when a key is set.
-    if _API_KEY and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
-        # compare_digest, not ==, so a wrong key cannot be recovered by timing the response
-        if not hmac.compare_digest(request.headers.get("X-API-Key", ""), _API_KEY):
+    #
+    # `_API_KEY` is NOT part of this predicate. That is the whole fix: whether a key happens to
+    # be configured must never decide whether the check runs. An empty key reaches
+    # compare_digest and fails, which is the correct answer to "no credential exists".
+    if _ALLOW_OPEN:
+        return await call_next(request)
+    if request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
+        # `not _API_KEY` FIRST, and it is not redundant with the startup guard.
+        # compare_digest("", "") returns True, so an unset key matched a request that simply
+        # omitted the header, and the API opened again through a second door. The inverted test
+        # in test_redwing.py caught this in the first fix of the original bug, which is the
+        # argument for inverting a test rather than deleting it.
+        # No configured credential means nothing can authenticate. That is the whole point.
+        supplied = request.headers.get("X-API-Key", "")
+        if not _API_KEY or not hmac.compare_digest(supplied, _API_KEY):
             return JSONResponse({"detail": "invalid or missing X-API-Key"}, status_code=401)
     return await call_next(request)
 
@@ -389,7 +481,19 @@ try:
         _wh_secrets = {}
 except Exception:
     _wh_secrets = {}
-_wh_secrets.setdefault("demo_processor", "whsec_demo_do_not_use_in_prod")
+# A HARDCODED SECRET IS A PUBLISHED SECRET. This line read
+# `_wh_secrets.setdefault("demo_processor", "whsec_demo_do_not_use_in_prod")`, and `setdefault`
+# meant it registered on EVERY boot, including a correctly-configured one. The literal is in git,
+# so anyone with the source could sign a valid payload for `demo_processor` and push events that
+# are scored, written to `decisions`, and recorded as TRAINING LABELS. That is precisely the
+# attack core/webhook.py's own docstring says the HMAC exists to prevent: the cryptography was
+# right and the key was public.
+#
+# The demo source now gets a per-process random secret, printed once, and only when asked for.
+if os.environ.get("REDWING_DEMO_WEBHOOK") == "1":
+    _demo_secret = secrets.token_urlsafe(24)
+    _wh_secrets.setdefault("demo_processor", _demo_secret)
+    print(f"⚠ demo webhook source registered; secret for this process only: {_demo_secret}")
 WEBHOOK = WebhookReceiver(TRANSPORT, _wh_secrets) if TRANSPORT is not None else None
 if WEBHOOK is not None:
     print(f"✓ Webhook receiver online; authenticated sources: {WEBHOOK.sources()}")
@@ -1361,6 +1465,11 @@ async def monitor_stream(speed: float = 0.25, limit: int = 300):
         async def error_stream():
             yield f"data: {json.dumps({'error': 'Models not loaded'})}\n\n"
         return StreamingResponse(error_stream(), media_type="text/event-stream")
+    # `speed` is the pacing sleep. `speed=0` removed it entirely and turned an SSE endpoint into
+    # a tight build_event() loop, which both scores and WRITES per iteration. The floor is what
+    # keeps this a stream rather than a scoring flood.
+    speed = _rl_defaults.clamp(speed, 0.05, 5.0, default=0.25)
+    limit = _rl_defaults.clamp(limit, 1, 1000, default=300)
 
     # Snapshot the injection buffer before building the historical fallback
     injected = list(_ingest_buffer)
@@ -1413,6 +1522,11 @@ def get_alerts(limit: int = 30):
     """Return the most recent high-confidence alerts from the transaction dataset."""
     if not MODEL_OK:
         return []
+    # A WRITE amplifier, which is why the ceiling is low. Each row here goes through
+    # build_event(), which is not read-only: it runs model inference and then writes via
+    # record_scored_event, record_decision and STORE.add_label. `?limit=200000` was an
+    # unauthenticated write flood against a 1.3GB WAL database.
+    limit = _rl_defaults.clamp(limit, 1, 500, default=30)
 
     # Prioritize confirmed fraud rows for alert demo
     if "is_fraud" in df_all.columns:
@@ -2184,7 +2298,18 @@ def post_telemetry(body: dict):
     subject_ref = str(body.get("subject_ref", "")).strip()
     if not subject_ref:
         raise HTTPException(400, "subject_ref is required")
+    # BOUNDED, because nothing else is. Every column in the decisions/telemetry schema is bare
+    # TEXT with no length constraint, and there is no ASGI body-size limit, so a loop of
+    # oversized posts writes megabytes per request into a 1.3GB database until the volume fills.
+    # Once it does, every SQLite write in the process starts failing into `except Exception:
+    # pass` handlers, so the durable trail is lost silently while the API still returns 200.
+    # REJECTED rather than truncated: a silently shortened subject_ref would join to nothing and
+    # produce orphan rows, which is a data bug wearing the costume of a fix.
+    if len(subject_ref) > _MAX_REF_LEN:
+        raise HTTPException(400, f"subject_ref exceeds {_MAX_REF_LEN} characters")
     tel = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
+    if len(json.dumps(tel, default=str)) > _MAX_TELEMETRY_BYTES:
+        raise HTTPException(413, f"telemetry exceeds {_MAX_TELEMETRY_BYTES} bytes")
     STORE.record_telemetry(subject_ref, tel, entity_id=str(body.get("entity_id", "") or ""))
     return {"ok": True, "subject_ref": subject_ref, "derived_signals": derive_signals(tel)}
 
@@ -2520,6 +2645,20 @@ def connectors_db_poll(body: dict):
     table = str(body.get("table", "")).strip()
     if not db_path or not table:
         raise HTTPException(400, "db_path and table are required")
+
+    # CONFINEMENT, answered here as well as in the connector so the caller gets a reason instead
+    # of a silent empty poll. `db_path` is caller-supplied, and unconfined it made this endpoint
+    # a read primitive against any SQLite file the process could open: point it at the decision
+    # store, map four of its columns onto canonical fields, and read them back out of
+    # /monitor/stream. Repeat with a new field_map for the rest.
+    from core.connectors import connector_root, path_is_confined  # noqa: PLC0415
+    if connector_root() is None:
+        raise HTTPException(503, "the DB source connector is disabled; set REDWING_CONNECTOR_ROOT "
+                                 "to the directory that holds source databases")
+    if not path_is_confined(db_path):
+        # The root is NOT echoed back. Telling an unauthorised caller where the allowed
+        # directory is turns a refusal into reconnaissance.
+        raise HTTPException(400, "db_path is outside the configured connector root")
     conn = DBConnector(
         connector_id=str(body.get("connector_id") or f"db:{table}"),
         transport=TRANSPORT, checkpoints=STORE, db_path=db_path, table=table,
@@ -2699,6 +2838,13 @@ def get_network_graph(
     """
     if not MODEL_OK:
         return {"nodes": [], "links": [], "stats": {}}
+    # CLAMPED, and this one is not cosmetic. The sampler below only engages when
+    # `len(df) > limit_nodes * 3`, so a large enough value DISABLES it and drops into
+    # `df.iterrows()` over all 914,127 rows of a 126MB frame, the slowest pandas iteration there
+    # is, building unbounded Python lists. One GET, no body, minutes of CPU and hundreds of MB.
+    limit_nodes = _rl_defaults.clamp(limit_nodes, 10, 2000, default=400)
+    days = _rl_defaults.clamp(days, 1, 3650, default=90)
+    min_score = _rl_defaults.clamp(min_score, 0.0, 1.0, default=0.0)
 
     try:
         df = pd.read_csv(MODELS_DIR / "transactions.csv")
@@ -3664,4 +3810,12 @@ def report_fraud(body: dict):
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # LOCALHOST BY DEFAULT. This was 0.0.0.0, which put every route on every interface while the
+    # auth comment 3,600 lines above claimed the design was "only safe while bound to localhost".
+    # The mitigation the comment relied on was never in the code. Binding elsewhere is now an
+    # explicit act.
+    #
+    # reload=True is gone: it watches and re-executes source on change, which is a code-execution
+    # path keyed to filesystem writes and has no place in anything reachable from a network.
+    uvicorn.run("main:app", host=os.environ.get("REDWING_BIND", "127.0.0.1"),
+                port=int(os.environ.get("REDWING_PORT", "8000")))

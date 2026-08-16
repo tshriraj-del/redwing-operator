@@ -38,6 +38,50 @@ def _safe_ident(name: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name or "")))
 
 
+# The directory a DB source may live in. UNSET MEANS THE DB CONNECTOR IS OFF, which is the
+# correct default: nothing in this deployment uses it, and a disabled feature cannot be a file
+# read primitive.
+#
+# NOTE THE DEFAULT THAT IS NOT USED. The obvious choice is MODELS_DIR, and it would have been
+# actively harmful: `redwing.db`, `stream.db` and `phase2_replay.db` all live there, so confining
+# the connector to MODELS_DIR would have confined it to precisely the files it must never read.
+_ROOT_ENV = "REDWING_CONNECTOR_ROOT"
+
+
+def connector_root():
+    """The configured source root as a resolved Path, or None when unconfigured."""
+    raw = os.environ.get(_ROOT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        from pathlib import Path
+        return Path(raw).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def path_is_confined(candidate) -> bool:
+    """Is `candidate` inside the configured connector root?
+
+    RESOLVED, not string-compared. The check has to judge where a path ENDS UP, not how it is
+    spelled, or `sources/../../redwing.db` and a symlink named `innocent.db` both walk straight
+    out of the root. `Path.resolve()` collapses `..` and follows symlinks, so both land on their
+    real target before the comparison happens.
+    """
+    root = connector_root()
+    if root is None:
+        return False                                      # unconfigured means off, not open
+    try:
+        from pathlib import Path
+        target = Path(str(candidate)).expanduser().resolve()
+    except (OSError, ValueError):
+        return False
+    try:
+        return target.is_relative_to(root)                # 3.9+
+    except AttributeError:                                # pragma: no cover
+        return str(target).startswith(str(root) + os.sep)
+
+
 class SourceConnector:
     """Base pull connector. Subclasses implement read(since_offset) -> yields (offset, raw)."""
 
@@ -150,7 +194,15 @@ class DBConnector(SourceConnector):
         self.batch = batch
 
     def _map(self, row: dict) -> dict:
-        out = dict(row)
+        """PROJECT onto the mapped fields. Never `dict(row)`.
+
+        This began as `out = dict(row)` plus the renames, which made `field_map` a rename list
+        rather than a whitelist: every column of the source table survived into the published
+        event whether or not it was mapped. Combined with an unvalidated `db_path` that turned
+        the connector into a general-purpose table reader, because the caller did not even need
+        to map a column to see it. Projection is what makes the field_map the contract.
+        """
+        out = {}
         for src, dst in self.field_map.items():
             if src in row:
                 out[dst] = row[src]
@@ -160,9 +212,21 @@ class DBConnector(SourceConnector):
         # values are parameterised; the table/column identifiers are interpolated, so guard them
         if not (_safe_ident(self.table) and _safe_ident(self.id_column)):
             return
+        # CONFINEMENT. `db_path` arrives from the request body, so without this the endpoint is a
+        # read primitive against any SQLite file the process can open, and the rows come back out
+        # through /monitor/stream and the backbone. Unconfigured root means refuse, not allow.
+        if not path_is_confined(self.db_path):
+            return
         if not os.path.exists(self.db_path):
             return
-        conn = sqlite3.connect(self.db_path)
+        # READ-ONLY. A plain connect() opens read-write and can run WAL recovery against someone
+        # else's database, which would turn a read primitive into a limited write one.
+        try:
+            from pathlib import Path
+            uri = f"file:{Path(self.db_path).resolve().as_posix()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            return
         conn.row_factory = sqlite3.Row
         try:
             q = (f"SELECT {self.id_column} AS __wm, * FROM {self.table} "

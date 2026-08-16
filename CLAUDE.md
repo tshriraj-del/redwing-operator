@@ -138,10 +138,16 @@ target. A per-surface floor is adopted instead; the numbers and reasoning are be
 
 Measured 2026-08-12 with `coverage` 7.15.4, branch coverage on. Config is `.coveragerc`.
 
+> **STALE as of 2026-08-15 and NOT re-measured.** The table below predates the dispute rail, the
+> card sequence gate, the card durable record, and the `/score` rail branch. `main.py` has grown
+> 348 lines and the suite has grown from 362 to 460 tests since. Do not quote these percentages
+> until the command below has been re-run. They are left in place rather than deleted so the
+> re-measurement has a baseline to move against.
+
 **Read the config comment before quoting any number.** The first run listed
 `source = core,main.py,...` and coverage SILENTLY IGNORED the `main.py` entry, because `source`
 takes package and directory names, not file paths. That produced a clean-looking **88%** which
-excluded the 3,319-line file holding `build_event`, `/score` and `/authorize`. A coverage figure
+excluded the 3,667-line file holding `build_event`, `/score` and `/authorize`. A coverage figure
 that omits the hot path is worse than none, because it is quotable. `source = .` now.
 
 Headline, statements plus branches: **operator 69%, redwing-ml 52%.** Both below ECC's 80%.
@@ -163,7 +169,7 @@ that is easiest to state.
 
 **`main.py` at 36% is the real finding here**, and it is the same file ADR-001 is about. The
 decision logic is well covered because it lives in `core/` where it is testable without the ML
-stack; the pipelines that CALL that logic are not, because they are inlined in a 3,319-line
+stack; the pipelines that CALL that logic are not, because they are inlined in a 3,667-line
 module behind a model load. Extracting the decision core raises coverage as a side effect rather
 than as a separate campaign.
 
@@ -175,14 +181,41 @@ for f in tests/test_*.py; do .venv/bin/python -m coverage run "$f" >/dev/null 2>
 
 ---
 
+## The silent-degradation class
+
+Measured 2026-08-15. This is now the repo's most repeated defect and it deserves its own rule:
+**the code cannot distinguish "I could not look" from "I looked and there is nothing."**
+
+Three confirmed instances, all shipped, all found in one day:
+
+1. `core/card_history.sequence_view` swallows a read failure and returns the no-history view,
+   while `apply_sequence_gate` sets `available: True` unconditionally. A gate that saw nothing
+   reports as one that looked. Measured: 8 verified prior authorizations, gate reported
+   `burst_24h: 0.0, card_known: false, available: true`.
+2. `core/record.row_from_backbone` returns `None` on any read failure and `main.py` `get_case()`
+   turns that into `HTTPException(404)`. An investigator pulling a live case cannot tell
+   "never ingested" from "the store was briefly unreadable". This one lands on a human.
+3. `get_network_graph` and `get_typologies` return empty node/link sets on a CSV read failure,
+   which reads to an analyst as "no fraud network exists".
+
+**The rule:** an advisory layer may degrade, but its OUTPUT must carry the degradation. Absence
+of evidence is never rendered as evidence of absence. Concretely: return a `read_ok` / `degraded`
+flag beside the value, set `available` from that flag and never unconditionally, and bind the
+exception (`except Exception as e:`) with a log line.
+
+The correct pattern already exists in this repo, twice: `core/screening.py` stores `self.error`
+and surfaces "screening is unavailable" through both `status()` and the blocked reason, and
+`integrations/hub.py` binds and logs. Copy those, do not invent a third shape.
+
 ## Known violations of the adopted rules
 
 Recorded rather than hidden, so they read as debt with a plan and not as standards nobody follows.
 
 | Rule | Violation | Plan |
 |---|---|---|
-| Files < 800 lines | `main.py` 3,319; `core/store.py` 1,090; `tests/test_core_store.py` 1,680 | ADR-001 extracts the decision core out of `main.py` |
-| Functions < 50 lines | 53 functions exceed it; `build_event` is 322 | Same |
+| Files < 800 lines | `main.py` **3,667**; `core/store.py` **1,142**; `tests/test_core_store.py` 1,680 | ADR-001 extracts the decision core out of `main.py` |
+| Functions < 50 lines | 53+ exceed it; `build_event` is 314, `score` **147**, `get_network_graph` **124**, `store.add_label` **~90** | Same |
+| Errors never silently swallowed | **24 bare `except Exception:` in `main.py`, and `main.py` imports no logger at all** | See "The silent-degradation class" below |
 | Type annotations | `core/` at 87% return-annotated | New code 100%; backfill opportunistically |
 | `core/` >= 85% | 89%, holds | keep it there |
 | `main.py` >= 60% | **36%** | ADR-001 extraction raises it as a side effect |
@@ -205,9 +238,10 @@ cd ~/pulseml_models && ~/redwing-operator/.venv/bin/python tests/test_device_gra
 ## Architecture
 
 - `core/`: pure-stdlib decision logic, testable without the ML stack. This boundary is
-  load-bearing: it is what lets 300+ tests run without loading a model.
+  load-bearing: it is what lets the bulk of the 460-test suite run without loading a model.
 - `main.py`: FastAPI surface, model loading, the scoring pipelines.
-- `integrations/`: external connector interfaces. All 14 currently return `UNCONFIGURED`.
+- `integrations/`: external connector interfaces. 15 registered; an unconfigured one now
+  returns `DERIVED` synthetic signals via `hub._safe_enrich`, not a bare `UNCONFIGURED`.
 - `docs/adr/`: architecture decision records. `docs/` is gitignored (candid, local only).
 
 ## Reference

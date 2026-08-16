@@ -1075,6 +1075,7 @@ def test_db_connector_polls_incrementally_by_watermark():
     d = tempfile.mkdtemp()
     src = os.path.join(d, "source.db")
     _make_source_table(src, [(1, 100.0, "c1", "r1", "zelle"), (2, 250.0, "c2", "r2", "ach")])
+    os.environ["REDWING_CONNECTOR_ROOT"] = d   # the DB connector is confined and off by default
     q = DurableQueue(os.path.join(d, "q.db"))
     cp = Store(os.path.join(d, "cp.db"))
     c = DBConnector("core_txns", q, cp, src, "txns", id_column="id", field_map=_FMAP)
@@ -1099,6 +1100,7 @@ def test_db_connector_maps_source_schema_to_canonical():
     d = tempfile.mkdtemp()
     src = os.path.join(d, "source.db")
     _make_source_table(src, [(1, 100.0, "c1", "r1", "faster_payments")])
+    os.environ["REDWING_CONNECTOR_ROOT"] = d   # the DB connector is confined and off by default
     q = DurableQueue(os.path.join(d, "q.db"))
     cp = Store(os.path.join(d, "cp.db"))
     DBConnector("core_txns", q, cp, src, "txns", id_column="id", field_map=_FMAP).poll()
@@ -1118,6 +1120,10 @@ def test_db_connector_refuses_unsafe_identifiers():
     d = tempfile.mkdtemp()
     src = os.path.join(d, "source.db")
     _make_source_table(src, [(1, 100.0, "c1", "r1", "zelle")])
+    # The root MUST be set here, or this test passes for the wrong reason: the confinement guard
+    # added 2026-08-15 also returns 0, so an unconfigured root would make this assertion vacuous
+    # and the identifier guard could be deleted without failing anything.
+    os.environ["REDWING_CONNECTOR_ROOT"] = d
     q = DurableQueue(os.path.join(d, "q.db"))
     cp = Store(os.path.join(d, "cp.db"))
     c = DBConnector("bad", q, cp, src, "txns; DROP TABLE txns", id_column="id")

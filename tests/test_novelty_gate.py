@@ -27,6 +27,8 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+os.environ.setdefault("REDWING_ALLOW_OPEN", "i-understand-this-is-open")  # auth fails closed; tests run the app in-process
+
 import main  # noqa: E402
 
 
