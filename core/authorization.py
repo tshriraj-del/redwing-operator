@@ -220,9 +220,15 @@ def authorize(msg: dict, *, score_fn=None, budget_ms: int = AUTH_BUDGET_MS,
     # makes it possible to vary that per member without handing attackers a roadmap.
     reason = ("approved" if code == "00" else
               "step-up required" if code == "65" else "risk decision")
+    # The gate views are lifted to the TOP LEVEL, matching build_event() and /score, which both
+    # expose `device_gate` there. A control that is observable under a different key on each path
+    # is a control a conformance probe cannot check uniformly, and uniform checkability is the
+    # entire point of the harness. `detail` keeps them too, so nothing is moved, only surfaced.
     return respond(code, action=pol["action"], reason=reason,
                    extra={"screening": scr, "priced": priced, "policy": pol,
-                          "score_detail": detail})
+                          "score_detail": detail,
+                          "device_gate": (detail or {}).get("device_gate") or {},
+                          "sequence_gate": (detail or {}).get("sequence_gate") or {}})
 
 
 # ── the durable record ───────────────────────────────────────────────────────
