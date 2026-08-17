@@ -1859,17 +1859,40 @@ def substrate_next_questions(limit: int = 10):
 
 
 def score_card_message_gated(msg: dict) -> tuple:
-    """The card score with the sequence gate applied. THE one entry point both card paths use.
+    """The card score with EVERY card-rail gate applied. THE one entry point all card paths use.
 
-    Ordering matters and it is the same ordering the device gate uses: the model scores first,
-    then the gate may raise that score, and only then do pricing and policy act. Gating after
-    the policy has already chosen an action would produce a raised score nobody decided on.
+    Ordering matters: the model scores first, the gates may raise that score, and only then do
+    pricing and policy act. Gating after the policy has already chosen an action would produce a
+    raised score nobody decided on.
+
+    THE DEVICE GATE LIVES HERE, and putting it here rather than on a handler is the whole point.
+    ("authorize", "device_gate") was a KNOWN_GAP across many sessions on the argument that an
+    ISO 8583 message carries no device. That holds for card-PRESENT and fails for card-not-
+    present: CNP carries device data (3DS device channel, merchant SDK), the fixtures themselves
+    set entry_mode="ecom", and CNP is where card testing lives.
+
+    MEASURED 2026-08-15, which is why this is not cosmetic. The card model carries ZERO device
+    features, and its top five by importance are all verification RESULTS (avs/cvv/3ds, ~48% of
+    total importance). A card tester's whole objective is finding a card that PASSES those
+    checks, so at the moment the attack succeeds every one of the model's strongest signals reads
+    clean. Recall on the challenge ledger's card_testing_bot: 1.6%, model p50 0.0008. Device is
+    one of only two signals that could see it; merchant fan-in is the other.
+
+    DOUBLE APPLICATION IS SAFE. build_event() and /score already apply the device gate to the
+    post-model score, so a card row now meets it twice. The contract is escalate-only via max(),
+    and max(max(s,x),x) == max(s,x), so the second application is a no-op. This one is the more
+    correct of the two because it lands BEFORE pricing rather than after.
     """
     p, detail = score_card_message(msg)
-    raised, gd = apply_sequence_gate(msg, p)
     detail = dict(detail or {})
+
+    raised, gd = apply_sequence_gate(msg, p)
     detail["sequence_gate"] = gd
-    if gd.get("fired"):
+
+    raised, dv = apply_device_gate(raised, msg)
+    detail["device_gate"] = dv
+
+    if gd.get("fired") or dv.get("escalated") or dv.get("fired"):
         detail["p_fraud_before_gate"] = round(float(p), 4)
     return raised, detail
 
