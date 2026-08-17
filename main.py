@@ -426,7 +426,7 @@ except Exception as _pe:
 # Pure helpers (stdlib-only) import at module scope so they exist even if the SQLite
 # store fails to open; only the Store() instantiation is guarded.
 from core.store import Store, DEFAULT_DB_PATH, eid, FRAUD_TRUE
-from core.record import record_scored_event, row_from_backbone
+from core.record import record_card_authorization, record_scored_event, row_from_backbone
 from core.adjudication import schema as adjudication_schema, validate as adjudication_validate
 from core.loop import close_loop, record_decision
 from core.holdout import holdout_decision, holdout_rationale
@@ -1976,6 +1976,18 @@ def _persist_authorization(msg: dict, decision: dict) -> dict:
     except Exception as e:                                        # noqa: BLE001
         decision["recorded"] = False
         decision["not_recorded_reason"] = f"{type(e).__name__}: {str(e)[:120]}"
+
+    # THE BACKBONE WRITE, separate from the decision row and deliberately not inside its try.
+    # A decision row is a record of what we did; entities and edges are what make the card rail
+    # visible to graph queries at all. Measured 2026-08-15, `entities` held zero cards and zero
+    # merchants, so campaign and actor detection could not run on this rail.
+    #
+    # Reported, never swallowed: `backbone` distinguishes a write that FAILED from one that had
+    # nothing identifiable to link. Three separate controls in this codebase were found on the
+    # same day reporting "nothing there" when they meant "could not look".
+    _bb = {}
+    record_card_authorization(STORE, msg, decision, report=_bb)
+    decision["backbone"] = _bb
     return decision
 
 

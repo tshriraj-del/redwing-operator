@@ -22,6 +22,103 @@ from .store import Store, eid
 
 _ENTITY_COLS = (("user", "user_id"), ("device", "device_id"), ("recipient", "recipient_id"))
 
+# The card rail's equivalent. `card` comes from the salted key rather than a column, so it is
+# resolved separately below; these are the plain columns.
+_CARD_ENTITY_COLS = (("merchant", "merchant_id"), ("device", "device_id"), ("user", "user_id"))
+
+# NOT an entity, on purpose. See record_card_authorization.
+_CARD_CLASS_FIELDS = ("bin", "mcc_code", "entry_mode", "card_type")
+
+
+def record_card_authorization(store, msg: dict, decision: dict, report: dict | None = None):
+    """Write a card authorization into the backbone as ENTITIES plus a linking EVENT.
+
+    WHY THIS EXISTS. MEASURED 2026-08-15 on the live store: `entities` held recipient 9,818,
+    user 2,005, device 1,891, and card 0, merchant 0. The card path wrote its key into
+    `decisions.entity_id` and stopped, so a card authorization was an isolated row. No node, no
+    edge, nothing for a graph query, a campaign detector, or an investigator to traverse. The
+    card rail could not participate in actor detection because the substrate it would read was
+    never written.
+
+    WHY IT IS THE PRIORITY. Per-typology recall on the challenge ledger: the novelty gate catches
+    90.0% of invoice redirection and 1.6% of card testing, while the model scores card testing at
+    0.0008. Nothing sees it, and that is structural: a card-testing authorization is unremarkable
+    in isolation (small amount, ordinary merchant, a card with no history because each card is
+    used once), so no per-transaction detector can flag it. The signal exists only as MERCHANT
+    FAN-IN, which needs the merchant to be a node with edges to those cards. That is this
+    function.
+
+    THE BIN IS AN ATTRIBUTE, NOT AN ENTITY, and the distinction is load-bearing. Millions of
+    cards share a BIN, so a `bin:` node would be a supernode every card authorization links to,
+    and traversal from any card would reach most of the graph in two hops. Kept as an attribute
+    on the card entity, "distinct BINs at this merchant in the last hour" is still answerable by
+    aggregating over the merchant's linked cards, with no degree explosion.
+
+    NEVER RAISES, and never silently succeeds either. A substrate failure must cost the backbone
+    and not the authorization, but `report` receives `{"ok": bool, "error": str}` so a caller can
+    tell a write that FAILED from one that had nothing to write. That distinction is the
+    silent-degradation defect class this codebase hit three times in one day.
+
+    Returns the entity ids linked, or [] on failure.
+    """
+    if report is not None:
+        report.clear()
+        report.update({"ok": False, "entities": 0})
+    if store is None:
+        if report is not None:
+            report["error"] = "no store"
+        return []
+
+    try:
+        from .card_identity import card_key
+    except Exception:                                             # noqa: BLE001
+        card_key = lambda _m: ""                                  # noqa: E731
+
+    try:
+        inst = str(msg.get("institution_id", "") or "")
+        ids = []
+
+        ckey = card_key(msg)
+        if ckey:
+            # The card's class fields ride as ATTRIBUTES, which is what keeps the BIN out of the
+            # node set while leaving it aggregatable.
+            attrs = {k: msg.get(k) for k in _CARD_CLASS_FIELDS if msg.get(k) not in (None, "")}
+            cid = eid("card", ckey)
+            store.upsert_entity(cid, "card", institution_id=inst, attributes=attrs)
+            ids.append(cid)
+
+        for kind, col in _CARD_ENTITY_COLS:
+            raw = str(msg.get(col, "") or "").strip()
+            if raw and raw.lower() != "nan":
+                e = eid(kind, raw)
+                store.upsert_entity(e, kind, institution_id=inst)
+                ids.append(e)
+
+        if not ids:
+            if report is not None:
+                report.update({"ok": True, "entities": 0, "note": "nothing identifiable to link"})
+            return []
+
+        # THE EDGE, which is the actual deliverable. Entities without a linking event are
+        # isolated nodes and answer no question that a plain column could not.
+        ref = str(msg.get("arn") or msg.get("rrn") or msg.get("transaction_id") or "")
+        store.append_event(
+            "card_authorization", entities=ids, institution_id=inst,
+            event_id=(f"auth:{ref}" if ref else None),
+            payload={"amount": msg.get("amount"), "mcc_code": msg.get("mcc_code"),
+                     "entry_mode": msg.get("entry_mode"), "bin": msg.get("bin")},
+            derived={"score": decision.get("score"),
+                     "action": decision.get("action"),
+                     "expected_liability": decision.get("expected_liability")},
+        )
+        if report is not None:
+            report.update({"ok": True, "entities": len(ids)})
+        return ids
+    except Exception as e:                                        # noqa: BLE001
+        if report is not None:
+            report.update({"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"})
+        return []
+
 
 def record_scored_event(store, event: dict, row: dict) -> list:
     """Persist one scored transaction as entities + a transaction event (+ an alert
