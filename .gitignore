@@ -26,3 +26,6 @@ coverage.json
 # Local agent-harness state written by plugins installed 2026-08-14, not project code.
 .claude-flow/
 .claude/
+
+# Experiment outputs: derived from the ledgers, regenerable, and large.
+experiments/out/
