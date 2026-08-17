@@ -75,6 +75,13 @@ MANDATORY = ("screening", "priced", "policy")
 PROFILE_ONLY = {
     "latency_budget": ("authorize",),   # only a path with a network deadline can miss one
     "response_code": ("authorize",),    # only a path with an acquirer needs a code
+    # PUSH-RAIL ONLY, and this is a SCOPE decision recorded as such, not a gap being hidden.
+    # Authorization IQ is a payee view and the owner has ruled consortium out as a direction on
+    # domain grounds: institutions do not share this data, and bureau-sourced data arrives
+    # heavily re-labelled, so there is nothing to consume on a card auth. The shipped code stays
+    # and is not extended. Carrying this in KNOWN_GAPS made the list overstate the work, because
+    # a gap is something someone intends to close and nobody intends to close this one.
+    "consortium": ("build_event", "score"),
 }
 
 # Each entry: (path, control) -> why it is still open and what closes it.
@@ -83,12 +90,21 @@ KNOWN_GAPS = {
     ("authorize", "novelty_gate"):
         "the unsupervised detector is not applied on the card authorization path; it was built "
         "for the push feature set and has no card equivalent yet. ADR-001 stage extraction.",
-    ("authorize", "consortium"):
-        "Authorization IQ is a push-rail payee view; there is no card counterpart. Whether it "
-        "belongs on the card profile at all is an open question in ADR-001's Consequences.",
-    ("authorize", "device_gate"):
-        "an ISO 8583 message carries no device, so the gate has nothing to read. This is "
-        "arguably PROFILE rather than a gap; kept here until the card device story is settled.",
+    # ("authorize", "consortium") REMOVED 2026-08-15 as OUT OF SCOPE, not closed. The owner has
+    # killed consortium as a direction on domain grounds: no bank or fintech shares this data,
+    # and what arrives via bureaus is heavily re-labelled, so there is no signal to consume. The
+    # shipped Authorization IQ code stays; it is not extended, and it is not a gap because the
+    # card counterpart is not something anyone intends to build. Carrying it as a defect made
+    # this list overstate the work, and re-raising a killed direction under cover of rigour costs
+    # the owner a correction they already made.
+    # ("authorize", "device_gate") CLOSED 2026-08-15. The excuse it survived on for many
+    # sessions, that an ISO 8583 message carries no device, is true for card-PRESENT and false
+    # for card-not-present: CNP carries device data and the fixtures set entry_mode="ecom"
+    # themselves. It is now applied inside score_card_message_gated, THE entry point every card
+    # path uses, so /authorize, /score and build_event were closed by one edit rather than three.
+    # Worth recording what the gap cost: the card model carries zero device features and its top
+    # five by importance are all verification RESULTS, so at the exact moment a card tester
+    # succeeds every signal it leans on reads clean. Measured recall on card_testing_bot: 1.6%.
     # ("authorize", "durable_decision") CLOSED 2026-08-14. Card authorizations now write through
     # to the substrate keyed on the ARN/RRN, with holdout membership decided in the decision
     # path by a pure hash rather than at write time. Deleted from the list by the two-way
